@@ -4335,6 +4335,7 @@ rules:
       - subnets
       - vlans
       - provider-networks
+      - iptables-eips
     verbs:
       - get
       - list
