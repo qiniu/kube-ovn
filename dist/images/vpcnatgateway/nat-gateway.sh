@@ -114,7 +114,20 @@ function init() {
     echo "VPC_INTERFACE=$VPC_INTERFACE" > /etc/kube-ovn/nat-gateway.env
     echo "EXTERNAL_INTERFACE=$EXTERNAL_INTERFACE" >> /etc/kube-ovn/nat-gateway.env
 
-    # run once is enough
+    # Add route to local node IP via external interface for node-local EIP access
+    # This allows the pod to directly reach the node without going through the gateway
+    # This must be done before the "exit 0" check below, as routes may be lost after pod restart
+    # while iptables rules are preserved. ip route replace is idempotent.
+    if [ -n "$HOST_IP" ]; then
+        echo "Adding route to local node IP $HOST_IP via $EXTERNAL_INTERFACE"
+        if [[ $HOST_IP == *":"* ]]; then
+            ip -6 route replace "$HOST_IP/128" dev "$EXTERNAL_INTERFACE"
+        else
+            ip route replace "$HOST_IP/32" dev "$EXTERNAL_INTERFACE"
+        fi
+    fi
+
+    # run once is enough (for iptables rules only, not for routes)
     $iptables_save_cmd | grep DNAT_FILTER && exit 0
     # add static chain
     # this also a flag to make sure init once
