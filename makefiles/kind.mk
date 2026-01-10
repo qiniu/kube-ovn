@@ -637,6 +637,9 @@ kind-install-cilium-delegate-%:
 	kubectl -n kube-system set resources ds/kube-multus-ds -c kube-multus --limits=cpu=200m,memory=200Mi
 	kubectl -n kube-system rollout status ds kube-multus-ds
 
+# PEER_WITH_LOCAL: when set to non-empty value, adds --peer-with-local=true
+PEER_WITH_LOCAL_ARG := $(if $(PEER_WITH_LOCAL),--peer-with-local=true,)
+
 .PHONY: kind-install-bgp
 kind-install-bgp: kind-install
 	kubectl label node --all ovn.kubernetes.io/bgp=true
@@ -645,6 +648,7 @@ kind-install-bgp: kind-install
 		-e 's/--neighbor-address=.*/--neighbor-address=10.0.1.1/' \
 		-e 's/--neighbor-as=.*/--neighbor-as=65001/' \
 		-e 's/--cluster-as=.*/--cluster-as=65002/' yamls/speaker.yaml | \
+		$(if $(PEER_WITH_LOCAL),sed 's/--cluster-as=65002/--cluster-as=65002\n            - $(PEER_WITH_LOCAL_ARG)/',cat) | \
 		kubectl apply -f -
 	kubectl -n kube-system rollout status ds kube-ovn-speaker --timeout 60s
 	docker exec clab-bgp-router vtysh -c "show ip route bgp"
@@ -657,6 +661,7 @@ kind-install-bgp-ha: kind-install
 		-e 's/--neighbor-address=.*/--neighbor-address=10.0.1.1,10.0.1.2/' \
 		-e 's/--neighbor-as=.*/--neighbor-as=65001/' \
 		-e 's/--cluster-as=.*/--cluster-as=65002/' yamls/speaker.yaml | \
+		$(if $(PEER_WITH_LOCAL),sed 's/--cluster-as=65002/--cluster-as=65002\n            - $(PEER_WITH_LOCAL_ARG)/',cat) | \
 		kubectl apply -f -
 	kubectl -n kube-system rollout status ds kube-ovn-speaker --timeout 60s
 	docker exec clab-bgp-router-1 vtysh -c "show ip route bgp"
