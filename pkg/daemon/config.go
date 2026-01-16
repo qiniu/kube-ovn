@@ -152,7 +152,8 @@ func ParseFlags() *Configuration {
 
 		// Node-local EIP access for VPC NAT Gateway
 		argEnableNodeLocalAccessVpcNatGwEIP = pflag.Bool("enable-node-local-access-vpc-nat-gw-eip", true, "Enable node local access to VPC NAT gateway iptables EIP addresses via macvlan sub-interface")
-		argEnableMacvlanNodeLocalIP         = pflag.Bool("enable-macvlan-node-local-ip", true, "Add node IP to macvlan sub-interface for ARP/NDP responses")
+		// Warning: enabling this may cause ARP conflicts if the same IP is already configured on the master interface
+		argEnableMacvlanNodeLocalIP = pflag.Bool("enable-macvlan-node-local-ip", false, "Add node IP to macvlan sub-interface for ARP/NDP responses")
 	)
 
 	// mute info log for ipset lib

@@ -16,56 +16,63 @@ import (
 func TestGenerateMacvlanName(t *testing.T) {
 	tests := []struct {
 		name     string
-		cidr     string
+		master   string
 		expected string
 	}{
 		{
-			name:     "typical IPv4 CIDR",
-			cidr:     "192.168.1.0/24",
-			expected: "macc0a80100", // 192=0xc0, 168=0xa8, 1=0x01, 0=0x00
+			name:     "short interface name",
+			master:   "eth0",
+			expected: "maceth0",
 		},
 		{
-			name:     "class A network",
-			cidr:     "10.0.0.0/8",
-			expected: "mac0a000000", // 10=0x0a, 0=0x00, 0=0x00, 0=0x00
+			name:     "bond interface",
+			master:   "bond0",
+			expected: "macbond0",
 		},
 		{
-			name:     "class B network",
-			cidr:     "172.16.0.0/16",
-			expected: "macac100000", // 172=0xac, 16=0x10, 0=0x00, 0=0x00
+			name:     "longer interface name",
+			master:   "enp0s25",
+			expected: "macenp0s25",
 		},
 		{
-			name:     "class C network",
-			cidr:     "192.168.100.0/24",
-			expected: "macc0a86400", // 192=0xc0, 168=0xa8, 100=0x64, 0=0x00
+			name:     "max length interface name (12 chars)",
+			master:   "eth0.1234567",
+			expected: "maceth0.1234567",
+		},
+		{
+			name:   "long interface name (exceeds 12 chars, uses hash)",
+			master: "very-long-interface-name",
+			// Name will be "mac" + 8 hex chars (FNV-1a hash)
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := generateMacvlanName(tt.cidr)
+			result, err := generateMacvlanName(tt.master)
 			require.NoError(t, err)
 			assert.LessOrEqual(t, len(result), 15, "interface name should not exceed 15 chars")
 			assert.True(t, strings.HasPrefix(result, "mac"), "should have 'mac' prefix")
-			assert.Equal(t, tt.expected, result, "should match expected name")
+			if tt.expected != "" {
+				assert.Equal(t, tt.expected, result, "should match expected name")
+			}
 			// Verify consistent output
-			result2, err := generateMacvlanName(tt.cidr)
+			result2, err := generateMacvlanName(tt.master)
 			require.NoError(t, err)
 			assert.Equal(t, result, result2, "same input should produce same output")
 		})
 	}
 
-	// Verify uniqueness for different CIDRs - including cases that would collide with old implementation
-	t.Run("different CIDRs produce different outputs", func(t *testing.T) {
+	// Verify uniqueness for different master interfaces
+	t.Run("different masters produce different outputs", func(t *testing.T) {
 		names := make(map[string]string)
-		// Include CIDRs that would have collided with simple digit concatenation
 		inputs := []string{
-			"192.168.1.0/24",
-			"192.168.2.0/24",
-			"10.0.0.0/8",
-			"172.16.0.0/16",
-			"19.216.81.0/24", // Would collide with 192.168.1.0 using old method
-			"1.92.168.10/24", // Would collide with 192.168.1.0 using old method
+			"eth0",
+			"eth1",
+			"bond0",
+			"bond1",
+			"enp0s25",
+			"very-long-interface-name",
+			"another-long-interface",
 		}
 		for _, input := range inputs {
 			result, err := generateMacvlanName(input)
@@ -77,17 +84,21 @@ func TestGenerateMacvlanName(t *testing.T) {
 		}
 	})
 
-	// Verify error returned for invalid or IPv6 CIDRs
-	t.Run("returns error for invalid CIDR", func(t *testing.T) {
-		_, err := generateMacvlanName("invalid")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not a valid IPv4")
+	// Verify that long interface names are properly hashed
+	t.Run("long names are hashed to fit 15 char limit", func(t *testing.T) {
+		longName := "this-is-a-very-long-interface-name"
+		result, err := generateMacvlanName(longName)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, len(result), 15)
+		assert.True(t, strings.HasPrefix(result, "mac"))
+		// Should be "mac" + 8 hex chars = 11 chars
+		assert.Equal(t, 11, len(result))
 	})
 
-	t.Run("returns error for IPv6 CIDR", func(t *testing.T) {
-		_, err := generateMacvlanName("fd00::/64")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not a valid IPv4")
+	t.Run("empty master returns error", func(t *testing.T) {
+		_, err := generateMacvlanName("")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "empty")
 	})
 }
 
@@ -261,51 +272,6 @@ func TestGetNatGwNameFromPod(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Labels: tt.labels},
 			}
 			assert.Equal(t, tt.want, getNatGwNameFromPod(pod))
-		})
-	}
-}
-
-func TestGetIPv4CIDR(t *testing.T) {
-	tests := []struct {
-		name      string
-		cidrBlock string
-		want      string
-	}{
-		{
-			name:      "IPv4 only",
-			cidrBlock: "192.168.1.0/24",
-			want:      "192.168.1.0/24",
-		},
-		{
-			name:      "IPv6 only",
-			cidrBlock: "2001:db8::/64",
-			want:      "",
-		},
-		{
-			name:      "dual-stack IPv4 first",
-			cidrBlock: "192.168.1.0/24,2001:db8::/64",
-			want:      "192.168.1.0/24",
-		},
-		{
-			name:      "dual-stack IPv6 first",
-			cidrBlock: "2001:db8::/64,192.168.1.0/24",
-			want:      "192.168.1.0/24",
-		},
-		{
-			name:      "empty CIDR",
-			cidrBlock: "",
-			want:      "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			subnet := &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{
-					CIDRBlock: tt.cidrBlock,
-				},
-			}
-			assert.Equal(t, tt.want, getIPv4CIDR(subnet))
 		})
 	}
 }

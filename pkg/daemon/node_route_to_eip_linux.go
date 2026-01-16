@@ -11,6 +11,12 @@ package daemon
 // each EIP pointing to this sub-interface. This allows the node to reach
 // the EIP addresses via Layer 2 on the external network.
 //
+// Key design: One macvlan sub-interface per master interface (not per subnet).
+// Multiple subnets may share the same NAD (Network Attachment Definition) and
+// thus the same master interface. Creating one interface per master avoids
+// ARP conflicts that would occur if the same IP were configured on multiple
+// interfaces.
+//
 // Control flow:
 //  1. Subnet event (subnet with NadMacvlanMasterAnnotation):
 //     enqueueAddSubnet/enqueueUpdateSubnet/enqueueDeleteSubnet
@@ -33,11 +39,10 @@ package daemon
 //   - EnableNodeLocalAccessVpcNatGwEIP config flag must be true (default)
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net"
-	"strings"
 	"sync"
 	"syscall"
 
@@ -52,8 +57,8 @@ import (
 )
 
 const (
-	// macvlanLinkPrefix is the prefix for macvlan sub-interfaces created for node local EIP access
-	// Using short prefix "mac" (3 chars), leaving 8 chars for hex-encoded IPv4 address
+	// macvlanLinkPrefix is the prefix for macvlan sub-interfaces created for node local EIP access.
+	// Format: "mac" (3 chars) + master interface name or FNV hash (up to 12 chars) = max 15 chars.
 	macvlanLinkPrefix = "mac"
 )
 
@@ -71,37 +76,38 @@ type eipRouteInfo struct {
 	macvlanName string // macvlan sub-interface name for the route
 }
 
-// generateMacvlanName generates macvlan sub-interface name from IPv4 CIDR.
-// Format: "mac" (3 chars) + hex encoded IPv4 address (8 chars) = 11 chars.
+// generateMacvlanName generates macvlan sub-interface name from master interface name.
+// Format: "mac" (3 chars) + master name or FNV hash (up to 12 chars) = max 15 chars.
 // Linux interface names are limited to 15 characters.
 //
-// Using hex encoding avoids collisions that could occur with simple digit concatenation
-// (e.g., "192.168.1.0" and "19.216.81.0" would both produce "19216810").
+// For short master names (<=12 chars), appends master name directly.
+// For longer names, uses FNV-1a 32-bit hash to ensure uniqueness.
 //
 // Examples:
 //
-//	CIDR "192.168.1.0/24" -> "macc0a80100"
-//	CIDR "10.0.0.0/8"      -> "mac0a000000"
-//	CIDR "172.16.0.0/16"   -> "macac100000"
-//
-// Returns an error for invalid CIDRs or IPv6 addresses (not yet supported).
-// TODO: For IPv6 support, consider using FNV-1a hash to handle longer addresses.
-func generateMacvlanName(cidr string) (string, error) {
-	// Extract network address part (before /)
-	networkAddrStr := cidr
-	if idx := strings.Index(cidr, "/"); idx != -1 {
-		networkAddrStr = cidr[:idx]
+//	master "eth0"        -> "maceth0"
+//	master "bond0"       -> "macbond0"
+//	master "enp0s25"     -> "macenp0s25"
+//	master "very-long-interface-name" -> "mac" + hash
+func generateMacvlanName(master string) (string, error) {
+	if master == "" {
+		return "", errors.New("master interface name is empty")
 	}
 
-	ip := net.ParseIP(networkAddrStr)
-	// Currently this feature only supports IPv4.
-	if ip == nil || ip.To4() == nil {
-		return "", fmt.Errorf("generateMacvlanName: cidr=%s is not a valid IPv4, IPv6 is not supported yet", cidr)
+	maxMasterLen := 15 - len(macvlanLinkPrefix) // 12 chars for master part
+
+	// If master name fits, use it directly
+	if len(master) <= maxMasterLen {
+		name := macvlanLinkPrefix + master
+		klog.V(3).Infof("generateMacvlanName: master=%s -> name=%s", master, name)
+		return name, nil
 	}
 
-	// Use hex encoding of the IPv4 address to avoid collisions.
-	name := macvlanLinkPrefix + hex.EncodeToString(ip.To4())
-	klog.V(3).Infof("generateMacvlanName: cidr=%s -> name=%s", cidr, name)
+	// For longer names, use FNV-1a 32-bit hash (8 hex chars)
+	h := fnv.New32a()
+	h.Write([]byte(master))
+	name := fmt.Sprintf("%s%08x", macvlanLinkPrefix, h.Sum32())
+	klog.V(3).Infof("generateMacvlanName: master=%s (hashed) -> name=%s", master, name)
 	return name, nil
 }
 
@@ -161,11 +167,12 @@ func (c *Controller) addNodeIPToLink(link netlink.Link) error {
 }
 
 // createMacvlanSubInterface creates a macvlan sub-interface for node local EIP access.
-func (c *Controller) createMacvlanSubInterface(masterIface, cidr string) error {
-	macvlanName, err := generateMacvlanName(cidr)
+// The macvlan name is derived from the master interface name, ensuring only one
+// sub-interface is created per master interface even if multiple subnets use it.
+func (c *Controller) createMacvlanSubInterface(masterIface string) error {
+	macvlanName, err := generateMacvlanName(masterIface)
 	if err != nil {
-		klog.Error(err)
-		return err
+		return fmt.Errorf("createMacvlanSubInterface: %w", err)
 	}
 
 	// Check if sub-interface already exists
@@ -213,16 +220,15 @@ func (c *Controller) createMacvlanSubInterface(masterIface, cidr string) error {
 		}
 	}
 
-	klog.Infof("created macvlan sub-interface %s with master %s for cidr %s", macvlanName, masterIface, cidr)
+	klog.Infof("created macvlan sub-interface %s with master %s", macvlanName, masterIface)
 	return nil
 }
 
-// deleteMacvlanSubInterface deletes the macvlan sub-interface.
-func deleteMacvlanSubInterface(cidr string) error {
-	macvlanName, err := generateMacvlanName(cidr)
+// deleteMacvlanSubInterface deletes the macvlan sub-interface for the given master interface.
+func deleteMacvlanSubInterface(masterIface string) error {
+	macvlanName, err := generateMacvlanName(masterIface)
 	if err != nil {
-		klog.Error(err)
-		return err
+		return fmt.Errorf("deleteMacvlanSubInterface: %w", err)
 	}
 
 	link, err := netlink.LinkByName(macvlanName)
@@ -316,11 +322,15 @@ func deleteEIPRoute(eip, macvlanSubIfName string) error {
 // It processes subnet add/update/delete events and manages macvlan sub-interfaces accordingly.
 // This function is called by the macvlan subnet worker with independent retry mechanism.
 //
-// Handles all transitions of NadMacvlanMasterAnnotation and CIDR changes:
-//   - Annotation addition: create macvlan sub-interface
-//   - Annotation removal: delete macvlan sub-interface
-//   - Annotation value change: delete old macvlan, create new one with new master
-//   - CIDR change: delete old macvlan (with old CIDR-based name), create new one
+// Key design: One macvlan sub-interface per master interface (not per subnet).
+// Multiple subnets may share the same master interface via the same NAD.
+// The macvlan interface is created when the first subnet with that master appears,
+// and deleted only when no more subnets use that master.
+//
+// Handles all transitions of NadMacvlanMasterAnnotation:
+//   - Annotation addition: create macvlan sub-interface (if not exists)
+//   - Annotation removal: delete macvlan sub-interface (if no other subnet uses it)
+//   - Annotation value change: handle as removal + addition
 func (c *Controller) reconcileMacvlanSubnet(event *subnetEvent) error {
 	var oldSubnet, newSubnet *kubeovnv1.Subnet
 	if event.oldObj != nil {
@@ -331,36 +341,36 @@ func (c *Controller) reconcileMacvlanSubnet(event *subnetEvent) error {
 	}
 
 	oldMaster := ""
-	oldCIDR := ""
 	if oldSubnet != nil {
 		oldMaster = oldSubnet.Annotations[util.NadMacvlanMasterAnnotation]
-		oldCIDR = getIPv4CIDR(oldSubnet)
 	}
 	newMaster := ""
-	newCIDR := ""
 	if newSubnet != nil {
 		newMaster = newSubnet.Annotations[util.NadMacvlanMasterAnnotation]
-		newCIDR = getIPv4CIDR(newSubnet)
 	}
 
-	// No change in annotation or CIDR, nothing to do
-	if oldMaster == newMaster && oldCIDR == newCIDR {
+	// No change in master annotation, nothing to do
+	if oldMaster == newMaster {
 		return nil
 	}
 
-	// Annotation removed or changed, or CIDR changed: cleanup old macvlan interface
-	if oldMaster != "" && oldCIDR != "" {
-		if err := deleteMacvlanSubInterface(oldCIDR); err != nil {
-			klog.Errorf("failed to cleanup macvlan for subnet %s (cidr=%s): %v", oldSubnet.Name, oldCIDR, err)
-			return err
+	// Master annotation removed or changed: check if we should delete old macvlan
+	if oldMaster != "" {
+		if c.shouldDeleteMacvlanForMaster(oldMaster, oldSubnet.Name) {
+			if err := deleteMacvlanSubInterface(oldMaster); err != nil {
+				klog.Errorf("failed to cleanup macvlan for master %s (subnet %s): %v", oldMaster, oldSubnet.Name, err)
+				return err
+			}
+		} else {
+			klog.V(3).Infof("macvlan for master %s still in use by other subnets, skipping delete", oldMaster)
 		}
 	}
 
-	// Annotation added or changed: create new macvlan interface
-	if newMaster != "" && newCIDR != "" {
-		klog.V(3).Infof("creating macvlan sub-interface for subnet %s (master=%s, cidr=%s)", newSubnet.Name, newMaster, newCIDR)
-		if err := c.createMacvlanSubInterface(newMaster, newCIDR); err != nil {
-			klog.Errorf("failed to create macvlan for subnet %s: %v", newSubnet.Name, err)
+	// Master annotation added or changed: create new macvlan interface
+	if newMaster != "" {
+		klog.V(3).Infof("creating macvlan sub-interface for subnet %s (master=%s)", newSubnet.Name, newMaster)
+		if err := c.createMacvlanSubInterface(newMaster); err != nil {
+			klog.Errorf("failed to create macvlan for subnet %s (master=%s): %v", newSubnet.Name, newMaster, err)
 			return err
 		}
 	}
@@ -368,12 +378,25 @@ func (c *Controller) reconcileMacvlanSubnet(event *subnetEvent) error {
 	return nil
 }
 
-// getIPv4CIDR extracts IPv4 CIDR from subnet.
-// For dual-stack, uses util.SplitStringIP to extract IPv4 part.
-// Returns empty string if subnet is IPv6-only.
-func getIPv4CIDR(subnet *kubeovnv1.Subnet) string {
-	v4, _ := util.SplitStringIP(subnet.Spec.CIDRBlock)
-	return v4
+// shouldDeleteMacvlanForMaster checks if the macvlan interface for the given master
+// should be deleted. Returns true only if no other subnet uses the same master.
+// excludeSubnet is the subnet being deleted/changed, which should be excluded from the check.
+func (c *Controller) shouldDeleteMacvlanForMaster(master, excludeSubnet string) bool {
+	subnets, err := c.subnetsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list subnets: %v", err)
+		return false // Don't delete if we can't check
+	}
+
+	for _, subnet := range subnets {
+		if subnet.Name == excludeSubnet {
+			continue
+		}
+		if subnet.Annotations[util.NadMacvlanMasterAnnotation] == master {
+			return false // Another subnet uses this master
+		}
+	}
+	return true
 }
 
 // hasNatGwPodOnLocalNode checks if the NAT GW pod for the given NatGwDp is scheduled on the local node.
@@ -405,7 +428,7 @@ func shouldEnqueueIptablesEip(eip *kubeovnv1.IptablesEIP) bool {
 }
 
 // buildEipRouteInfo builds eipRouteInfo from an EIP object.
-// Returns nil if the EIP cannot be processed (e.g., subnet not found or no IPv4 CIDR).
+// Returns nil if the EIP cannot be processed (e.g., subnet not found or no master annotation).
 func (c *Controller) buildEipRouteInfo(eip *kubeovnv1.IptablesEIP) *eipRouteInfo {
 	if eip.Spec.V4ip == "" {
 		return nil
@@ -417,15 +440,15 @@ func (c *Controller) buildEipRouteInfo(eip *kubeovnv1.IptablesEIP) *eipRouteInfo
 		return nil
 	}
 
-	cidr := getIPv4CIDR(subnet)
-	if cidr == "" {
-		klog.Errorf("subnet %s has no IPv4 CIDR for EIP %s, IPv6 is not supported yet", subnet.Name, eip.Name)
+	master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
+	if master == "" {
+		klog.V(3).Infof("subnet %s has no macvlan master annotation for EIP %s", subnet.Name, eip.Name)
 		return nil
 	}
 
-	macvlanName, err := generateMacvlanName(cidr)
+	macvlanName, err := generateMacvlanName(master)
 	if err != nil {
-		klog.Errorf("failed to generate macvlan name for EIP %s (cidr=%s): %v", eip.Name, cidr, err)
+		klog.Errorf("failed to generate macvlan name for EIP %s (master=%s): %v", eip.Name, master, err)
 		return nil
 	}
 
