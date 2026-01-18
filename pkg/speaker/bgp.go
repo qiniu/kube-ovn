@@ -135,8 +135,9 @@ func (c *Controller) delRoute(route string) error {
 
 // getPathRequest returns paths to be used in add/delete path requests for a given route
 func (c *Controller) getPathRequest(route string) ([][]*apiutil.Path, error) {
-	// Should this route be advertised to IPv4 or IPv6 peers
-	// If extended-nexthop is enabled, we advertise IPv4 NLRIs to IPv6 peers and IPv6 NRLIs to IPv4 peers
+	// Determine which peers should receive this route announcement
+	// If extended-nexthop is enabled, advertise all routes to all peers (both IPv4 and IPv6)
+	// Otherwise, advertise IPv4 routes to IPv4 peers and IPv6 routes to IPv6 peers
 	neighborAddresses := c.config.NeighborAddresses
 	if c.config.ExtendedNexthop {
 		neighborAddresses = append(neighborAddresses, c.config.NeighborIPv6Addresses...)
@@ -232,4 +233,42 @@ func getNextHopFromPathAttributes(attrs []bgp.PathAttributeInterface) net.IP {
 		}
 	}
 	return nil
+}
+
+// isRouteAnnounced checks if a route is already being announced by this BGP speaker.
+// Returns true if the route exists in the BGP RIB with a local next hop.
+func (c *Controller) isRouteAnnounced(route string) bool {
+	prefix, err := parsePrefix(route)
+	if err != nil {
+		klog.Errorf("failed to parse route %s: %v", route, err)
+		return false
+	}
+
+	afi := prefixToAFI(prefix)
+	listPathRequest := apiutil.ListPathRequest{
+		TableType: api.TableType_TABLE_TYPE_GLOBAL,
+		Family:    apiutil.ToFamily(&api.Family{Afi: afi, Safi: api.Family_SAFI_UNICAST}),
+	}
+
+	found := false
+	fn := func(nlri bgp.NLRI, paths []*apiutil.Path) {
+		if nlri.String() != prefix.String() {
+			return
+		}
+		for _, path := range paths {
+			nextHop := getNextHopFromPathAttributes(path.Attrs)
+			routes, _ := netlink.RouteGet(nextHop)
+			if (len(routes) == 1 && routes[0].Type == unix.RTN_LOCAL) || nextHop.Equal(c.config.RouterID) {
+				found = true
+				return
+			}
+		}
+	}
+
+	if err := c.config.BgpServer.ListPath(listPathRequest, fn); err != nil {
+		klog.Errorf("failed to list paths for route %s: %v", route, err)
+		return false
+	}
+
+	return found
 }

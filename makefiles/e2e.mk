@@ -99,6 +99,8 @@ e2e-build:
 	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/metallb
 	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/anp-domain
 	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/cnp-domain
+	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/speaker
+	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/bgp-iptables-eip
 
 .PHONY: k8s-conformance-e2e
 k8s-conformance-e2e:
@@ -333,3 +335,21 @@ kube-ovn-underlay-metallb-e2e:
 	E2E_NETWORK_MODE=$(E2E_NETWORK_MODE) \
 	ginkgo $(GINKGO_OUTPUT_OPT) $(GINKGO_PARALLEL_OPT) --randomize-all -v \
 		--focus=CNI:Kube-OVN ./test/e2e/metallb/metallb.test -- $(TEST_BIN_ARGS)
+
+.PHONY: kube-ovn-speaker-e2e
+kube-ovn-speaker-e2e:
+	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/speaker
+	E2E_BRANCH=$(E2E_BRANCH) \
+	E2E_IP_FAMILY=$(E2E_IP_FAMILY) \
+	E2E_NETWORK_MODE=$(E2E_NETWORK_MODE) \
+	ginkgo $(GINKGO_OUTPUT_OPT) --randomize-all -v --timeout=5m \
+		--focus=CNI:Kube-OVN ./test/e2e/speaker/speaker.test -- $(TEST_BIN_ARGS)
+
+.PHONY: bgp-iptables-eip-e2e
+bgp-iptables-eip-e2e:
+	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/bgp-iptables-eip
+	E2E_BRANCH=$(E2E_BRANCH) \
+	E2E_IP_FAMILY=$(E2E_IP_FAMILY) \
+	E2E_NETWORK_MODE=$(E2E_NETWORK_MODE) \
+	ginkgo $(GINKGO_OUTPUT_OPT) --randomize-all -v --timeout=10m \
+		--focus=CNI:Kube-OVN ./test/e2e/bgp-iptables-eip/bgp-iptables-eip.test -- $(TEST_BIN_ARGS)
