@@ -9,6 +9,7 @@ RUN set -ex \
     iptables iptables-legacy \
     iputils \
     tcpdump \
+    netcat-openbsd \
     conntrack-tools
 
 WORKDIR /kube-ovn
