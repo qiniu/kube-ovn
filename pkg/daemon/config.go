@@ -152,7 +152,7 @@ func ParseFlags() *Configuration {
 
 		// Node-local EIP access for VPC NAT Gateway
 		argEnableNodeLocalAccessVpcNatGwEIP = pflag.Bool("enable-node-local-access-vpc-nat-gw-eip", true, "Enable node local access to VPC NAT gateway iptables EIP addresses via macvlan sub-interface")
-		argNonPrimaryCNI   = pflag.Bool("non-primary-cni-mode", false, "Use Kube-OVN in non primary cni mode. When true, skip setting NetworkUnavailable node condition")
+		argNonPrimaryCNI                    = pflag.Bool("non-primary-cni-mode", false, "Use Kube-OVN in non primary cni mode. When true, skip setting NetworkUnavailable node condition")
 	)
 
 	// mute info log for ipset lib
@@ -226,7 +226,7 @@ func ParseFlags() *Configuration {
 
 		// Node-local access to eip in VPC NAT Gateway pod
 		EnableNodeLocalAccessVpcNatGwEIP: *argEnableNodeLocalAccessVpcNatGwEIP,
-		EnableNonPrimaryCNI:       *argNonPrimaryCNI,
+		EnableNonPrimaryCNI:              *argNonPrimaryCNI,
 	}
 
 	return config
