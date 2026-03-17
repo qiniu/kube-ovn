@@ -740,14 +740,15 @@ func (c *Controller) setIptables() error {
 			klog.Errorf("failed to check existence of ipset %s: %v", ipset, err)
 			return err
 		}
-		if ipsetExists {
+		if ipsetExists && !c.config.DisableSvcIptablesRule {
 			iptablesRules[0].Rule = strings.Fields(fmt.Sprintf(`-i %s -m set --match-set %s src -m set --match-set %s dst,dst -j MARK --set-xmark 0x4000/0x4000`, util.NodeNic, matchset, ipset))
 			rejectRule := strings.Fields(fmt.Sprintf(`-p tcp -m mark ! --mark 0x4000/0x4000 -m set --match-set %s dst -m conntrack --ctstate NEW -j REJECT`, svcMatchset))
-			obsoleteRejectRule := strings.Fields(fmt.Sprintf(`-m mark ! --mark 0x4000/0x4000 -m set --match-set %s dst -m conntrack --ctstate NEW -j REJECT`, svcMatchset))
 			iptablesRules = append(iptablesRules,
 				util.IPTableRule{Table: "filter", Chain: "INPUT", Rule: rejectRule},
 				util.IPTableRule{Table: "filter", Chain: "OUTPUT", Rule: rejectRule},
 			)
+			// TODO: remove obsoleteRejectRule cleanup after all clusters have upgraded past v1.12
+			obsoleteRejectRule := strings.Fields(fmt.Sprintf(`-m mark ! --mark 0x4000/0x4000 -m set --match-set %s dst -m conntrack --ctstate NEW -j REJECT`, svcMatchset))
 			obsoleteRejectRules := []util.IPTableRule{
 				{Table: "filter", Chain: "INPUT", Rule: obsoleteRejectRule},
 				{Table: "filter", Chain: "OUTPUT", Rule: obsoleteRejectRule},
@@ -766,7 +767,53 @@ func (c *Controller) setIptables() error {
 				{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m mark --mark 0x4000/0x4000 -j MASQUERADE`, nodeIP))},
 				{Table: NAT, Chain: Postrouting, Rule: strings.Fields(fmt.Sprintf(`! -s %s -m set ! --match-set %s src -m set --match-set %s dst -j MASQUERADE`, nodeIP, matchset, matchset))},
 			}
+		}
 
+		if c.config.DisableSvcIptablesRule {
+			// Filter out service-related rules from iptablesRules and clean up
+			// any existing service rules in standard chains.
+			// Rules in custom chains (OvnPrerouting, OvnPostrouting) are automatically
+			// reconciled by updateIptablesChain.
+
+			// Clean up reject rules for unmatched service traffic
+			rejectRule := strings.Fields(fmt.Sprintf(`-p tcp -m mark ! --mark 0x4000/0x4000 -m set --match-set %s dst -m conntrack --ctstate NEW -j REJECT`, svcMatchset))
+			obsoleteRejectRule := strings.Fields(fmt.Sprintf(`-m mark ! --mark 0x4000/0x4000 -m set --match-set %s dst -m conntrack --ctstate NEW -j REJECT`, svcMatchset))
+			rejectRulesToClean := []util.IPTableRule{
+				{Table: "filter", Chain: "INPUT", Rule: rejectRule},
+				{Table: "filter", Chain: "OUTPUT", Rule: rejectRule},
+				{Table: "filter", Chain: "INPUT", Rule: obsoleteRejectRule},
+				{Table: "filter", Chain: "OUTPUT", Rule: obsoleteRejectRule},
+			}
+			for _, rule := range rejectRulesToClean {
+				if err = deleteIptablesRule(ipt, rule); err != nil {
+					klog.Errorf("failed to delete service reject iptables rule %v: %v", rule, err)
+					return err
+				}
+			}
+
+			var filteredRules []util.IPTableRule
+			for _, rule := range iptablesRules {
+				ruleStr := strings.Join(rule.Rule, " ")
+				// Skip MARK 0x4000 rule in OvnPrerouting (pod → service marking)
+				if rule.Table == NAT && rule.Chain == OvnPrerouting && strings.Contains(ruleStr, "0x4000/0x4000") {
+					continue
+				}
+				// Skip 0x4000 MASQUERADE rule in OvnPostrouting
+				if rule.Table == NAT && rule.Chain == OvnPostrouting && strings.Contains(ruleStr, "0x4000/0x4000") && strings.Contains(ruleStr, OvnMasquerade) {
+					continue
+				}
+				// Clean up and skip service ACCEPT rules in filter chains
+				if rule.Table == "filter" && strings.Contains(ruleStr, svcMatchset) {
+					if err = deleteIptablesRule(ipt, rule); err != nil {
+						klog.Errorf("failed to delete service iptables rule %v: %v", rule, err)
+						return err
+					}
+					continue
+				}
+				filteredRules = append(filteredRules, rule)
+			}
+			iptablesRules = filteredRules
+		} else if nodeIP := nodeIPs[protocol]; nodeIP != "" {
 			rules := make([]util.IPTableRule, len(iptablesRules)+1)
 			copy(rules, iptablesRules[:1])
 			copy(rules[2:], iptablesRules[1:])

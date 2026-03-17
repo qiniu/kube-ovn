@@ -189,15 +189,19 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		return errors.New("iptables nat gw not enable")
 	}
 
-	if _, err := c.vpcsLister.Get(gw.Spec.Vpc); err != nil {
-		err = fmt.Errorf("failed to get vpc '%s', err: %w", gw.Spec.Vpc, err)
-		klog.Error(err)
-		return err
+	if gw.Spec.Vpc != "" {
+		if _, err := c.vpcsLister.Get(gw.Spec.Vpc); err != nil {
+			err = fmt.Errorf("failed to get vpc '%s', err: %w", gw.Spec.Vpc, err)
+			klog.Error(err)
+			return err
+		}
 	}
-	if _, err := c.subnetsLister.Get(gw.Spec.Subnet); err != nil {
-		err = fmt.Errorf("failed to get subnet '%s', err: %w", gw.Spec.Subnet, err)
-		klog.Error(err)
-		return err
+	if gw.Spec.Subnet != "" {
+		if _, err := c.subnetsLister.Get(gw.Spec.Subnet); err != nil {
+			err = fmt.Errorf("failed to get subnet '%s', err: %w", gw.Spec.Subnet, err)
+			klog.Error(err)
+			return err
+		}
 	}
 
 	var natGwPodContainerRestartCount int32
@@ -346,30 +350,40 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 			klog.Errorf("failed to extract external nad interface name from runtime Pod annotation network-status, %v", err)
 			return err
 		}
-		// extract vpc nad interface name
-		providers, err := c.getPodProviders(pod)
-		if err != nil || len(providers) == 0 {
-			klog.Errorf("failed to get providers for pod %s/%s: %v", pod.Namespace, pod.Name, err)
-			return fmt.Errorf("failed to get providers for pod %s/%s: %w", pod.Namespace, pod.Name, err)
-		}
-		// if more than one provider exists, use the first one
-		provider := providers[0]
-		providerParts := strings.Split(provider, ".")
-		if len(providerParts) < 2 {
-			klog.Errorf("failed to format provider %s for pod %s/%s", provider, pod.Namespace, pod.Name)
-			return fmt.Errorf("failed to format provider %s parts for pod %s/%s", provider, pod.Namespace, pod.Name)
-		}
-		vpcNadName, vpcNadNamespace := providerParts[0], providerParts[1]
-		vpcNadFullName := fmt.Sprintf("%s/%s", vpcNadNamespace, vpcNadName)
-		vpcNadIfName, err := util.GetNadInterfaceFromNetworkStatusAnnotation(networkStatusAnnotations, vpcNadFullName)
-		if err != nil {
-			klog.Errorf("failed to extract internal nad interface name from runtime Pod annotation network-status, %v", err)
-			return err
-		}
 
-		klog.Infof("nat gw pod %s/%s internal nad interface %s, external nad interface %s", pod.Namespace, pod.Name, vpcNadIfName, externalNadIfName)
-		interfaces = []string{
-			strings.Join([]string{vpcNadIfName, externalNadIfName}, ","),
+		if gw.Spec.Subnet != "" {
+			// 3-NIC mode (currently broken for non-primary-cni): extract vpc nad interface name
+			providers, err := c.getPodProviders(pod)
+			if err != nil || len(providers) == 0 {
+				klog.Errorf("failed to get providers for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+				return fmt.Errorf("failed to get providers for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+			}
+			// if more than one provider exists, use the first one
+			provider := providers[0]
+			providerParts := strings.Split(provider, ".")
+			if len(providerParts) < 2 {
+				klog.Errorf("failed to format provider %s for pod %s/%s", provider, pod.Namespace, pod.Name)
+				return fmt.Errorf("failed to format provider %s parts for pod %s/%s", provider, pod.Namespace, pod.Name)
+			}
+			vpcNadName, vpcNadNamespace := providerParts[0], providerParts[1]
+			vpcNadFullName := fmt.Sprintf("%s/%s", vpcNadNamespace, vpcNadName)
+			vpcNadIfName, err := util.GetNadInterfaceFromNetworkStatusAnnotation(networkStatusAnnotations, vpcNadFullName)
+			if err != nil {
+				klog.Errorf("failed to extract internal nad interface name from runtime Pod annotation network-status, %v", err)
+				return err
+			}
+
+			klog.Infof("nat gw pod %s/%s internal nad interface %s, external nad interface %s", pod.Namespace, pod.Name, vpcNadIfName, externalNadIfName)
+			interfaces = []string{
+				strings.Join([]string{vpcNadIfName, externalNadIfName}, ","),
+			}
+		} else {
+			// Decoupled 2-NIC mode: eth0 from Calico (primary CNI), external NAD is the WAN interface.
+			// nat-gateway.sh init requires exactly 2 comma-separated interfaces: VPC_INTERFACE,EXTERNAL_INTERFACE
+			klog.Infof("nat gw pod %s/%s decoupled mode, external nad interface %s", pod.Namespace, pod.Name, externalNadIfName)
+			interfaces = []string{
+				strings.Join([]string{"eth0", externalNadIfName}, ","),
+			}
 		}
 	}
 	if err = c.execNatGwRules(pod, natGwInit, interfaces); err != nil {
@@ -901,10 +915,16 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 		return nil, err
 	}
 
-	eth0SubnetProvider, err := c.GetSubnetProvider(gw.Spec.Subnet)
-	if err != nil {
-		klog.Errorf("failed to get gw eth0 valid subnet provider: %v", err)
-		return nil, err
+	// In decoupled non-primary-cni mode (2-NIC), subnet is empty — skip OVN internal subnet logic.
+	var eth0SubnetProvider string
+	if gw.Spec.Subnet != "" {
+		eth0SubnetProvider, err = c.GetSubnetProvider(gw.Spec.Subnet)
+		if err != nil {
+			klog.Errorf("failed to get gw eth0 valid subnet provider: %v", err)
+			return nil, err
+		}
+		// TODO: 3-NIC non-primary-cni mode: when EnableNonPrimaryCNI is true and subnet is specified,
+		// should add internal subnet NAD to k8s.v1.cni.cncf.io/networks for it to actually work.
 	}
 
 	// Get additional networks specified by user in VpcNatGateway CR metadata.annotations (for secondary CNI mode)
@@ -939,48 +959,51 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 		}
 	}
 
-	// Retrieve all subnets in existence
-	subnets, err := c.subnetsLister.List(labels.Everything())
-	if err != nil {
-		klog.Errorf("failed to list subnets: %v", err)
-		return nil, err
-	}
-
-	// Configure eth0 (OVN internal network) routes
-	// Retrieve the gateways of the subnet sitting behind the NAT gateway
-	eth0V4Gateway, eth0V6Gateway, err := c.GetGwBySubnet(gw.Spec.Subnet)
-	if err != nil {
-		klog.Errorf("failed to get gateway ips for subnet %s: %v", gw.Spec.Subnet, err)
-		return nil, err
-	}
-
-	// Add routes to join the services (is this still needed?)
-	// It seems like the script inside the NAT GW already does that
-	v4ClusterIPRange, v6ClusterIPRange := util.SplitStringIP(c.config.ServiceClusterIPRange)
+	// Configure eth0 (OVN internal network) routes — only when subnet is specified.
+	var eth0V4Gateway, eth0V6Gateway string
 	routes := make([]request.Route, 0, 2)
-	if eth0V4Gateway != "" && v4ClusterIPRange != "" {
-		routes = append(routes, request.Route{Destination: v4ClusterIPRange, Gateway: eth0V4Gateway})
-	}
-	if eth0V6Gateway != "" && v6ClusterIPRange != "" {
-		routes = append(routes, request.Route{Destination: v6ClusterIPRange, Gateway: eth0V6Gateway})
-	}
+	if gw.Spec.Subnet != "" {
+		// Retrieve all subnets in existence
+		subnets, err := c.subnetsLister.List(labels.Everything())
+		if err != nil {
+			klog.Errorf("failed to list subnets: %v", err)
+			return nil, err
+		}
 
-	// Add gateway to join every subnet in the same VPC? (is this still needed?)
-	// Are we trying to give the NAT gateway access to every subnet in the VPC?
-	// I suspect this is to solve a problem where a static route is inserted to redirect all the traffic
-	// from a VPC into the NAT GW. When that happens, the GW has no return path to the other subnets.
-	for _, subnet := range subnets {
-		if subnet.Spec.Vpc != gw.Spec.Vpc || subnet.Name == gw.Spec.Subnet ||
-			!isOvnSubnet(subnet) || !subnet.Status.IsValidated() ||
-			(subnet.Spec.Vlan != "" && !subnet.Spec.U2OInterconnection) {
-			continue
+		// Retrieve the gateways of the subnet sitting behind the NAT gateway
+		eth0V4Gateway, eth0V6Gateway, err = c.GetGwBySubnet(gw.Spec.Subnet)
+		if err != nil {
+			klog.Errorf("failed to get gateway ips for subnet %s: %v", gw.Spec.Subnet, err)
+			return nil, err
 		}
-		cidrV4, cidrV6 := util.SplitStringIP(subnet.Spec.CIDRBlock)
-		if cidrV4 != "" && eth0V4Gateway != "" {
-			routes = append(routes, request.Route{Destination: cidrV4, Gateway: eth0V4Gateway})
+
+		// Add routes to join the services (is this still needed?)
+		// It seems like the script inside the NAT GW already does that
+		v4ClusterIPRange, v6ClusterIPRange := util.SplitStringIP(c.config.ServiceClusterIPRange)
+		if eth0V4Gateway != "" && v4ClusterIPRange != "" {
+			routes = append(routes, request.Route{Destination: v4ClusterIPRange, Gateway: eth0V4Gateway})
 		}
-		if cidrV6 != "" && eth0V6Gateway != "" {
-			routes = append(routes, request.Route{Destination: cidrV6, Gateway: eth0V6Gateway})
+		if eth0V6Gateway != "" && v6ClusterIPRange != "" {
+			routes = append(routes, request.Route{Destination: v6ClusterIPRange, Gateway: eth0V6Gateway})
+		}
+
+		// Add gateway to join every subnet in the same VPC? (is this still needed?)
+		// Are we trying to give the NAT gateway access to every subnet in the VPC?
+		// I suspect this is to solve a problem where a static route is inserted to redirect all the traffic
+		// from a VPC into the NAT GW. When that happens, the GW has no return path to the other subnets.
+		for _, subnet := range subnets {
+			if subnet.Spec.Vpc != gw.Spec.Vpc || subnet.Name == gw.Spec.Subnet ||
+				!isOvnSubnet(subnet) || !subnet.Status.IsValidated() ||
+				(subnet.Spec.Vlan != "" && !subnet.Spec.U2OInterconnection) {
+				continue
+			}
+			cidrV4, cidrV6 := util.SplitStringIP(subnet.Spec.CIDRBlock)
+			if cidrV4 != "" && eth0V4Gateway != "" {
+				routes = append(routes, request.Route{Destination: cidrV4, Gateway: eth0V4Gateway})
+			}
+			if cidrV6 != "" && eth0V6Gateway != "" {
+				routes = append(routes, request.Route{Destination: cidrV6, Gateway: eth0V6Gateway})
+			}
 		}
 	}
 
@@ -996,14 +1019,22 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 			} else {
 				nexthop = eth0V6Gateway
 			}
+			if nexthop == "" {
+				klog.Warningf("skipping route %s for nat gw %s: nexthop 'gateway' cannot be resolved without subnet", route.CIDR, gw.Name)
+				continue
+			}
 		}
 
 		routes = append(routes, request.Route{Destination: route.CIDR, Gateway: nexthop})
 	}
 
-	if err = setPodRoutesAnnotation(templateAnnotations, eth0SubnetProvider, routes); err != nil {
-		klog.Error(err)
-		return nil, err
+	if len(routes) > 0 && eth0SubnetProvider != "" {
+		if err = setPodRoutesAnnotation(templateAnnotations, eth0SubnetProvider, routes); err != nil {
+			klog.Error(err)
+			return nil, err
+		}
+	} else if len(routes) > 0 {
+		klog.Warningf("skipping %d custom route(s) for nat gw %s: no OVN subnet provider in decoupled mode", len(routes), gw.Name)
 	}
 
 	// Set the default routes to the external network

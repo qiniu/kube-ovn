@@ -320,34 +320,37 @@ func (v *ValidatingHook) iptablesFipUpdateHook(ctx context.Context, req admissio
 }
 
 func (v *ValidatingHook) ValidateVpcNatGW(ctx context.Context, gw *ovnv1.VpcNatGateway) error {
-	if gw.Spec.Vpc == "" {
-		return errors.New("parameter \"vpc\" cannot be empty")
-	}
-	vpc := &ovnv1.Vpc{}
-	key := types.NamespacedName{Name: gw.Spec.Vpc}
-	if err := v.cache.Get(ctx, key, vpc); err != nil {
-		return err
+	// In decoupled non-primary-cni mode (2-NIC), vpc and subnet may both be empty.
+	// When specified, they must be specified together.
+	if (gw.Spec.Vpc == "") != (gw.Spec.Subnet == "") {
+		return errors.New("vpc and subnet must be both specified or both empty")
 	}
 
-	if gw.Spec.Subnet == "" {
-		return errors.New("parameter \"subnet\" cannot be empty")
+	if gw.Spec.Vpc != "" {
+		vpc := &ovnv1.Vpc{}
+		key := types.NamespacedName{Name: gw.Spec.Vpc}
+		if err := v.cache.Get(ctx, key, vpc); err != nil {
+			return err
+		}
 	}
 
-	subnet := &ovnv1.Subnet{}
-	key = types.NamespacedName{Name: gw.Spec.Subnet}
-	if err := v.cache.Get(ctx, key, subnet); err != nil {
-		return err
-	}
+	if gw.Spec.Subnet != "" {
+		subnet := &ovnv1.Subnet{}
+		key := types.NamespacedName{Name: gw.Spec.Subnet}
+		if err := v.cache.Get(ctx, key, subnet); err != nil {
+			return err
+		}
 
-	if net.ParseIP(gw.Spec.LanIP) == nil {
-		err := fmt.Errorf("lanIP %s is not a valid", gw.Spec.LanIP)
-		return err
-	}
+		if gw.Spec.LanIP != "" {
+			if net.ParseIP(gw.Spec.LanIP) == nil {
+				return fmt.Errorf("lanIP %s is not a valid", gw.Spec.LanIP)
+			}
 
-	if !util.CIDRContainIP(subnet.Spec.CIDRBlock, gw.Spec.LanIP) {
-		err := fmt.Errorf("lanIP %s is not in the range of subnet %s, cidr %v",
-			gw.Spec.LanIP, subnet.Name, subnet.Spec.CIDRBlock)
-		return err
+			if !util.CIDRContainIP(subnet.Spec.CIDRBlock, gw.Spec.LanIP) {
+				return fmt.Errorf("lanIP %s is not in the range of subnet %s, cidr %v",
+					gw.Spec.LanIP, subnet.Name, subnet.Spec.CIDRBlock)
+			}
+		}
 	}
 
 	for _, t := range gw.Spec.Tolerations {
@@ -367,7 +370,7 @@ func (v *ValidatingHook) ValidateVpcNatGW(ctx context.Context, gw *ovnv1.VpcNatG
 
 	if gw.Spec.QoSPolicy != "" {
 		qos := &ovnv1.QoSPolicy{}
-		key = types.NamespacedName{Name: gw.Spec.QoSPolicy}
+		key := types.NamespacedName{Name: gw.Spec.QoSPolicy}
 		if err := v.cache.Get(ctx, key, qos); err != nil {
 			return err
 		}

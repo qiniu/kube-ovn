@@ -409,6 +409,48 @@ func TestGenNatGwPodAnnotations(t *testing.T) {
 			expected:             nil,
 			expectError:          true,
 		},
+		{
+			name: "Decoupled 2-NIC mode (empty subnet) only produces external NAD and vpc_nat_gw annotations",
+			gw: v1.VpcNatGateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "decoupled-gw",
+				},
+				Spec: v1.VpcNatGatewaySpec{
+					Subnet: "",
+					LanIP:  "",
+				},
+			},
+			externalNadName:      "external-subnet",
+			externalNadNamespace: metav1.NamespaceSystem,
+			provider:             "",
+			additionalNetworks:   "",
+			expected: map[string]string{
+				VpcNatGatewayAnnotation:      "decoupled-gw",
+				nadv1.NetworkAttachmentAnnot: "kube-system/external-subnet",
+			},
+			expectError: false,
+		},
+		{
+			name: "Decoupled 2-NIC mode with additional networks",
+			gw: v1.VpcNatGateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "decoupled-gw-extra",
+				},
+				Spec: v1.VpcNatGatewaySpec{
+					Subnet: "",
+					LanIP:  "",
+				},
+			},
+			externalNadName:      "external-subnet",
+			externalNadNamespace: metav1.NamespaceSystem,
+			provider:             "",
+			additionalNetworks:   "default/extra-net1",
+			expected: map[string]string{
+				VpcNatGatewayAnnotation:      "decoupled-gw-extra",
+				nadv1.NetworkAttachmentAnnot: "default/extra-net1, kube-system/external-subnet",
+			},
+			expectError: false,
+		},
 	}
 
 	for _, tc := range tests {

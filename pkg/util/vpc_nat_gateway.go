@@ -84,20 +84,24 @@ func GenNatGwPodAnnotations(userAnnotations map[string]string, gw *kubeovnv1.Vpc
 	// Set system annotations (overwrites any conflicting user annotations)
 	result[nadv1.NetworkAttachmentAnnot] = attachedNetworks
 	result[VpcNatGatewayAnnotation] = gw.Name
-	result[fmt.Sprintf(LogicalSwitchAnnotationTemplate, p)] = gw.Spec.Subnet
-	result[fmt.Sprintf(IPAddressAnnotationTemplate, p)] = gw.Spec.LanIP
 
-	// We're using a custom provider, we need to override the default network of the pod so that the
-	// default VPC/Subnet of the cluster isn't accidentally injected.
-	if p != OvnProvider {
-		// Subdivide the provider so we can infer the namespace/name of the NetworkAttachmentDefinition
-		providerSplit := strings.Split(provider, ".")
-		if len(providerSplit) != 3 || providerSplit[2] != OvnProvider {
-			return nil, fmt.Errorf("name of the provider must have syntax 'name.namespace.ovn', got %s", provider)
+	// In decoupled non-primary-cni mode (2-NIC), subnet is empty — skip OVN subnet annotations.
+	if gw.Spec.Subnet != "" {
+		result[fmt.Sprintf(LogicalSwitchAnnotationTemplate, p)] = gw.Spec.Subnet
+		result[fmt.Sprintf(IPAddressAnnotationTemplate, p)] = gw.Spec.LanIP
+
+		// We're using a custom provider, we need to override the default network of the pod so that the
+		// default VPC/Subnet of the cluster isn't accidentally injected.
+		if p != OvnProvider {
+			// Subdivide the provider so we can infer the namespace/name of the NetworkAttachmentDefinition
+			providerSplit := strings.Split(provider, ".")
+			if len(providerSplit) != 3 || providerSplit[2] != OvnProvider {
+				return nil, fmt.Errorf("name of the provider must have syntax 'name.namespace.ovn', got %s", provider)
+			}
+
+			name, namespace := providerSplit[0], providerSplit[1]
+			result[DefaultNetworkAnnotation] = fmt.Sprintf("%s/%s", namespace, name)
 		}
-
-		name, namespace := providerSplit[0], providerSplit[1]
-		result[DefaultNetworkAnnotation] = fmt.Sprintf("%s/%s", namespace, name)
 	}
 
 	return result, nil
