@@ -93,6 +93,7 @@ type Configuration struct {
 	EnableEcmp                  bool
 	EnableKeepVMIP              bool
 	EnableLbSvc                 bool
+	EnableBgpLbVip              bool
 	EnableOVNLBPreferLocal      bool
 	EnableMetrics               bool
 	EnableANP                   bool
@@ -199,6 +200,7 @@ func ParseFlags() (*Configuration, error) {
 		argEnableEcmp                  = pflag.Bool("enable-ecmp", false, "Enable ecmp route for centralized subnet")
 		argKeepVMIP                    = pflag.Bool("keep-vm-ip", true, "Whether to keep ip for kubevirt pod when pod is rebuild")
 		argEnableLbSvc                 = pflag.Bool("enable-lb-svc", false, "Whether to support loadbalancer service")
+		argEnableBgpLbVip              = pflag.Bool("enable-bgp-lb-vip", false, "Whether to allocate a LoadBalancer external IP via a VIP (type=bgp_lb_vip) and announce it through BGP speaker")
 		argEnableOVNLBPreferLocal      = pflag.Bool("enable-ovn-lb-prefer-local", false, "Whether to support ovn loadbalancer prefer local")
 		argEnableMetrics               = pflag.Bool("enable-metrics", true, "Whether to support metrics query")
 		argEnableANP                   = pflag.Bool("enable-anp", false, "Enable support for admin network policy and baseline admin network policy")
@@ -310,6 +312,7 @@ func ParseFlags() (*Configuration, error) {
 		GCInterval:                     *argGCInterval,
 		InspectInterval:                *argInspectInterval,
 		EnableLbSvc:                    *argEnableLbSvc,
+		EnableBgpLbVip:                 *argEnableBgpLbVip,
 		EnableOVNLBPreferLocal:         *argEnableOVNLBPreferLocal,
 		EnableMetrics:                  *argEnableMetrics,
 		EnableOVNIPSec:                 *argEnableOVNIPSec,
@@ -332,6 +335,10 @@ func ParseFlags() (*Configuration, error) {
 	}
 	if config.OvsDbInactivityTimeout > 0 && config.OvsDbConnectTimeout >= config.OvsDbInactivityTimeout {
 		return nil, errors.New("OVS DB inactivity timeout value should be greater than reconnect timeout value")
+	}
+
+	if err := config.validateModeFlags(); err != nil {
+		return nil, err
 	}
 
 	if config.NetworkType == util.NetworkTypeVlan && config.DefaultHostInterface == "" {
@@ -385,6 +392,16 @@ func ParseFlags() (*Configuration, error) {
 
 	klog.Infof("config is %+v", config)
 	return config, nil
+}
+
+func (config *Configuration) validateModeFlags() error {
+	// TODO: If we need to support both modes in the future, replace this hard
+	// mutual-exclusion check with explicit dispatch rules per Service behavior.
+	if config.EnableBgpLbVip && config.EnableLbSvc {
+		return errors.New("--enable-bgp-lb-vip and --enable-lb-svc are mutually exclusive")
+	}
+
+	return nil
 }
 
 func (config *Configuration) initKubeClient() error {
