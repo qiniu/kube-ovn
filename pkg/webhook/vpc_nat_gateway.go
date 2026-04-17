@@ -84,6 +84,7 @@ func (v *ValidatingHook) iptablesEIPCreateHook(ctx context.Context, req admissio
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
+	// lbSvc EIPs are IPAM-only and have no NatGwDp; skip NAT-gateway config checks.
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
@@ -109,6 +110,9 @@ func (v *ValidatingHook) iptablesEIPUpdateHook(ctx context.Context, req admissio
 	if err := v.decoder.DecodeRaw(req.OldObject, &eipOld); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
+
+	// lbSvc EIPs are IPAM-only and have no NatGwDp. Their only immutability rule:
+	// once an IP is allocated (Spec.V4ip or Spec.V6ip set), it cannot be changed.
 
 	// IptablesEIP is an internal resource of a NatGwDp. Once created and Ready,
 	// its Spec (including V4ip address) is immutable — the Ready check below blocks

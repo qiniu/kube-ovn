@@ -326,6 +326,24 @@ false
 			<td>Enable the kube-ovn-speaker.</td>
 		</tr>
 		<tr>
+			<td>bgpSpeaker.enableLbSvcAnnounce</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable announcing LoadBalancer Service ingress IPs for Services bound by ovn.kubernetes.io/bgp-vip.</td>
+		</tr>
+		<tr>
+			<td>bgpSpeaker.extraEnv</td>
+			<td>list</td>
+			<td><pre lang="json">
+[]
+</pre>
+</td>
+			<td>Extra environment variables to be added to kube-ovn-speaker pods.</td>
+		</tr>
+		<tr>
 			<td>bgpSpeaker.labels</td>
 			<td>object</td>
 			<td><pre lang="json">

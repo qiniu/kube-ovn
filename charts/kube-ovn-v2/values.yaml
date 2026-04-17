@@ -198,6 +198,7 @@ features:
   # -- Enable Kube-OVN loadbalancer services
   # @section -- Opt-in/out Features
   enableLoadbalancerService: false
+  enableBgpLbVip: false
   # -- Enable persistent VM IPs
   # @section -- Opt-in/out Features
   enableKeepVmIps: true
@@ -497,6 +498,24 @@ bgpSpeaker:
   # -- Enable the kube-ovn-speaker.
   # @section -- BGP speaker configuration
   enabled: false
+  # -- Enable announcing LoadBalancer Service ingress IPs for Services bound by ovn.kubernetes.io/bgp-vip.
+  # @section -- BGP speaker configuration
+  enableLbSvcAnnounce: false
+  # -- Override image settings for kube-ovn-speaker. Empty fields fall back to the global kube-ovn image.
+  # @section -- BGP speaker configuration
+  image:
+    # -- Registry override for this component image. This becomes the rendered image address. Defaults to `.global.registry.address`.
+    # @section -- BGP speaker configuration
+    registry: ""
+    # -- Repository override for this component image. Defaults to `.global.images.kubeovn.repository`.
+    # @section -- BGP speaker configuration
+    repository: ""
+    # -- Tag override for this component image. Defaults to `.global.images.kubeovn.tag`.
+    # @section -- BGP speaker configuration
+    tag: ""
+    # -- Pull policy override for this component image. Defaults to `.image.pullPolicy`.
+    # @section -- BGP speaker configuration
+    pullPolicy: ""
   # -- Annotations to be added to all top-level kube-ovn-speaker objects (resources under templates/speaker)
   # @section -- BGP speaker configuration
   annotations: {}

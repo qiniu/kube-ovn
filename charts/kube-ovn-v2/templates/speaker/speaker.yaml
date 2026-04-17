@@ -72,6 +72,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - /kube-ovn/kube-ovn-speaker
+          args:
+            - --logtostderr=false
+            - --alsologtostderr=true
+            - --log_file=/var/log/kube-ovn/kube-ovn-speaker.log
+            - --log_file_max_size=200
+            - --enable-lb-svc-announce={{ .Values.bgpSpeaker.enableLbSvcAnnounce }}
           {{- with .Values.bgpSpeaker.args }}
           args:
             {{- toYaml . | trim | nindent 14 }}

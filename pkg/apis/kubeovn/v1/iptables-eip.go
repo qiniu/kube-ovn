@@ -28,11 +28,17 @@ type IptablesEIP struct {
 	Status IptablesEIPStatus `json:"status"`
 }
 type IptablesEIPSpec struct {
-	V4ip           string `json:"v4ip"`
-	V6ip           string `json:"v6ip"`
-	MacAddress     string `json:"macAddress"`
-	NatGwDp        string `json:"natGwDp"`
-	QoSPolicy      string `json:"qosPolicy"`
+	// IPv4 address for the EIP
+	V4ip string `json:"v4ip"`
+	// IPv6 address for the EIP
+	V6ip string `json:"v6ip"`
+	// MAC address for the EIP
+	MacAddress string `json:"macAddress"`
+	// NAT gateway datapath where the EIP is assigned.
+	NatGwDp string `json:"natGwDp"`
+	// QoS policy name to apply to the EIP
+	QoSPolicy string `json:"qosPolicy"`
+	// External subnet name. This field is immutable after creation.
 	ExternalSubnet string `json:"externalSubnet"`
 	// Namespace where the NAT gateway StatefulSet/Pod for this EIP resides.
 	// If empty, defaults to the kube-ovn controller's own namespace.
