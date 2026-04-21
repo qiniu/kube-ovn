@@ -600,10 +600,20 @@ func diffSvcPorts(oldPorts, newPorts []v1.ServicePort) (toDel []v1.ServicePort) 
 }
 
 func (c *Controller) checkServiceLBIPBelongToSubnet(svc *v1.Service) error {
+	if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
+		return nil
+	}
+	if len(svc.Status.LoadBalancer.Ingress) == 0 {
+		return nil
+	}
+
 	svc = svc.DeepCopy()
 	if svc.Annotations == nil {
 		svc.Annotations = map[string]string{}
 	}
+
+	origAnnotation := svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation]
+
 	subnets, err := c.subnetsLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list subnets: %v", err)
@@ -611,12 +621,13 @@ func (c *Controller) checkServiceLBIPBelongToSubnet(svc *v1.Service) error {
 	}
 
 	isServiceExternalIPFromSubnet := false
+outer:
 	for _, subnet := range subnets {
 		for _, ingress := range svc.Status.LoadBalancer.Ingress {
 			if util.CIDRContainIP(subnet.Spec.CIDRBlock, ingress.IP) {
 				svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] = subnet.Name
 				isServiceExternalIPFromSubnet = true
-				break
+				break outer
 			}
 		}
 	}
@@ -624,8 +635,14 @@ func (c *Controller) checkServiceLBIPBelongToSubnet(svc *v1.Service) error {
 	if !isServiceExternalIPFromSubnet {
 		delete(svc.Annotations, util.ServiceExternalIPFromSubnetAnnotation)
 	}
+
+	newAnnotation := svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation]
+	if newAnnotation == origAnnotation {
+		return nil
+	}
+
 	klog.Infof("Service %s/%s external IP belongs to subnet: %v", svc.Namespace, svc.Name, isServiceExternalIPFromSubnet)
-	if _, err = c.config.KubeClient.CoreV1().Services(svc.Namespace).Update(context.TODO(), svc, metav1.UpdateOptions{}); err != nil {
+	if _, err = c.config.KubeClient.CoreV1().Services(svc.Namespace).Update(context.Background(), svc, metav1.UpdateOptions{}); err != nil {
 		klog.Errorf("failed to update service %s/%s: %v", svc.Namespace, svc.Name, err)
 		return err
 	}
@@ -692,7 +709,10 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 		return fmt.Errorf("vip %s has type %q, expected %q", vipName, vip.Spec.Type, util.BgpLbVip)
 	}
 	if vip.Status.V4ip == "" {
-		return fmt.Errorf("vip %s has no IP allocated yet", vipName)
+		// IP not yet allocated. enqueueUpdateVirtualIP in vip.go will re-enqueue this
+		// Service once the VIP receives its IP, so return nil to avoid retry noise.
+		klog.Infof("bgp-lb-vip service %s: vip %s has no IP yet, skip", key, vipName)
+		return nil
 	}
 
 	vipIP := vip.Status.V4ip
@@ -705,6 +725,12 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 
 	// Set externalIPs so kube-proxy installs DNAT rules on every node.
 	// Use replace semantics: desired state is exactly [vipIP].
+	//
+	// NOTE: spec (externalIPs + bgp annotation) and status (loadBalancer.ingress) are written
+	// in two separate API calls because the Kubernetes API server treats them as independent
+	// sub-resources. This means a bootstrap reconcile where both are unset will produce two
+	// watch events and trigger one extra (idempotent) reconcile iteration. This is intentional:
+	// the second iteration hits the `!equality.Semantic.DeepEqual` guards and returns early.
 	desiredExternalIPs := []string{vipIP}
 	// Also ensure the BGP speaker annotation is present so collectSvcBgpPrefixes announces the IP.
 	changed := !equality.Semantic.DeepEqual(svc.Spec.ExternalIPs, desiredExternalIPs) ||
@@ -768,9 +794,16 @@ func (c *Controller) needReconcileBgpLbVipService(svc *v1.Service) (bool, error)
 		return false, err
 	}
 
-	if vip.Spec.Type != util.BgpLbVip || vip.Status.V4ip == "" {
-		klog.Infof("bgp-lb-vip service %s needs reconcile: vip %s type=%q v4ip=%q", key, vipName, vip.Spec.Type, vip.Status.V4ip)
+	if vip.Spec.Type != util.BgpLbVip {
+		klog.Infof("bgp-lb-vip service %s needs reconcile: vip %s has unexpected type=%q", key, vipName, vip.Spec.Type)
 		return true, nil
+	}
+	if vip.Status.V4ip == "" {
+		// IP not yet allocated; enqueueUpdateVirtualIP in vip.go will re-enqueue
+		// this Service once the VIP receives its IP, so skip here to avoid
+		// a reconcile that fails immediately and adds log noise.
+		klog.Infof("bgp-lb-vip service %s: vip %s has no IP yet, skip reconcile", key, vipName)
+		return false, nil
 	}
 
 	desiredExternalIPs := []string{vip.Status.V4ip}
@@ -807,14 +840,15 @@ func (c *Controller) needCleanupBgpLbVipServiceBinding(svc *v1.Service) bool {
 }
 
 func (c *Controller) cleanupBgpLbVipServiceBindingByVip(vipName string) error {
-	svcs, err := c.servicesLister.Services(v1.NamespaceAll).List(labels.Everything())
+	objs, err := c.svcByBgpVipIndexer.ByIndex(bgpVipIndexName, vipName)
 	if err != nil {
-		klog.Errorf("failed to list services for bgp-lb-vip %s cleanup: %v", vipName, err)
+		klog.Errorf("failed to index services for bgp-lb-vip %s cleanup: %v", vipName, err)
 		return err
 	}
 
-	for _, svc := range svcs {
-		if len(svc.Annotations) == 0 || svc.Annotations[util.BgpVipAnnotation] != vipName {
+	for _, obj := range objs {
+		svc, ok := obj.(*v1.Service)
+		if !ok {
 			continue
 		}
 		if err := c.cleanupBgpLbVipServiceBinding(svc); err != nil {

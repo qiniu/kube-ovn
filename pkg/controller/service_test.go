@@ -174,6 +174,22 @@ func newBgpLbVipController(t *testing.T, vip *kubeovnv1.Vip, svc *v1.Service) *C
 	ctrl.virtualIpsLister = vipInformer.Lister()
 	ctrl.svcKeyMutex = keymutex.NewHashed(0)
 
+	// Register bgpVip indexer so cleanupBgpLbVipServiceBindingByVip can do O(K) lookups.
+	err = fc.fakeInformers.serviceInformer.Informer().AddIndexers(cache.Indexers{
+		bgpVipIndexName: func(obj any) ([]string, error) {
+			s, ok := obj.(*v1.Service)
+			if !ok {
+				return nil, nil
+			}
+			if v := s.Annotations[util.BgpVipAnnotation]; v != "" {
+				return []string{v}, nil
+			}
+			return nil, nil
+		},
+	})
+	require.NoError(t, err)
+	ctrl.svcByBgpVipIndexer = fc.fakeInformers.serviceInformer.Informer().GetIndexer()
+
 	// Seed service into the services lister cache.
 	if svc != nil {
 		err = fc.fakeInformers.serviceInformer.Informer().GetIndexer().Add(svc)
@@ -266,13 +282,13 @@ func TestHandleAddBgpLbVipService(t *testing.T) {
 		require.Error(t, err)
 	})
 
-	t.Run("vip has no IP yet: error returned", func(t *testing.T) {
+	t.Run("vip has no IP yet: nil returned (will retry on VIP update)", func(t *testing.T) {
 		t.Parallel()
 		vip := readyVIP()
 		vip.Status.V4ip = ""
 		ctrl := newBgpLbVipController(t, vip, lbSvc(vipName))
 		err := ctrl.handleAddBgpLbVipService(key)
-		require.Error(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("happy path: externalIPs, ingress, and bgp annotation set", func(t *testing.T) {
@@ -521,6 +537,21 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 			},
 		},
 	}
+
+	err = fc.fakeInformers.serviceInformer.Informer().AddIndexers(cache.Indexers{
+		bgpVipIndexName: func(obj any) ([]string, error) {
+			s, ok := obj.(*v1.Service)
+			if !ok {
+				return nil, nil
+			}
+			if v := s.Annotations[util.BgpVipAnnotation]; v != "" {
+				return []string{v}, nil
+			}
+			return nil, nil
+		},
+	})
+	require.NoError(t, err)
+	ctrl.svcByBgpVipIndexer = fc.fakeInformers.serviceInformer.Informer().GetIndexer()
 
 	for _, svc := range []*v1.Service{bindingSvc, unrelatedSvc} {
 		err = fc.fakeInformers.serviceInformer.Informer().GetIndexer().Add(svc)

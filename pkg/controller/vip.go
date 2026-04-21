@@ -122,6 +122,12 @@ func (c *Controller) handleAddVirtualIP(key string) error {
 		klog.Errorf("failed to get subnet %s: %v", subnetName, err)
 		return err
 	}
+	// ipamKey is the key used for IPAM allocation and must be consistent with the
+	// corresponding ReleaseAddressByPod call in handleUpdateVirtualIP.
+	// - Non-BgpLbVip types: use the OVN port name (<name>.<ns>.<provider>) because
+	//   they have an associated LSP and the IPAM entry must match the port.
+	// - BgpLbVip: use the bare VIP name because there is no OVN LSP; the IP is
+	//   held in IPAM only and released with the same bare name on deletion.
 	ipamKey := vip.Name
 	if vip.Spec.Type != util.BgpLbVip {
 		ipamKey = ovs.PodNameToPortName(vip.Name, vip.Spec.Namespace, subnet.Spec.Provider)
@@ -152,6 +158,10 @@ func (c *Controller) handleAddVirtualIP(key string) error {
 	// bgp_lb_vip: IPAM-only VIP — no OVN LSP, no virtual parents.
 	// The IP is set in status.loadBalancer.ingress by the service controller,
 	// and announced by the BGP speaker via the ovn.kubernetes.io/bgp annotation.
+	// createOrUpdateVipCR already embeds the finalizer in the Create path, so no
+	// extra handleAddOrUpdateVipFinalizer call is needed here.  Any externally-
+	// created VIP that somehow lacks a finalizer will be patched by the subsequent
+	// handleUpdateVirtualIP invocation (triggered by the status write above).
 	if vip.Spec.Type == util.BgpLbVip {
 		if err = c.createOrUpdateVipCR(key, vip.Spec.Namespace, subnet.Name, v4ip, v6ip, mac); err != nil {
 			klog.Errorf("failed to create or update bgp-lb vip '%s': %v", vip.Name, err)
@@ -236,6 +246,12 @@ func (c *Controller) handleUpdateVirtualIP(key string) error {
 	if !vip.DeletionTimestamp.IsZero() {
 		klog.Infof("handle deleting vip %s", vip.Name)
 		if vip.Spec.Type == util.BgpLbVip {
+			// Clean up bound Services before releasing IPAM and removing the finalizer.
+			// Ordering guarantee: Service spec is written first, then status. If the
+			// status write fails, a retry re-enters with targetSvc = updatedSvc.DeepCopy()
+			// (which already carries the new resourceVersion), so the stale-object
+			// conflict is avoided. IPAM release happens after this block; if cleanup
+			// fails here, the finalizer is not removed and the VIP is retried safely.
 			if err := c.cleanupBgpLbVipServiceBindingByVip(vip.Name); err != nil {
 				klog.Errorf("failed to cleanup bound services for bgp-lb-vip %s: %v", vip.Name, err)
 				return err

@@ -27,6 +27,11 @@ const (
 	announcePolicyLocal = "local"
 )
 
+// ipAddrAnnotationSuffix is the suffix of pod annotation keys that carry IP addresses
+// (e.g. "ovn.kubernetes.io/ip_address"). Computed once at startup to avoid repeated
+// fmt.Sprintf calls on the hot syncSubnetRoutes path.
+var ipAddrAnnotationSuffix = fmt.Sprintf(util.IPAddressAnnotationTemplate, "")
+
 func (c *Controller) syncSubnetRoutes() {
 	bgpExpected := make(prefixMap)
 
@@ -112,7 +117,6 @@ func (c *Controller) syncSubnetRoutes() {
 // It reads IPs from pod annotations ({provider}.kubernetes.io/ip_address) instead of pod.Status.PodIPs,
 // so that attachment network IPs and non-primary CNI IPs are correctly announced.
 func collectPodExpectedPrefixes(pods []*corev1.Pod, subnetByName map[string]*kubeovnv1.Subnet, nodeName string, bgpExpected prefixMap) {
-	ipAddrSuffix := fmt.Sprintf(util.IPAddressAnnotationTemplate, "")
 	for _, pod := range pods {
 		if len(pod.Annotations) == 0 || !isPodAlive(pod) {
 			continue
@@ -121,10 +125,10 @@ func collectPodExpectedPrefixes(pods []*corev1.Pod, subnetByName map[string]*kub
 		podBgpPolicy := pod.Annotations[util.BgpAnnotation]
 
 		for key, ipStr := range pod.Annotations {
-			if ipStr == "" || !strings.HasSuffix(key, ipAddrSuffix) {
+			if ipStr == "" || !strings.HasSuffix(key, ipAddrAnnotationSuffix) {
 				continue
 			}
-			provider := strings.TrimSuffix(key, ipAddrSuffix)
+			provider := strings.TrimSuffix(key, ipAddrAnnotationSuffix)
 			if provider == "" {
 				continue
 			}
