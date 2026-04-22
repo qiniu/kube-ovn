@@ -86,6 +86,10 @@ type Configuration struct {
 	LsDnatModDlDst          bool
 	LsCtSkipDstLportIPs     bool
 
+	// TODO: rename EnableLb to EnableOvnLB (and --enable-lb flag to --enable-ovn-lb) to clarify
+	// that this flag specifically controls the classic OVN NB load-balancer object mode,
+	// distinct from EnableLbSvc and EnableBgpLbVip which are also LB-related but OVN-LB-free.
+	// Requires coordinated update of Helm charts, install.sh, and release notes.
 	EnableLb                    bool
 	EnableNP                    bool
 	EnableEipSnat               bool
@@ -192,15 +196,15 @@ func ParseFlags() (*Configuration, error) {
 		argLsDnatModDlDst              = pflag.Bool("ls-dnat-mod-dl-dst", true, "Set ethernet destination address for DNAT on logical switch")
 		argLsCtSkipDstLportIPs         = pflag.Bool("ls-ct-skip-dst-lport-ips", true, "Skip conntrack for direct traffic between lports")
 		argPodNicType                  = pflag.String("pod-nic-type", "veth-pair", "The default pod network nic implementation type")
-		argEnableLb                    = pflag.Bool("enable-lb", true, "Enable load balancer")
+		argEnableLb                    = pflag.Bool("enable-lb", true, "Enable OVN NB load-balancer object mode: ClusterIP/NodePort VIPs are programmed directly into OVN LB tables, replacing kube-proxy. Mutually usable with --enable-lb-svc and --enable-bgp-lb-vip for their respective LB Service flows, but those modes do not require this flag")
 		argEnableNP                    = pflag.Bool("enable-np", true, "Enable network policy support")
 		argNPEnforcement               = pflag.String("np-enforcement", "standard", "Network policy enforcement (standard, lax), default is standard")
 		argEnableEipSnat               = pflag.Bool("enable-eip-snat", true, "Enable EIP and SNAT")
 		argEnableExternalVpc           = pflag.Bool("enable-external-vpc", false, "Enable external vpc support")
 		argEnableEcmp                  = pflag.Bool("enable-ecmp", false, "Enable ecmp route for centralized subnet")
 		argKeepVMIP                    = pflag.Bool("keep-vm-ip", true, "Whether to keep ip for kubevirt pod when pod is rebuild")
-		argEnableLbSvc                 = pflag.Bool("enable-lb-svc", false, "Whether to support loadbalancer service")
-		argEnableBgpLbVip              = pflag.Bool("enable-bgp-lb-vip", false, "Whether to allocate a LoadBalancer external IP via a VIP (type=bgp_lb_vip) and announce it through BGP speaker")
+		argEnableLbSvc                 = pflag.Bool("enable-lb-svc", false, "Enable Pod-based LoadBalancer Service mode: the controller creates a dedicated Pod per LB Service to provide external IP connectivity via iptables NAT. Mutually exclusive with --enable-bgp-lb-vip")
+		argEnableBgpLbVip              = pflag.Bool("enable-bgp-lb-vip", false, "Enable BGP LB EIP mode: allocates a LoadBalancer external IP via a VIP CR (type=bgp_lb_vip) on a non-OVN subnet and announces it through the BGP speaker. No lb-svc Pod is created. Mutually exclusive with --enable-lb-svc")
 		argEnableOVNLBPreferLocal      = pflag.Bool("enable-ovn-lb-prefer-local", false, "Whether to support ovn loadbalancer prefer local")
 		argEnableMetrics               = pflag.Bool("enable-metrics", true, "Whether to support metrics query")
 		argEnableANP                   = pflag.Bool("enable-anp", false, "Enable support for admin network policy and baseline admin network policy")
