@@ -144,55 +144,60 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 	defer func() { _ = c.svcKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle delete service %s", key)
 
-	svcs, err := c.servicesLister.Services(v1.NamespaceAll).List(labels.Everything())
-	if err != nil {
-		klog.Errorf("failed to list svc, %v", err)
-		return err
-	}
-
-	var (
-		vpcLB             [2]string
-		vpcLbConfig       = c.GenVpcLoadBalancer(service.Vpc)
-		ignoreHealthCheck = true
-	)
-
-	switch service.Protocol {
-	case v1.ProtocolTCP:
-		vpcLB = [2]string{vpcLbConfig.TCPLoadBalancer, vpcLbConfig.TCPSessLoadBalancer}
-	case v1.ProtocolUDP:
-		vpcLB = [2]string{vpcLbConfig.UDPLoadBalancer, vpcLbConfig.UDPSessLoadBalancer}
-	case v1.ProtocolSCTP:
-		vpcLB = [2]string{vpcLbConfig.SctpLoadBalancer, vpcLbConfig.SctpSessLoadBalancer}
-	}
-
-	for _, vip := range service.Vips {
+	// OVN LB VIP cleanup is only relevant when the classic OVN LB mode is active.
+	// When EnableLb=false (e.g. EnableBgpLbVip-only mode), no OVN LB objects are
+	// created, so attempting to delete from them would always fail with "not found
+	// load balancer" and cause an infinite retry loop.
+	if c.config.EnableLb {
+		svcs, err := c.servicesLister.Services(v1.NamespaceAll).List(labels.Everything())
+		if err != nil {
+			klog.Errorf("failed to list svc, %v", err)
+			return err
+		}
 		var (
-			ip    string
-			found bool
+			vpcLB             [2]string
+			vpcLbConfig       = c.GenVpcLoadBalancer(service.Vpc)
+			ignoreHealthCheck = true
 		)
-		ip = parseVipAddr(vip)
 
-		for _, svc := range svcs {
-			if slices.Contains(util.ServiceClusterIPs(*svc), ip) {
-				found = true
-				break
-			}
-		}
-		if found {
-			continue
+		switch service.Protocol {
+		case v1.ProtocolTCP:
+			vpcLB = [2]string{vpcLbConfig.TCPLoadBalancer, vpcLbConfig.TCPSessLoadBalancer}
+		case v1.ProtocolUDP:
+			vpcLB = [2]string{vpcLbConfig.UDPLoadBalancer, vpcLbConfig.UDPSessLoadBalancer}
+		case v1.ProtocolSCTP:
+			vpcLB = [2]string{vpcLbConfig.SctpLoadBalancer, vpcLbConfig.SctpSessLoadBalancer}
 		}
 
-		for _, lb := range vpcLB {
-			if c.config.EnableOVNLBPreferLocal {
-				if err = c.OVNNbClient.LoadBalancerDeleteIPPortMapping(lb, vip); err != nil {
-					klog.Errorf("failed to delete ip port mapping for vip %s from LB %s: %v", vip, lb, err)
-					return err
+		for _, vip := range service.Vips {
+			var (
+				ip    string
+				found bool
+			)
+			ip = parseVipAddr(vip)
+
+			for _, svc := range svcs {
+				if slices.Contains(util.ServiceClusterIPs(*svc), ip) {
+					found = true
+					break
 				}
 			}
+			if found {
+				continue
+			}
 
-			if err = c.OVNNbClient.LoadBalancerDeleteVip(lb, vip, ignoreHealthCheck); err != nil {
-				klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
-				return err
+			for _, lb := range vpcLB {
+				if c.config.EnableOVNLBPreferLocal {
+					if err = c.OVNNbClient.LoadBalancerDeleteIPPortMapping(lb, vip); err != nil {
+						klog.Errorf("failed to delete ip port mapping for vip %s from LB %s: %v", vip, lb, err)
+						return err
+					}
+				}
+
+				if err = c.OVNNbClient.LoadBalancerDeleteVip(lb, vip, ignoreHealthCheck); err != nil {
+					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
+					return err
+				}
 			}
 		}
 	}
