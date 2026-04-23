@@ -282,7 +282,7 @@ func TestHandleAddBgpLbVipService(t *testing.T) {
 		require.Error(t, err)
 	})
 
-	t.Run("vip has no IP yet: nil returned (will retry on VIP update)", func(t *testing.T) {
+	t.Run("vip has no IP yet: skip silently", func(t *testing.T) {
 		t.Parallel()
 		vip := readyVIP()
 		vip.Status.V4ip = ""
@@ -403,7 +403,6 @@ func TestNeedReconcileBgpLbVipService(t *testing.T) {
 		t.Parallel()
 		svc := newSvc(true)
 		svc.Annotations[util.BgpAnnotation] = "true"
-		svc.Spec.ExternalIPs = []string{vipIP}
 		svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: vipIP}}
 		ctrl := newBgpLbVipController(t, newVIP(vipName), svc)
 		need, err := ctrl.needReconcileBgpLbVipService(svc)
@@ -411,12 +410,11 @@ func TestNeedReconcileBgpLbVipService(t *testing.T) {
 		require.False(t, need)
 	})
 
-	t.Run("drifted externalIPs requires reconcile", func(t *testing.T) {
+	t.Run("drifted ingress requires reconcile", func(t *testing.T) {
 		t.Parallel()
 		svc := newSvc(true)
 		svc.Annotations[util.BgpAnnotation] = "true"
-		svc.Spec.ExternalIPs = []string{"198.51.100.9"}
-		svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: vipIP}}
+		svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "198.51.100.9"}}
 		ctrl := newBgpLbVipController(t, newVIP(vipName), svc)
 		need, err := ctrl.needReconcileBgpLbVipService(svc)
 		require.NoError(t, err)
@@ -464,7 +462,6 @@ func TestNeedCleanupBgpLbVipServiceBinding(t *testing.T) {
 		t.Parallel()
 		svc := makeService()
 		svc.Annotations = map[string]string{util.BgpAnnotation: "true"}
-		svc.Spec.ExternalIPs = []string{"203.0.113.10"}
 		require.True(t, ctrl.needCleanupBgpLbVipServiceBinding(svc))
 	})
 
@@ -508,8 +505,7 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 			},
 		},
 		Spec: v1.ServiceSpec{
-			Type:        v1.ServiceTypeLoadBalancer,
-			ExternalIPs: []string{"203.0.113.10"},
+			Type: v1.ServiceTypeLoadBalancer,
 		},
 		Status: v1.ServiceStatus{
 			LoadBalancer: v1.LoadBalancerStatus{
@@ -527,8 +523,7 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 			},
 		},
 		Spec: v1.ServiceSpec{
-			Type:        v1.ServiceTypeLoadBalancer,
-			ExternalIPs: []string{"203.0.113.11"},
+			Type: v1.ServiceTypeLoadBalancer,
 		},
 		Status: v1.ServiceStatus{
 			LoadBalancer: v1.LoadBalancerStatus{
@@ -563,7 +558,6 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 
 	cleaned, err := ctrl.config.KubeClient.CoreV1().Services(ns).Get(context.Background(), bindingSvc.Name, metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Empty(t, cleaned.Spec.ExternalIPs)
 	require.Empty(t, cleaned.Status.LoadBalancer.Ingress)
 	require.Empty(t, cleaned.Annotations[util.BgpAnnotation])
 	// BgpVipAnnotation is a user-managed field; cleanupBgpLbVipServiceBinding must
@@ -572,7 +566,6 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 
 	stillBound, err := ctrl.config.KubeClient.CoreV1().Services(ns).Get(context.Background(), unrelatedSvc.Name, metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Equal(t, []string{"203.0.113.11"}, stillBound.Spec.ExternalIPs)
 	require.Equal(t, []v1.LoadBalancerIngress{{IP: "203.0.113.11"}}, stillBound.Status.LoadBalancer.Ingress)
 	require.Equal(t, "vip-b", stillBound.Annotations[util.BgpVipAnnotation])
 }
