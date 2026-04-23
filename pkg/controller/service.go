@@ -137,6 +137,12 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 	c.updateServiceQueue.Add(updateSvc)
 }
 
+// handleDeleteService cleans up resources associated with a deleted Service.
+//
+// When EnableBgpLbVip=true and EnableLb=false, this function has no interaction
+// with OVN whatsoever. The only cleanup that runs is cleanBgpLbVipService, which
+// is a pure IPAM-level operation (BGP withdrawal happens automatically when the
+// speaker no longer sees the externalIPs on the Service object).
 func (c *Controller) handleDeleteService(service *vpcService) error {
 	key := cache.MetaObjectToName(service.Svc).String()
 
@@ -219,6 +225,12 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 	return nil
 }
 
+// handleUpdateService reconciles a Service update.
+//
+// When EnableBgpLbVip=true and EnableLb=false, this function has no interaction
+// with OVN whatsoever: the OVN LB block (VPC lookup, updateVip, endpoint sync)
+// is skipped entirely. Only the BGP-LB-VIP reconcile path at the end runs,
+// which is purely IPAM-level (VIP CR binding → externalIPs → BGP announcement).
 func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 	key := svcObject.key
 	keys := strings.Split(key, "#")
@@ -451,11 +463,21 @@ func parseVipAddr(vip string) string {
 	return host
 }
 
+// handleAddService is the entry point for LoadBalancer Service creation.
+//
+// Mode matrix:
+//   - EnableBgpLbVip=true : pure IPAM path — binds a VIP CR to the Service's
+//     externalIPs and lets the BGP speaker announce it. No OVN LB objects are
+//     created or modified; OVN is not involved at all.
+//   - EnableLbSvc=true    : Pod-based path — creates a dedicated lb-svc Pod that
+//     provides external connectivity via iptables NAT inside OVN.
+//   - EnableLb=true       : classic OVN LB path — handled via the update/delete
+//     workers (add just enqueues endpoint sync).
 func (c *Controller) handleAddService(key string) error {
 	if c.config.EnableBgpLbVip {
-		// enable-bgp-lb-vip and enable-lb-svc are mutually exclusive modes.
-		// When bgp-lb-vip is on, we handle the EIP binding and return; the LB-SVC
-		// pod-based flow is intentionally skipped.
+		// BGP LB EIP mode: only IPAM and BGP announcement are involved.
+		// enable-bgp-lb-vip and enable-lb-svc are mutually exclusive; the
+		// lb-svc Pod-based flow is intentionally skipped.
 		klog.Infof("dispatch add service %s to bgp-lb-vip handler", key)
 		return c.handleAddBgpLbVipService(key)
 	}
