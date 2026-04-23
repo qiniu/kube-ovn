@@ -142,7 +142,7 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 // When EnableBgpLbVip=true and EnableLb=false, this function has no interaction
 // with OVN whatsoever. The only cleanup that runs is cleanBgpLbVipService, which
 // is a pure IPAM-level operation (BGP withdrawal happens automatically when the
-// speaker no longer sees the externalIPs on the Service object).
+// speaker no longer sees the bgp annotation on the Service object).
 func (c *Controller) handleDeleteService(service *vpcService) error {
 	key := cache.MetaObjectToName(service.Svc).String()
 
@@ -239,7 +239,7 @@ func (c *Controller) deleteServiceOvnLBVips(service *vpcService) error {
 // When EnableBgpLbVip=true and EnableLb=false, this function has no interaction
 // with OVN whatsoever: the OVN LB block (VPC lookup, updateVip, endpoint sync)
 // is skipped entirely. Only the BGP-LB-VIP reconcile path at the end runs,
-// which is purely IPAM-level (VIP CR binding → externalIPs → BGP announcement).
+// which is purely IPAM-level (VIP CR binding → status.loadBalancer.ingress → BGP announcement).
 func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 	key := svcObject.key
 	keys := strings.Split(key, "#")
@@ -454,7 +454,7 @@ func (c *Controller) syncServiceOvnLBVips(key string, svc *v1.Service, ips, ipsT
 }
 
 // reconcileUpdateBgpLbVipService handles the BGP LB EIP path on Service update:
-// cleans up stale bindings or reconciles the VIP→externalIPs binding.
+// cleans up stale bindings or reconciles the VIP→status.loadBalancer.ingress binding.
 func (c *Controller) reconcileUpdateBgpLbVipService(key string, svc *v1.Service) error {
 	if c.needCleanupBgpLbVipServiceBinding(svc) {
 		if err := c.cleanupBgpLbVipServiceBinding(svc); err != nil {
@@ -710,8 +710,9 @@ outer:
 // handleAddBgpLbVipService binds a pre-allocated VIP (type=bgp_lb_vip) to a
 // LoadBalancer Service. The VIP is identified by the ovn.kubernetes.io/bgp-vip annotation.
 // Once bound:
-//   - svc.spec.externalIPs is set so kube-proxy installs DNAT rules on every node.
-//   - svc.status.loadBalancer.ingress is set so the BGP speaker announces the IP.
+//   - svc.status.loadBalancer.ingress is set so the BGP speaker announces the IP and
+//     kube-proxy installs DNAT rules (for type=LoadBalancer, kube-proxy processes ingress
+//     IPs automatically — spec.externalIPs is NOT set to avoid duplicate kubectl output).
 //   - svc.annotations[ovn.kubernetes.io/bgp] is set to "true" so the speaker picks it up.
 func (c *Controller) handleAddBgpLbVipService(key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -753,7 +754,7 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 	namespace, name := svc.Namespace, svc.Name
 
 	klog.Infof("handle add bgp-lb-vip service %s, vip %s", key, vipName)
-	klog.Infof("bgp-lb-vip service %s current state: externalIPs=%v ingress=%v bgp=%q", key, svc.Spec.ExternalIPs, svc.Status.LoadBalancer.Ingress, svc.Annotations[util.BgpAnnotation])
+	klog.Infof("bgp-lb-vip service %s current state: ingress=%v bgp=%q", key, svc.Status.LoadBalancer.Ingress, svc.Annotations[util.BgpAnnotation])
 
 	vip, err := c.virtualIpsLister.Get(vipName)
 	if err != nil {
@@ -761,7 +762,7 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 		return err
 	}
 	// Only bgp_lb_vip is supported here because this path expects an IPAM-only VIP
-	// that is written into Service externalIPs/ingress for speaker announcement.
+	// that is written into Service ingress for speaker announcement.
 	if vip.Spec.Type != util.BgpLbVip {
 		return fmt.Errorf("vip %s has type %q, expected %q", vipName, vip.Spec.Type, util.BgpLbVip)
 	}
@@ -780,23 +781,15 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 		targetSvc.Annotations = make(map[string]string)
 	}
 
-	// Set externalIPs so kube-proxy installs DNAT rules on every node.
-	// Use replace semantics: desired state is exactly [vipIP].
+	// Ensure the BGP speaker annotation is present so collectSvcBgpPrefixes announces the IP.
 	//
-	// NOTE: spec (externalIPs + bgp annotation) and status (loadBalancer.ingress) are written
-	// in two separate API calls because the Kubernetes API server treats them as independent
-	// sub-resources. This means a bootstrap reconcile where both are unset will produce two
-	// watch events and trigger one extra (idempotent) reconcile iteration. This is intentional:
-	// the second iteration hits the `!equality.Semantic.DeepEqual` guards and returns early.
-	desiredExternalIPs := []string{vipIP}
-	// Also ensure the BGP speaker annotation is present so collectSvcBgpPrefixes announces the IP.
-	changed := !equality.Semantic.DeepEqual(svc.Spec.ExternalIPs, desiredExternalIPs) ||
-		svc.Annotations[util.BgpAnnotation] != "true"
-	baseSvc := svc
-	if changed {
-		klog.Infof("bgp-lb-vip service %s updating spec: externalIPs %v -> %v, bgp %q -> %q", key, svc.Spec.ExternalIPs, desiredExternalIPs, svc.Annotations[util.BgpAnnotation], "true")
+	// NOTE: spec (annotation) and status (loadBalancer.ingress) are written in two separate
+	// API calls because the Kubernetes API server treats them as independent sub-resources.
+	// A bootstrap reconcile will produce two watch events and one extra (idempotent) reconcile
+	// iteration — this is intentional.
+	if svc.Annotations[util.BgpAnnotation] != "true" {
+		klog.Infof("bgp-lb-vip service %s setting bgp annotation", key)
 		targetSvc.Annotations[util.BgpAnnotation] = "true"
-		targetSvc.Spec.ExternalIPs = desiredExternalIPs
 		updatedSvc, updateErr := c.config.KubeClient.CoreV1().Services(namespace).Update(
 			context.Background(), targetSvc, metav1.UpdateOptions{},
 		)
@@ -805,14 +798,15 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 			return updateErr
 		}
 		klog.Infof("bgp-lb-vip service %s spec updated successfully", key)
-		baseSvc = updatedSvc
 		targetSvc = updatedSvc.DeepCopy()
 	}
 
 	// Set status.loadBalancer.ingress so the BGP speaker discovers the IP.
+	// kube-proxy also uses ingress IPs for DNAT rules on type=LoadBalancer services.
+	// We only set Ingress here (not spec.externalIPs) — consistent with MetalLB.
 	ingress := []v1.LoadBalancerIngress{{IP: vipIP}}
-	if !equality.Semantic.DeepEqual(baseSvc.Status.LoadBalancer.Ingress, ingress) {
-		klog.Infof("bgp-lb-vip service %s updating status ingress: %v -> %v", key, baseSvc.Status.LoadBalancer.Ingress, ingress)
+	if !equality.Semantic.DeepEqual(targetSvc.Status.LoadBalancer.Ingress, ingress) {
+		klog.Infof("bgp-lb-vip service %s updating status ingress: %v -> %v", key, targetSvc.Status.LoadBalancer.Ingress, ingress)
 		targetSvc.Status.LoadBalancer.Ingress = ingress
 		if _, err = c.config.KubeClient.CoreV1().Services(namespace).UpdateStatus(
 			context.Background(), targetSvc, metav1.UpdateOptions{},
@@ -863,13 +857,8 @@ func (c *Controller) needReconcileBgpLbVipService(svc *v1.Service) (bool, error)
 		return false, nil
 	}
 
-	desiredExternalIPs := []string{vip.Status.V4ip}
 	desiredIngress := []v1.LoadBalancerIngress{{IP: vip.Status.V4ip}}
 
-	if !equality.Semantic.DeepEqual(svc.Spec.ExternalIPs, desiredExternalIPs) {
-		klog.Infof("bgp-lb-vip service %s needs reconcile: externalIPs=%v desired=%v", key, svc.Spec.ExternalIPs, desiredExternalIPs)
-		return true, nil
-	}
 	if svc.Annotations[util.BgpAnnotation] != "true" {
 		klog.Infof("bgp-lb-vip service %s needs reconcile: bgp annotation=%q desired=%q", key, svc.Annotations[util.BgpAnnotation], "true")
 		return true, nil
@@ -893,6 +882,9 @@ func (c *Controller) needCleanupBgpLbVipServiceBinding(svc *v1.Service) bool {
 	if svc.Annotations[util.BgpAnnotation] == "true" {
 		return true
 	}
+	// Check the entire LoadBalancerStatus (mirrors MetalLB's clearServiceState pattern).
+	// LoadBalancerStatus contains a slice so direct struct comparison is not allowed;
+	// check the only field (Ingress) explicitly.
 	return len(svc.Status.LoadBalancer.Ingress) != 0
 }
 
@@ -922,15 +914,11 @@ func (c *Controller) cleanupBgpLbVipServiceBinding(svc *v1.Service) error {
 		targetSvc.Annotations = make(map[string]string)
 	}
 
-	// Only clear fields owned by the controller: spec.externalIPs and the BGP
-	// speaker annotation. Do NOT remove BgpVipAnnotation — that is a user-managed
-	// field. If the VIP is re-created with the same name the Service must be able
-	// to auto-rebind via the still-present annotation.
-	specChanged := len(svc.Spec.ExternalIPs) != 0 ||
-		svc.Annotations[util.BgpAnnotation] != ""
-
-	if specChanged {
-		targetSvc.Spec.ExternalIPs = nil
+	// Clear fields owned by the controller:
+	//   - ovn.kubernetes.io/bgp annotation — cleared so the BGP speaker stops advertising.
+	// Do NOT remove BgpVipAnnotation (ovn.kubernetes.io/bgp-vip) — that is a user-managed
+	// field; if the VIP CR is re-created the Service must be able to auto-rebind.
+	if svc.Annotations[util.BgpAnnotation] != "" {
 		delete(targetSvc.Annotations, util.BgpAnnotation)
 
 		updatedSvc, err := c.config.KubeClient.CoreV1().Services(targetSvc.Namespace).Update(
@@ -943,8 +931,14 @@ func (c *Controller) cleanupBgpLbVipServiceBinding(svc *v1.Service) error {
 		targetSvc = updatedSvc.DeepCopy()
 	}
 
+	// Clear the entire LoadBalancerStatus (mirrors MetalLB's clearServiceState which does
+	// svc.Status.LoadBalancer = v1.LoadBalancerStatus{}). This is more defensive than
+	// only zeroing the Ingress slice: if LoadBalancerStatus gains new fields in future
+	// Kubernetes versions they will also be cleared.
+	// Note: direct struct comparison is not possible (LoadBalancerStatus contains a slice),
+	// so we check the only current field explicitly.
 	if len(svc.Status.LoadBalancer.Ingress) != 0 {
-		targetSvc.Status.LoadBalancer.Ingress = nil
+		targetSvc.Status.LoadBalancer = v1.LoadBalancerStatus{}
 		if _, err := c.config.KubeClient.CoreV1().Services(targetSvc.Namespace).UpdateStatus(
 			context.Background(), targetSvc, metav1.UpdateOptions{},
 		); err != nil {
@@ -958,8 +952,10 @@ func (c *Controller) cleanupBgpLbVipServiceBinding(svc *v1.Service) error {
 
 // cleanBgpLbVipService is called on Service deletion.
 // The VIP CR lifecycle is managed independently by the user; no action needed here.
+// (The Service object is being deleted so kube-proxy will remove its forwarding rules
+// automatically. The VIP CR remains reusable by another Service.)
 func (c *Controller) cleanBgpLbVipService(svc *v1.Service) error {
-	if len(svc.Spec.ExternalIPs) == 0 && len(svc.Status.LoadBalancer.Ingress) == 0 {
+	if len(svc.Status.LoadBalancer.Ingress) == 0 {
 		return nil
 	}
 	klog.Infof("clean bgp-lb-vip for deleted service %s/%s", svc.Namespace, svc.Name)
