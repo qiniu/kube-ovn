@@ -150,61 +150,11 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 	defer func() { _ = c.svcKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle delete service %s", key)
 
-	// OVN LB VIP cleanup is only relevant when the classic OVN LB mode is active.
-	// When EnableLb=false (e.g. EnableBgpLbVip-only mode), no OVN LB objects are
-	// created, so attempting to delete from them would always fail with "not found
-	// load balancer" and cause an infinite retry loop.
+	// OVN LB VIP cleanup is only relevant when the classic OVN LB mode is active;
+	// see deleteServiceOvnLBVips for details.
 	if c.config.EnableLb {
-		svcs, err := c.servicesLister.Services(v1.NamespaceAll).List(labels.Everything())
-		if err != nil {
-			klog.Errorf("failed to list svc, %v", err)
+		if err := c.deleteServiceOvnLBVips(service); err != nil {
 			return err
-		}
-		var (
-			vpcLB             [2]string
-			vpcLbConfig       = c.GenVpcLoadBalancer(service.Vpc)
-			ignoreHealthCheck = true
-		)
-
-		switch service.Protocol {
-		case v1.ProtocolTCP:
-			vpcLB = [2]string{vpcLbConfig.TCPLoadBalancer, vpcLbConfig.TCPSessLoadBalancer}
-		case v1.ProtocolUDP:
-			vpcLB = [2]string{vpcLbConfig.UDPLoadBalancer, vpcLbConfig.UDPSessLoadBalancer}
-		case v1.ProtocolSCTP:
-			vpcLB = [2]string{vpcLbConfig.SctpLoadBalancer, vpcLbConfig.SctpSessLoadBalancer}
-		}
-
-		for _, vip := range service.Vips {
-			var (
-				ip    string
-				found bool
-			)
-			ip = parseVipAddr(vip)
-
-			for _, svc := range svcs {
-				if slices.Contains(util.ServiceClusterIPs(*svc), ip) {
-					found = true
-					break
-				}
-			}
-			if found {
-				continue
-			}
-
-			for _, lb := range vpcLB {
-				if c.config.EnableOVNLBPreferLocal {
-					if err = c.OVNNbClient.LoadBalancerDeleteIPPortMapping(lb, vip); err != nil {
-						klog.Errorf("failed to delete ip port mapping for vip %s from LB %s: %v", vip, lb, err)
-						return err
-					}
-				}
-
-				if err = c.OVNNbClient.LoadBalancerDeleteVip(lb, vip, ignoreHealthCheck); err != nil {
-					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
-					return err
-				}
-			}
 		}
 	}
 
@@ -219,6 +169,65 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 		if err := c.cleanBgpLbVipService(service.Svc); err != nil {
 			klog.Errorf("failed to clean bgp-lb-vip for service %s: %v", service.Svc.Name, err)
 			return err
+		}
+	}
+
+	return nil
+}
+
+// deleteServiceOvnLBVips removes ClusterIP VIPs from OVN load balancer tables for a
+// deleted Service. Only called when EnableLb=true (classic OVN LB mode).
+func (c *Controller) deleteServiceOvnLBVips(service *vpcService) error {
+	svcs, err := c.servicesLister.Services(v1.NamespaceAll).List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list svc, %v", err)
+		return err
+	}
+
+	var (
+		vpcLB             [2]string
+		vpcLbConfig       = c.GenVpcLoadBalancer(service.Vpc)
+		ignoreHealthCheck = true
+	)
+
+	switch service.Protocol {
+	case v1.ProtocolTCP:
+		vpcLB = [2]string{vpcLbConfig.TCPLoadBalancer, vpcLbConfig.TCPSessLoadBalancer}
+	case v1.ProtocolUDP:
+		vpcLB = [2]string{vpcLbConfig.UDPLoadBalancer, vpcLbConfig.UDPSessLoadBalancer}
+	case v1.ProtocolSCTP:
+		vpcLB = [2]string{vpcLbConfig.SctpLoadBalancer, vpcLbConfig.SctpSessLoadBalancer}
+	}
+
+	for _, vip := range service.Vips {
+		var (
+			ip    string
+			found bool
+		)
+		ip = parseVipAddr(vip)
+
+		for _, svc := range svcs {
+			if slices.Contains(util.ServiceClusterIPs(*svc), ip) {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
+		for _, lb := range vpcLB {
+			if c.config.EnableOVNLBPreferLocal {
+				if err = c.OVNNbClient.LoadBalancerDeleteIPPortMapping(lb, vip); err != nil {
+					klog.Errorf("failed to delete ip port mapping for vip %s from LB %s: %v", vip, lb, err)
+					return err
+				}
+			}
+
+			if err = c.OVNNbClient.LoadBalancerDeleteVip(lb, vip, ignoreHealthCheck); err != nil {
+				klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
+				return err
+			}
 		}
 	}
 
@@ -263,137 +272,11 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 
 	ips := getVipIps(svc)
 
-	// OVN LB VIP management (VPC LB lookup + updateVip) is only relevant in classic
-	// OVN LB mode. Skip the entire block when EnableLb=false to avoid unnecessary
-	// VPC lister calls and to make the no-op behaviour explicit for bgp-lb-vip mode.
+	// OVN ClusterIP VIP management is only relevant in classic OVN LB mode;
+	// see syncServiceOvnLBVips for details.
 	if c.config.EnableLb {
-		vpcName := svc.Annotations[util.VpcAnnotation]
-		if vpcName == "" {
-			vpcName = c.config.ClusterRouter
-		}
-		vpc, err := c.vpcsLister.Get(vpcName)
-		if err != nil {
-			klog.Errorf("failed to get vpc %s of lb, %v", vpcName, err)
+		if err := c.syncServiceOvnLBVips(key, svc, ips, ipsToDel); err != nil {
 			return err
-		}
-
-		tcpLb, udpLb, sctpLb := vpc.Status.TCPLoadBalancer, vpc.Status.UDPLoadBalancer, vpc.Status.SctpLoadBalancer
-		oTCPLb, oUDPLb, oSctpLb := vpc.Status.TCPSessionLoadBalancer, vpc.Status.UDPSessionLoadBalancer, vpc.Status.SctpSessionLoadBalancer
-		if svc.Spec.SessionAffinity == v1.ServiceAffinityClientIP {
-			tcpLb, udpLb, sctpLb, oTCPLb, oUDPLb, oSctpLb = oTCPLb, oUDPLb, oSctpLb, tcpLb, udpLb, sctpLb
-		}
-
-		var tcpVips, udpVips, sctpVips []string
-		for _, port := range svc.Spec.Ports {
-			for _, ip := range ips {
-				switch port.Protocol {
-				case v1.ProtocolTCP:
-					tcpVips = append(tcpVips, util.JoinHostPort(ip, port.Port))
-				case v1.ProtocolUDP:
-					udpVips = append(udpVips, util.JoinHostPort(ip, port.Port))
-				case v1.ProtocolSCTP:
-					sctpVips = append(sctpVips, util.JoinHostPort(ip, port.Port))
-				}
-			}
-		}
-
-		var (
-			needUpdateEndpointQueue = false
-			ignoreHealthCheck       = true
-		)
-
-		// for service update
-		updateVip := func(lbName, oLbName string, svcVips []string) error {
-			if len(lbName) == 0 {
-				return nil
-			}
-
-			lb, err := c.OVNNbClient.GetLoadBalancer(lbName, false)
-			if err != nil {
-				klog.Errorf("failed to get LB %s: %v", lbName, err)
-				return err
-			}
-			lbVIPs := maps.Clone(lb.Vips)
-			klog.V(3).Infof("existing vips of LB %s: %v", lbName, lbVIPs)
-			for _, vip := range svcVips {
-				if err := c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
-					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
-					return err
-				}
-
-				if _, ok := lbVIPs[vip]; !ok {
-					klog.Infof("add vip %s to LB %s", vip, lbName)
-					needUpdateEndpointQueue = true
-				}
-			}
-			for vip := range lbVIPs {
-				if ip := parseVipAddr(vip); (slices.Contains(ips, ip) && !slices.Contains(svcVips, vip)) || slices.Contains(ipsToDel, ip) {
-					klog.Infof("remove stale vip %s from LB %s", vip, lbName)
-					if err := c.OVNNbClient.LoadBalancerDeleteVip(lbName, vip, ignoreHealthCheck); err != nil {
-						klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lbName, err)
-						return err
-					}
-				}
-			}
-
-			if len(oLbName) == 0 {
-				return nil
-			}
-
-			oLb, err := c.OVNNbClient.GetLoadBalancer(oLbName, false)
-			if err != nil {
-				klog.Errorf("failed to get LB %s: %v", oLbName, err)
-				return err
-			}
-			oLbVIPs := maps.Clone(oLb.Vips)
-			klog.V(3).Infof("existing vips of LB %s: %v", oLbName, oLbVIPs)
-			for vip := range oLbVIPs {
-				if ip := parseVipAddr(vip); slices.Contains(ips, ip) || slices.Contains(ipsToDel, ip) {
-					klog.Infof("remove stale vip %s from LB %s", vip, oLbName)
-					if err = c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
-						klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
-						return err
-					}
-				}
-			}
-			return nil
-		}
-
-		if err = updateVip(tcpLb, oTCPLb, tcpVips); err != nil {
-			klog.Error(err)
-			return err
-		}
-		if err = updateVip(udpLb, oUDPLb, udpVips); err != nil {
-			klog.Error(err)
-			return err
-		}
-		if err = updateVip(sctpLb, oSctpLb, sctpVips); err != nil {
-			klog.Error(err)
-			return err
-		}
-
-		if err := c.checkServiceLBIPBelongToSubnet(svc); err != nil {
-			klog.Error(err)
-			return err
-		}
-
-		if needUpdateEndpointQueue {
-			c.addOrUpdateEndpointSliceQueue.Add(key)
-		}
-		// add the svc key which has the same vip
-		vip, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]
-		if ok && vip != "" {
-			allSlrs, err := c.switchLBRuleLister.List(labels.Everything())
-			if err != nil {
-				klog.Error(err)
-				return err
-			}
-			for _, slr := range allSlrs {
-				if slr.Spec.Vip == vip {
-					slrKey := fmt.Sprintf("%s/slr-%s", slr.Spec.Namespace, slr.Name)
-					c.addOrUpdateEndpointSliceQueue.Add(slrKey)
-				}
-			}
 		}
 	}
 
@@ -429,27 +312,169 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 	}
 
 	if c.config.EnableBgpLbVip && svc.Spec.Type == v1.ServiceTypeLoadBalancer {
-		if c.needCleanupBgpLbVipServiceBinding(svc) {
-			if err = c.cleanupBgpLbVipServiceBinding(svc); err != nil {
-				klog.Errorf("failed to cleanup bgp-lb-vip binding for service %s: %v", key, err)
-				return err
-			}
-			return nil
-		}
+		return c.reconcileUpdateBgpLbVipService(key, svc)
+	}
 
-		needReconcile, err := c.needReconcileBgpLbVipService(svc)
-		if err != nil {
-			klog.Errorf("failed to check bgp-lb-vip reconcile precondition for service %s: %v", key, err)
-			return err
-		}
-		if needReconcile {
-			if err = c.reconcileBgpLbVipServiceLocked(key, svc); err != nil {
-				klog.Errorf("failed to reconcile bgp-lb-vip for service %s: %v", key, err)
-				return err
+	return nil
+}
+
+// syncServiceOvnLBVips reconciles ClusterIP VIPs in OVN load balancer tables on Service
+// update: adds missing VIPs, removes stale VIPs, and enqueues endpoint/SLR re-syncs as
+// needed. Only called when EnableLb=true (classic OVN LB mode).
+func (c *Controller) syncServiceOvnLBVips(key string, svc *v1.Service, ips, ipsToDel []string) error {
+	vpcName := svc.Annotations[util.VpcAnnotation]
+	if vpcName == "" {
+		vpcName = c.config.ClusterRouter
+	}
+	vpc, err := c.vpcsLister.Get(vpcName)
+	if err != nil {
+		klog.Errorf("failed to get vpc %s of lb, %v", vpcName, err)
+		return err
+	}
+
+	tcpLb, udpLb, sctpLb := vpc.Status.TCPLoadBalancer, vpc.Status.UDPLoadBalancer, vpc.Status.SctpLoadBalancer
+	oTCPLb, oUDPLb, oSctpLb := vpc.Status.TCPSessionLoadBalancer, vpc.Status.UDPSessionLoadBalancer, vpc.Status.SctpSessionLoadBalancer
+	if svc.Spec.SessionAffinity == v1.ServiceAffinityClientIP {
+		tcpLb, udpLb, sctpLb, oTCPLb, oUDPLb, oSctpLb = oTCPLb, oUDPLb, oSctpLb, tcpLb, udpLb, sctpLb
+	}
+
+	var tcpVips, udpVips, sctpVips []string
+	for _, port := range svc.Spec.Ports {
+		for _, ip := range ips {
+			switch port.Protocol {
+			case v1.ProtocolTCP:
+				tcpVips = append(tcpVips, util.JoinHostPort(ip, port.Port))
+			case v1.ProtocolUDP:
+				udpVips = append(udpVips, util.JoinHostPort(ip, port.Port))
+			case v1.ProtocolSCTP:
+				sctpVips = append(sctpVips, util.JoinHostPort(ip, port.Port))
 			}
 		}
 	}
 
+	var (
+		needUpdateEndpointQueue = false
+		ignoreHealthCheck       = true
+	)
+
+	// for service update
+	updateVip := func(lbName, oLbName string, svcVips []string) error {
+		if len(lbName) == 0 {
+			return nil
+		}
+
+		lb, err := c.OVNNbClient.GetLoadBalancer(lbName, false)
+		if err != nil {
+			klog.Errorf("failed to get LB %s: %v", lbName, err)
+			return err
+		}
+		lbVIPs := maps.Clone(lb.Vips)
+		klog.V(3).Infof("existing vips of LB %s: %v", lbName, lbVIPs)
+		for _, vip := range svcVips {
+			if err := c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
+				klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
+				return err
+			}
+
+			if _, ok := lbVIPs[vip]; !ok {
+				klog.Infof("add vip %s to LB %s", vip, lbName)
+				needUpdateEndpointQueue = true
+			}
+		}
+		for vip := range lbVIPs {
+			if ip := parseVipAddr(vip); (slices.Contains(ips, ip) && !slices.Contains(svcVips, vip)) || slices.Contains(ipsToDel, ip) {
+				klog.Infof("remove stale vip %s from LB %s", vip, lbName)
+				if err := c.OVNNbClient.LoadBalancerDeleteVip(lbName, vip, ignoreHealthCheck); err != nil {
+					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lbName, err)
+					return err
+				}
+			}
+		}
+
+		if len(oLbName) == 0 {
+			return nil
+		}
+
+		oLb, err := c.OVNNbClient.GetLoadBalancer(oLbName, false)
+		if err != nil {
+			klog.Errorf("failed to get LB %s: %v", oLbName, err)
+			return err
+		}
+		oLbVIPs := maps.Clone(oLb.Vips)
+		klog.V(3).Infof("existing vips of LB %s: %v", oLbName, oLbVIPs)
+		for vip := range oLbVIPs {
+			if ip := parseVipAddr(vip); slices.Contains(ips, ip) || slices.Contains(ipsToDel, ip) {
+				klog.Infof("remove stale vip %s from LB %s", vip, oLbName)
+				if err = c.OVNNbClient.LoadBalancerDeleteVip(oLbName, vip, ignoreHealthCheck); err != nil {
+					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	if err = updateVip(tcpLb, oTCPLb, tcpVips); err != nil {
+		klog.Error(err)
+		return err
+	}
+	if err = updateVip(udpLb, oUDPLb, udpVips); err != nil {
+		klog.Error(err)
+		return err
+	}
+	if err = updateVip(sctpLb, oSctpLb, sctpVips); err != nil {
+		klog.Error(err)
+		return err
+	}
+
+	if err := c.checkServiceLBIPBelongToSubnet(svc); err != nil {
+		klog.Error(err)
+		return err
+	}
+
+	if needUpdateEndpointQueue {
+		c.addOrUpdateEndpointSliceQueue.Add(key)
+	}
+	// add the svc key which has the same vip
+	vip, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]
+	if ok && vip != "" {
+		allSlrs, err := c.switchLBRuleLister.List(labels.Everything())
+		if err != nil {
+			klog.Error(err)
+			return err
+		}
+		for _, slr := range allSlrs {
+			if slr.Spec.Vip == vip {
+				slrKey := fmt.Sprintf("%s/slr-%s", slr.Spec.Namespace, slr.Name)
+				c.addOrUpdateEndpointSliceQueue.Add(slrKey)
+			}
+		}
+	}
+	return nil
+}
+
+// reconcileUpdateBgpLbVipService handles the BGP LB EIP path on Service update:
+// cleans up stale bindings or reconciles the VIP→externalIPs binding.
+func (c *Controller) reconcileUpdateBgpLbVipService(key string, svc *v1.Service) error {
+	if c.needCleanupBgpLbVipServiceBinding(svc) {
+		if err := c.cleanupBgpLbVipServiceBinding(svc); err != nil {
+			klog.Errorf("failed to cleanup bgp-lb-vip binding for service %s: %v", key, err)
+			return err
+		}
+		return nil
+	}
+
+	needReconcile, err := c.needReconcileBgpLbVipService(svc)
+	if err != nil {
+		klog.Errorf("failed to check bgp-lb-vip reconcile precondition for service %s: %v", key, err)
+		return err
+	}
+	if needReconcile {
+		if err = c.reconcileBgpLbVipServiceLocked(key, svc); err != nil {
+			klog.Errorf("failed to reconcile bgp-lb-vip for service %s: %v", key, err)
+			return err
+		}
+	}
 	return nil
 }
 
