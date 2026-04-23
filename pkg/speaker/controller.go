@@ -170,16 +170,43 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	klog.Info("Shutting down workers")
 }
 
+// Reconcile is the periodic reconciliation entry point.
+//
+// EIP announcement mode (mutually exclusive — pick exactly one):
+//
+//	--nat-gw-mode:          Speaker runs INSIDE the NAT gateway pod (overlay network).
+//	                        Announces IptablesEIP addresses via syncEIPRoutes().
+//	--node-route-eip-mode:  Speaker runs on the HOST network of the node where the
+//	                        vpc-nat-gw pod resides. Announces IptablesEIP addresses
+//	                        for local nat-gw pods via syncNodeRouteEIPs().
+//
+// The two modes above are mutually exclusive because they both claim ownership of IptablesEIP
+// BGP routes and would conflict if run together.
+//
+// Service VIP announcement (independent — composable with either EIP mode):
+//
+//	--enable-lb-svc-announce:
+//	    Announces LoadBalancer Service ingress IPs (VIPs live on kube-ipvs0 on
+//	    every node, managed by kube-proxy/iptables). This plane is orthogonal to
+//	    IptablesEIP — different resources, different network plane, no conflict.
+//	    When node-route-eip-mode is active, syncNodeRouteEIPs() merges Service VIP
+//	    prefixes (expectedBgpLbServiceEip) into the expected set before reconciling.
 func (c *Controller) Reconcile() {
 	switch {
 	case c.config.NatGwMode:
+		// EIP plane (nat-gw-mode): speaker runs inside the NAT gateway pod and
+		// announces IptablesEIP addresses from within the overlay network.
 		if err := c.syncEIPRoutes(); err != nil {
 			klog.Errorf("failed to reconcile EIPs: %s", err.Error())
 		}
 	case c.config.NodeRouteEIPMode:
-		// Node route EIP mode: use the periodic reconcile for consistency check
+		// EIP plane (node-route-eip-mode): speaker runs on the host network and
+		// announces IptablesEIP addresses for local vpc-nat-gw pods.
+		// Service VIP plane (enable-lb-svc-announce) is merged inside
+		// ReconcileNodeRouteEIPs() when the corresponding flag is set.
 		c.ReconcileNodeRouteEIPs()
 	default:
+		// Default: Pod/Subnet/Service VIP announcements without EIP mode.
 		c.syncSubnetRoutes()
 	}
 }

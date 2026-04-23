@@ -2,10 +2,24 @@ package speaker
 
 // This file implements EIP BGP announcement via node route mode.
 //
-// Mode: eip-bgp-via-node-route
-// This mode runs kube-ovn-speaker in host network mode (like Pod/Service IP announcement)
-// instead of running inside the NAT gateway pod. It monitors IptablesEIP resources and
-// announces EIP addresses for local node's vpc-nat-gw pods.
+// Network plane: IptablesEIP (EIP plane)
+//   EIPs are floating IPs assigned to vpc-nat-gw pods via iptables DNAT/SNAT rules.
+//   They live in the NAT gateway pod's network namespace, NOT on a node interface.
+//   In node-route-eip-mode the speaker runs on the HOST network of the node where the
+//   vpc-nat-gw pod is scheduled, then announces the EIP prefix so upstream routers can
+//   reach the NAT gateway pod via the node's underlay IP.
+//
+// Orthogonal plane: Service VIP (kube-proxy / kube-ipvs0)
+//   When --enable-lb-svc-announce is also set, the speaker
+//   additionally announces LoadBalancer ingress IPs from Service.status.loadBalancer.ingress.
+//   These VIPs are programmed on the kube-ipvs0 virtual interface on every node by
+//   kube-proxy/IPVS — a completely separate network plane from IptablesEIP.
+//   The two planes do NOT conflict and CAN be enabled simultaneously.
+//
+// Mode: --node-route-eip-mode (mutually exclusive with --nat-gw-mode)
+//   --nat-gw-mode:         speaker runs INSIDE the NAT gateway pod (overlay).
+//   --node-route-eip-mode: speaker runs on the NODE host network (underlay).
+//   Both announce IptablesEIP resources; running both would create conflicting routes.
 //
 // Control flow:
 //  1. Speaker starts in NodeRouteEIPMode with host network enabled
@@ -13,6 +27,8 @@ package speaker
 //  3. On EIP add/update event: check if the associated vpc-nat-gw pod runs on this node
 //  4. If yes and EIP is ready: announce the EIP via BGP
 //  5. On EIP delete: withdraw the EIP from BGP announcement
+//  6. Periodic reconcile (syncNodeRouteEIPs) also merges Service VIP prefixes
+//     (expectedBgpLbServiceEip) if --enable-lb-svc-announce is enabled.
 //
 // Prerequisites:
 //   - Speaker must run in host network mode with NodeRouteEIPMode enabled
@@ -264,10 +280,14 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 // syncNodeRouteEIPs performs a full reconciliation of all EIPs in node route mode.
 // This method finds all EIPs associated with local NAT gateway pods and announces them.
 // It also withdraws any EIPs that should no longer be announced.
+//
+// When EnableLbSvcAnnounce is also enabled, Service VIP prefixes are
+// merged into the expected set so that node-route-eip mode and Service VIP announcements
+// can operate concurrently on the same speaker instance.
 func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
 
-	// List all EIPs
+	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
 	eips, err := c.eipLister.List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list EIPs: %w", err)
@@ -289,6 +309,22 @@ func (c *Controller) syncNodeRouteEIPs() error {
 				addExpectedPrefix(ip, expectedPrefixes)
 			}
 		}
+	}
+
+	// Service VIP plane: merge LoadBalancer ingress IPs when Service VIP announcement is
+	// enabled alongside node-route-eip mode. The two planes are orthogonal:
+	//   - EIP plane  → IptablesEIP resources, NAT gateway traffic path.
+	//   - Service VIP plane → Service.status.loadBalancer.ingress on kube-ipvs0.
+	// Merging both into expectedPrefixes ensures reconcileRoutes does not withdraw
+	// Service VIP routes that are legitimately announced.
+	if c.config.EnableLbSvcAnnounce {
+		services, err := c.servicesLister.List(labels.Everything())
+		if err != nil {
+			return fmt.Errorf("failed to list services for bgp-lb-vip: %w", err)
+		}
+		expectedBgpLbServiceEip := make(prefixMap)
+		collectSvcBgpPrefixes(services, c.config.NodeName, expectedBgpLbServiceEip)
+		mergePrefixMap(expectedBgpLbServiceEip, expectedPrefixes)
 	}
 
 	return c.reconcileRoutes(expectedPrefixes)

@@ -99,17 +99,39 @@ func (c *Controller) syncSubnetRoutes() {
 	collectPodExpectedPrefixes(pods, subnetByName, c.config.NodeName, bgpExpected)
 
 	if c.config.EnableLbSvcAnnounce {
-		// Announce LoadBalancer Service external IPs only for Services bound to bgp-vip.
+		// Service VIP plane: announce LoadBalancer ingress IPs for Services bound by
+		// ovn.kubernetes.io/bgp-vip. This is independent from EIP resources:
+		// - Service VIP plane (this block): Service.status.loadBalancer.ingress on nodes.
+		// - EIP plane (nat-gw / node-route): IptablesEIP resources for NAT gateway traffic.
+		//
+		// Keep a dedicated set for Service VIP prefixes, then merge into the final expected
+		// prefixes to preserve composability with other announcement sources.
+		expectedBgpLbServiceEip := make(prefixMap)
 		services, err := c.servicesLister.List(labels.Everything())
 		if err != nil {
 			klog.Errorf("failed to list services for bgp-lb-eip, %v", err)
 			return
 		}
-		collectSvcBgpPrefixes(services, c.config.NodeName, bgpExpected)
+		collectSvcBgpPrefixes(services, c.config.NodeName, expectedBgpLbServiceEip)
+		mergePrefixMap(expectedBgpLbServiceEip, bgpExpected)
 	}
 
 	if err := c.reconcileRoutes(bgpExpected); err != nil {
 		klog.Errorf("failed to reconcile routes: %s", err.Error())
+	}
+}
+
+func mergePrefixMap(src, dst prefixMap) {
+	for afi, prefixes := range src {
+		if len(prefixes) == 0 {
+			continue
+		}
+		if dst[afi] == nil {
+			dst[afi] = set.New[string]()
+		}
+		for prefix := range prefixes {
+			dst[afi].Insert(prefix)
+		}
 	}
 }
 
@@ -166,8 +188,17 @@ func collectPodExpectedPrefixes(pods []*corev1.Pod, subnetByName map[string]*kub
 
 // collectSvcBgpPrefixes announces external IPs of LoadBalancer Services that carry
 // the ovn.kubernetes.io/bgp annotation and have a non-empty status.loadBalancer.ingress.
-// This is the speaker-side of the enable-bgp-lb-vip feature: speaker consumes the
-// final Service state written by the controller, not the Vip CR directly.
+//
+// Producer/consumer relationship with the controller:
+//   - Controller side (--enable-bgp-lb-vip): binds a bgp_lb_vip VIP to the Service and
+//     writes the VIP address into Service.status.loadBalancer.ingress.
+//   - Speaker side (--enable-lb-svc-announce, this function): reads that ingress status
+//     and announces the VIP prefix via BGP. The speaker never reads the Vip CR directly;
+//     it only acts on the final Service state produced by the controller.
+//
+// Both flags must be enabled end-to-end for BGP LB VIP announcement to work:
+//
+//	controller --enable-bgp-lb-vip=true  →  Service.status.loadBalancer.ingress  →  speaker --enable-lb-svc-announce=true
 //
 // Policy semantics:
 //   - "true" / "cluster": all speaker nodes announce the IP.
