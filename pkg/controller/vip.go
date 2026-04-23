@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -16,8 +17,6 @@ import (
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-
-	v1 "k8s.io/api/core/v1"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovs"
@@ -156,12 +155,10 @@ func (c *Controller) handleAddVirtualIP(key string) error {
 		return err
 	}
 	// bgp_lb_vip: IPAM-only VIP — no OVN LSP, no virtual parents.
-	// The IP is set in status.loadBalancer.ingress by the service controller,
-	// and announced by the BGP speaker via the ovn.kubernetes.io/bgp annotation.
-	// createOrUpdateVipCR already embeds the finalizer in the Create path, so no
-	// extra handleAddOrUpdateVipFinalizer call is needed here.  Any externally-
-	// created VIP that somehow lacks a finalizer will be patched by the subsequent
-	// handleUpdateVirtualIP invocation (triggered by the status write above).
+	// This CRD is only the IP resource source for the BGP LB VIP flow:
+	// Vip(spec/status) -> service controller -> Service annotation/status -> speaker -> BGP announce.
+	// The service controller writes the allocated IP into Service.status.loadBalancer.ingress
+	// and marks ovn.kubernetes.io/bgp so the speaker can publish it.
 	if vip.Spec.Type == util.BgpLbVip {
 		if err = c.createOrUpdateVipCR(key, vip.Spec.Namespace, subnet.Name, v4ip, v6ip, mac); err != nil {
 			klog.Errorf("failed to create or update bgp-lb vip '%s': %v", vip.Name, err)
