@@ -242,6 +242,7 @@ func TestCollectPodExpectedPrefixes(t *testing.T) {
 func makeService(name, ns, bgpPolicy string, ingressIPs ...string) *corev1.Service {
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
 	}
 	if bgpPolicy != "" {
 		svc.Annotations = map[string]string{
@@ -310,6 +311,7 @@ func TestCollectSvcBgpPrefixes(t *testing.T) {
 						util.BgpSpeakerNodeAnnotation: "node1",
 					},
 				},
+				Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
 				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "5.5.5.5"}}}},
 			}},
 			wantIPs: []string{"5.5.5.5/32"},
@@ -345,6 +347,7 @@ func TestCollectSvcBgpPrefixes(t *testing.T) {
 						util.MetalLBAllowSharedIPAnnotation: "111.62.241.102",
 					},
 				},
+				Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
 				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
 			}},
 			wantIPs: []string{"111.62.241.102/32"},
@@ -360,6 +363,7 @@ func TestCollectSvcBgpPrefixes(t *testing.T) {
 						// ovn.kubernetes.io/bgp-vip intentionally absent
 					},
 				},
+				Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
 				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
 			}},
 			wantIPs: []string{"111.62.241.102/32"},
@@ -375,6 +379,7 @@ func TestCollectSvcBgpPrefixes(t *testing.T) {
 						util.BgpVipAnnotation:               "some-other-vip",
 					},
 				},
+				Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
 				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
 			}},
 			wantIPs: []string{"111.62.241.102/32"},
@@ -390,6 +395,7 @@ func TestCollectSvcBgpPrefixes(t *testing.T) {
 						util.BgpSpeakerNodeAnnotation:       "node1",
 					},
 				},
+				Spec:   corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer},
 				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
 			}},
 			wantIPs: []string{"111.62.241.102/32"},
