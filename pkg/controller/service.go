@@ -236,10 +236,11 @@ func (c *Controller) deleteServiceOvnLBVips(service *vpcService) error {
 
 // handleUpdateService reconciles a Service update.
 //
-// When EnableBgpLbVip=true and EnableLb=false, this function has no interaction
-// with OVN whatsoever: the OVN LB block (VPC lookup, updateVip, endpoint sync)
-// is skipped entirely. Only the BGP-LB-VIP reconcile path at the end runs,
-// which is purely IPAM-level (VIP CR binding → status.loadBalancer.ingress → BGP announcement).
+// When EnableBgpLbVip=true: Service updates are intentionally a no-op for the BGP LB VIP path.
+// VIP binding is established at create time (handleAddBgpLbVipService) and torn down on
+// Service deletion (handleDeleteService) or VIP CR deletion (cleanupBgpLbVipServiceBindingByVip).
+// Skipping update reconciliation avoids incorrectly touching ingress status that is owned
+// by the creation path and prevents false-positive cleanup of third-party LB controllers.
 func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 	key := svcObject.key
 	keys := strings.Split(key, "#")
@@ -311,8 +312,10 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 		}
 	}
 
-	if c.config.EnableBgpLbVip && svc.Spec.Type == v1.ServiceTypeLoadBalancer {
-		return c.reconcileUpdateBgpLbVipService(key, svc)
+	if c.config.EnableBgpLbVip {
+		// BGP LB VIP binding is established at Service creation and torn down at
+		// Service or VIP CR deletion. Updates are intentionally a no-op.
+		return nil
 	}
 
 	return nil
@@ -448,31 +451,6 @@ func (c *Controller) syncServiceOvnLBVips(key string, svc *v1.Service, ips, ipsT
 				slrKey := fmt.Sprintf("%s/slr-%s", slr.Spec.Namespace, slr.Name)
 				c.addOrUpdateEndpointSliceQueue.Add(slrKey)
 			}
-		}
-	}
-	return nil
-}
-
-// reconcileUpdateBgpLbVipService handles the BGP LB EIP path on Service update:
-// cleans up stale bindings or reconciles the VIP→status.loadBalancer.ingress binding.
-func (c *Controller) reconcileUpdateBgpLbVipService(key string, svc *v1.Service) error {
-	if c.needCleanupBgpLbVipServiceBinding(svc) {
-		if err := c.cleanupBgpLbVipServiceBinding(svc); err != nil {
-			klog.Errorf("failed to cleanup bgp-lb-vip binding for service %s: %v", key, err)
-			return err
-		}
-		return nil
-	}
-
-	needReconcile, err := c.needReconcileBgpLbVipService(svc)
-	if err != nil {
-		klog.Errorf("failed to check bgp-lb-vip reconcile precondition for service %s: %v", key, err)
-		return err
-	}
-	if needReconcile {
-		if err = c.reconcileBgpLbVipServiceLocked(key, svc); err != nil {
-			klog.Errorf("failed to reconcile bgp-lb-vip for service %s: %v", key, err)
-			return err
 		}
 	}
 	return nil
@@ -808,83 +786,6 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 
 	klog.Infof("bgp-lb-vip service %s bound to vip %s (%s)", key, vipName, vipIP)
 	return nil
-}
-
-func (c *Controller) needReconcileBgpLbVipService(svc *v1.Service) (bool, error) {
-	if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
-		return false, nil
-	}
-	// Resolve VIP CR name: MetalLB compat annotation takes priority over bgp-vip.
-	vipName := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]
-	if vipName == "" {
-		vipName = svc.Annotations[util.BgpVipAnnotation]
-	}
-	if vipName == "" {
-		return false, nil
-	}
-	key := cache.MetaObjectToName(svc).String()
-
-	vip, err := c.virtualIpsLister.Get(vipName)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			// VIP does not exist yet (or has already been deleted). There is nothing to
-			// reconcile now. When the VIP is eventually created and receives its IP, the
-			// VIP update event will re-enqueue this Service via enqueueUpdateVirtualIP's
-			// indexer logic (Issue 1 fix). Returning (true, nil) here would only trigger
-			// a pointless reconcile that fails with NotFound and causes retry log noise.
-			klog.Infof("bgp-lb-vip service %s: vip %s not found, skip reconcile", key, vipName)
-			return false, nil
-		}
-		return false, err
-	}
-
-	if vip.Spec.Type != util.BgpLbVip {
-		klog.Infof("bgp-lb-vip service %s needs reconcile: vip %s has unexpected type=%q", key, vipName, vip.Spec.Type)
-		return true, nil
-	}
-	if vip.Status.V4ip == "" {
-		// IP not yet allocated; enqueueUpdateVirtualIP in vip.go will re-enqueue
-		// this Service once the VIP receives its IP, so skip here to avoid
-		// a reconcile that fails immediately and adds log noise.
-		klog.Infof("bgp-lb-vip service %s: vip %s has no IP yet, skip reconcile", key, vipName)
-		return false, nil
-	}
-
-	desiredIngress := []v1.LoadBalancerIngress{{IP: vip.Status.V4ip}}
-
-	if !equality.Semantic.DeepEqual(svc.Status.LoadBalancer.Ingress, desiredIngress) {
-		klog.Infof("bgp-lb-vip service %s needs reconcile: ingress=%v desired=%v", key, svc.Status.LoadBalancer.Ingress, desiredIngress)
-		return true, nil
-	}
-
-	klog.Infof("bgp-lb-vip service %s does not need reconcile", key)
-	return false, nil
-}
-
-func (c *Controller) needCleanupBgpLbVipServiceBinding(svc *v1.Service) bool {
-	if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
-		return false
-	}
-	// Either annotation means this service still owns a VIP binding — do not clean up.
-	if svc.Annotations[util.BgpVipAnnotation] != "" || svc.Annotations[util.MetalLBAllowSharedIPAnnotation] != "" {
-		return false
-	}
-	// Neither VIP annotation is present but ingress exists: the user removed the bgp-vip
-	// (or allow-shared-ip) annotation after kube-ovn had already written the ingress.
-	// Clean up the stale ingress so kube-proxy stops NATing and the speaker withdraws the route.
-	//
-	// This is safe because:
-	//   - ovn.kubernetes.io/bgp-vip is a kube-ovn-specific annotation; cloud providers
-	//     and other LB controllers do not set it.
-	//   - metallb.universe.tf/allow-shared-ip is a MetalLB annotation that kube-ovn
-	//     recognises for zero-annotation-change migration; a cluster running kube-ovn
-	//     BGP LB is expected to have already replaced MetalLB, so this annotation is
-	//     only present on Services explicitly migrated to kube-ovn.
-	//   - EnableBgpLbVip=true implies a kube-ovn-managed cluster: cloud-provider LB Services
-	//     coexisting in the same cluster are not expected.
-	//   - Therefore any LoadBalancer Service without these annotations is either unrelated
-	//     (no ingress) or a previously-bound bgp-lb-vip whose annotation was removed.
-	return len(svc.Status.LoadBalancer.Ingress) != 0
 }
 
 func (c *Controller) cleanupBgpLbVipServiceBindingByVip(vipName string) error {
