@@ -195,6 +195,14 @@ func (v *ValidatingHook) iptablesEIPDeleteHook(ctx context.Context, req admissio
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
+	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp and are managed
+	// without a VPC NAT gateway. Skip gateway-config validation so these EIPs
+	// remain deletable even when --enable-vpc-nat-gw is off or the NAT configmap
+	// is absent — exactly the deployments this PR adds support for.
+	if eip.Spec.NatGwDp == "" {
+		return ctrlwebhook.Allowed("IPAM-only EIP, no NAT gateway config required")
+	}
+
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
