@@ -68,18 +68,6 @@ func (c *Controller) enqueueDeleteService(obj any) {
 
 	vip, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]
 	if ok || (svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "") || svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] != "" {
-		if c.config.EnableNP {
-			netpols, err := c.svcMatchNetworkPolicies(svc)
-			if err != nil {
-				utilruntime.HandleError(err)
-				return
-			}
-
-			for _, np := range netpols {
-				c.updateNpQueue.Add(np)
-			}
-		}
-
 		ips := util.ServiceClusterIPs(*svc)
 		if ok {
 			ips = strings.Split(vip, ",")

@@ -17,7 +17,6 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/set"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovs"
@@ -540,13 +539,6 @@ func (c *Controller) handleDeleteNp(key string) error {
 	}
 
 	if err := c.OVNNbClient.DeleteAddressSets(map[string]string{
-		networkPolicyKey: fmt.Sprintf("%s/%s/%s", namespace, npName, "service"),
-	}); err != nil {
-		klog.Errorf("delete np %s service address set: %v", key, err)
-		return err
-	}
-
-	if err := c.OVNNbClient.DeleteAddressSets(map[string]string{
 		networkPolicyKey: fmt.Sprintf("%s/%s/%s", namespace, npName, "ingress"),
 	}); err != nil {
 		klog.Errorf("delete np %s ingress address set: %v", key, err)
@@ -663,12 +655,6 @@ func (c *Controller) fetchPolicySelectedAddresses(namespace, protocol string, np
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to list pod, %w", err)
 		}
-		svcs, err := c.servicesLister.Services(ns).List(labels.Everything())
-		if err != nil {
-			klog.Errorf("failed to list svc, %v", err)
-			return nil, nil, fmt.Errorf("failed to list svc, %w", err)
-		}
-
 		for _, pod := range pods {
 			podNets, err := c.getPodKubeovnNets(pod)
 			if err != nil {
@@ -683,48 +669,10 @@ func (c *Controller) fetchPolicySelectedAddresses(namespace, protocol string, np
 						selectedAddresses = append(selectedAddresses, podIP)
 					}
 				}
-				if len(svcs) == 0 {
-					continue
-				}
-
-				svcIPs, err := svcMatchPods(svcs, pod, protocol)
-				if err != nil {
-					return nil, nil, err
-				}
-				selectedAddresses = append(selectedAddresses, svcIPs...)
 			}
 		}
 	}
 	return selectedAddresses, exceptAddresses, nil
-}
-
-func svcMatchPods(svcs []*corev1.Service, pod *corev1.Pod, protocol string) ([]string, error) {
-	matchSvcs := []string{}
-	// find svc ip by pod's info
-	for _, svc := range svcs {
-		if isSvcMatchPod(svc, pod) {
-			clusterIPs := util.ServiceClusterIPs(*svc)
-			protocolClusterIPs := getProtocolSvcIP(clusterIPs, protocol)
-			if len(protocolClusterIPs) != 0 {
-				matchSvcs = append(matchSvcs, protocolClusterIPs...)
-			}
-		}
-	}
-	return matchSvcs, nil
-}
-
-func getProtocolSvcIP(clusterIPs []string, protocol string) []string {
-	protocolClusterIPs := []string{}
-	for _, clusterIP := range clusterIPs {
-		if clusterIP != "" && clusterIP != corev1.ClusterIPNone && util.CheckProtocol(clusterIP) == protocol {
-			protocolClusterIPs = append(protocolClusterIPs, clusterIP)
-		}
-	}
-	return protocolClusterIPs
-}
-
-func isSvcMatchPod(svc *corev1.Service, pod *corev1.Pod) bool {
-	return labels.Set(svc.Spec.Selector).AsSelector().Matches(labels.Set(pod.Labels))
 }
 
 func (c *Controller) podMatchNetworkPolicies(pod *corev1.Pod) []string {
@@ -749,36 +697,6 @@ func (c *Controller) podMatchNetworkPolicies(pod *corev1.Pod) []string {
 		}
 	}
 	return match
-}
-
-func (c *Controller) svcMatchNetworkPolicies(svc *corev1.Service) ([]string, error) {
-	// find all match pod
-	sel := labels.Set(svc.Spec.Selector).AsSelector()
-	pods, err := c.podsLister.Pods(svc.Namespace).List(sel)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list pods, %w", err)
-	}
-
-	// find all match netpol
-	nps, err := c.npsLister.NetworkPolicies(corev1.NamespaceAll).List(labels.Everything())
-	if err != nil {
-		return nil, fmt.Errorf("failed to list netpols, %w", err)
-	}
-	match := set.New[string]()
-	ns, _ := c.namespacesLister.Get(svc.Namespace)
-	for _, pod := range pods {
-		for _, np := range nps {
-			key := cache.MetaObjectToName(np).String()
-			if match.Has(key) {
-				continue
-			}
-			if isPodMatchNetworkPolicy(pod, ns, np, np.Namespace) {
-				match.Insert(key)
-				klog.V(3).Infof("svc %s/%s match np %s", svc.Namespace, svc.Name, key)
-			}
-		}
-	}
-	return match.UnsortedList(), nil
 }
 
 func isPodMatchNetworkPolicy(pod *corev1.Pod, podNs *corev1.Namespace, policy *netv1.NetworkPolicy, policyNs string) bool {
