@@ -894,13 +894,11 @@ func (c *Controller) needCleanupBgpLbVipServiceBinding(svc *v1.Service) bool {
 	if svc.Annotations[util.BgpVipAnnotation] != "" || svc.Annotations[util.MetalLBAllowSharedIPAnnotation] != "" {
 		return false
 	}
-	if svc.Annotations[util.BgpAnnotation] == "true" {
-		return true
-	}
-	// Check the entire LoadBalancerStatus (mirrors MetalLB's clearServiceState pattern).
-	// LoadBalancerStatus contains a slice so direct struct comparison is not allowed;
-	// check the only field (Ingress) explicitly.
-	return len(svc.Status.LoadBalancer.Ingress) != 0
+	// Only clean up if kube-ovn set bgp=true on this Service, proving ownership.
+	// A bare len(ingress) != 0 check has no ownership guarantee and would clear
+	// LoadBalancerStatus from unrelated LB Services managed by cloud providers or
+	// other controllers that happen to have no bgp-vip annotation.
+	return svc.Annotations[util.BgpAnnotation] == "true"
 }
 
 func (c *Controller) cleanupBgpLbVipServiceBindingByVip(vipName string) error {
