@@ -41,6 +41,17 @@ func (c *Controller) enqueueAddService(obj any) {
 	klog.V(3).Infof("enqueue add endpoint %s", key)
 	c.addOrUpdateEndpointSliceQueue.Add(key)
 
+	if c.config.EnableNP {
+		netpols, err := c.svcMatchNetworkPolicies(svc)
+		if err != nil {
+			utilruntime.HandleError(err)
+			return
+		}
+		for _, np := range netpols {
+			c.updateNpQueue.Add(np)
+		}
+	}
+
 	if c.config.EnableLbSvc || c.config.EnableBgpLbVip {
 		klog.V(3).Infof("enqueue add service %s for lb processing", key)
 		c.addServiceQueue.Add(key)
@@ -68,6 +79,17 @@ func (c *Controller) enqueueDeleteService(obj any) {
 
 	vip, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]
 	if ok || (svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "") || svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] != "" {
+		if c.config.EnableNP {
+			netpols, err := c.svcMatchNetworkPolicies(svc)
+			if err != nil {
+				utilruntime.HandleError(err)
+				return
+			}
+			for _, np := range netpols {
+				c.updateNpQueue.Add(np)
+			}
+		}
+
 		ips := util.ServiceClusterIPs(*svc)
 		if ok {
 			ips = strings.Split(vip, ",")
@@ -742,24 +764,30 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 	if vip.Spec.Type != util.BgpLbVip {
 		return fmt.Errorf("vip %s has type %q, expected %q", vipName, vip.Spec.Type, util.BgpLbVip)
 	}
-	if vip.Status.V4ip == "" {
+	if vip.Status.V4ip == "" && vip.Status.V6ip == "" {
 		// IP not yet allocated. enqueueUpdateVirtualIP in vip.go will re-enqueue this
 		// Service once the VIP receives its IP, so return nil to avoid retry noise.
 		klog.Infof("bgp-lb-vip service %s: vip %s has no IP yet, skip", key, vipName)
 		return nil
 	}
 
-	vipIP := vip.Status.V4ip
-	klog.Infof("bgp-lb-vip service %s resolved vip %s to ip %s", key, vipName, vipIP)
+	// Build ingress list from all allocated IPs (dual-stack and IPv6-only supported).
+	var ingress []v1.LoadBalancerIngress
+	if vip.Status.V4ip != "" {
+		ingress = append(ingress, v1.LoadBalancerIngress{IP: vip.Status.V4ip})
+	}
+	if vip.Status.V6ip != "" {
+		ingress = append(ingress, v1.LoadBalancerIngress{IP: vip.Status.V6ip})
+	}
+	klog.Infof("bgp-lb-vip service %s resolved vip %s to ips %v", key, vipName, ingress)
 
 	targetSvc := svc.DeepCopy()
 
-	// Set status.loadBalancer.ingress so the BGP speaker discovers the IP.
+	// Set status.loadBalancer.ingress so the BGP speaker discovers the IP(s).
 	// The speaker uses ovn.kubernetes.io/bgp-vip or metallb.universe.tf/allow-shared-ip
 	// as the announcement gate — no extra controller-written annotation is needed.
 	// kube-proxy also uses ingress IPs for DNAT rules on type=LoadBalancer services.
 	// We only set Ingress here (not spec.externalIPs) — consistent with MetalLB.
-	ingress := []v1.LoadBalancerIngress{{IP: vipIP}}
 	if !equality.Semantic.DeepEqual(targetSvc.Status.LoadBalancer.Ingress, ingress) {
 		klog.Infof("bgp-lb-vip service %s updating status ingress: %v -> %v", key, targetSvc.Status.LoadBalancer.Ingress, ingress)
 		targetSvc.Status.LoadBalancer.Ingress = ingress
@@ -772,7 +800,7 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 		klog.Infof("bgp-lb-vip service %s status updated successfully", key)
 	}
 
-	klog.Infof("bgp-lb-vip service %s bound to vip %s (%s)", key, vipName, vipIP)
+	klog.Infof("bgp-lb-vip service %s bound to vip %s ingress=%v", key, vipName, ingress)
 	return nil
 }
 

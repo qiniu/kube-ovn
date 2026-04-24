@@ -44,17 +44,15 @@ func (c *Controller) enqueueUpdateVirtualIP(oldObj, newObj any) {
 		klog.Infof("enqueue update virtual parents for %s", key)
 		c.updateVirtualParentsQueue.Add(key)
 	}
-	// When a bgp_lb_vip gets its IP for the first time (status.V4ip: "" → non-empty),
+	// When a bgp_lb_vip gets its first IP allocation (V4ip or V6ip: "" → non-empty),
 	// actively re-enqueue any Services that reference this VIP so they bind immediately
 	// instead of waiting for the next retry backoff interval.
-	// The informer calls UpdateFunc for all updates including status-only ones, so this
-	// handler fires whenever the VIP object is modified. The spec-change block above only
-	// enqueues to updateVirtualIPQueue on Spec field changes; this block is independent
-	// and fires on any update where oldVip.Status.V4ip was empty and newVip.Status.V4ip
-	// is now set (the first IP allocation event).
+	// Covers IPv4-only, IPv6-only, and dual-stack allocation events.
+	v4FirstAlloc := oldVip.Status.V4ip == "" && newVip.Status.V4ip != ""
+	v6FirstAlloc := oldVip.Status.V6ip == "" && newVip.Status.V6ip != ""
 	if c.config.EnableBgpLbVip &&
 		newVip.Spec.Type == util.BgpLbVip &&
-		oldVip.Status.V4ip == "" && newVip.Status.V4ip != "" {
+		(v4FirstAlloc || v6FirstAlloc) {
 		// Use the bgpVipIndexName indexer for O(k) lookup instead of a full Service list scan.
 		objs, err := c.svcByBgpVipIndexer.ByIndex(bgpVipIndexName, newVip.Name)
 		if err != nil {
@@ -67,7 +65,7 @@ func (c *Controller) enqueueUpdateVirtualIP(oldObj, newObj any) {
 				continue
 			}
 			svcKey := cache.MetaObjectToName(svc).String()
-			klog.Infof("re-enqueue service %s: vip %s got IP %s", svcKey, newVip.Name, newVip.Status.V4ip)
+			klog.Infof("re-enqueue service %s: vip %s got IPs v4=%s v6=%s", svcKey, newVip.Name, newVip.Status.V4ip, newVip.Status.V6ip)
 			c.addServiceQueue.Add(svcKey)
 		}
 	}

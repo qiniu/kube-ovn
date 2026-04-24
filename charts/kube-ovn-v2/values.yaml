@@ -198,6 +198,9 @@ features:
   # -- Enable Kube-OVN loadbalancer services
   # @section -- Opt-in/out Features
   enableLoadbalancerService: false
+  # -- Enable BGP LB VIP: use a bgp_lb_vip CRD as the IP source for LoadBalancer Services
+  # instead of a NAT-gateway EIP. Mutually exclusive with enableLoadbalancerService.
+  # @section -- Opt-in/out Features
   enableBgpLbVip: false
   # -- Enable persistent VM IPs
   # @section -- Opt-in/out Features

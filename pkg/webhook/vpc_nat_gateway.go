@@ -84,7 +84,12 @@ func (v *ValidatingHook) iptablesEIPCreateHook(ctx context.Context, req admissio
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
-	// lbSvc EIPs are IPAM-only and have no NatGwDp; skip NAT-gateway config checks.
+	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp; they only need an IP
+	// allocation — skip all NAT-gateway config and gateway-specific validation.
+	if eip.Spec.NatGwDp == "" {
+		return ctrlwebhook.Allowed("by pass")
+	}
+
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
@@ -111,8 +116,21 @@ func (v *ValidatingHook) iptablesEIPUpdateHook(ctx context.Context, req admissio
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
-	// lbSvc EIPs are IPAM-only and have no NatGwDp. Their only immutability rule:
-	// once an IP is allocated (Spec.V4ip or Spec.V6ip set), it cannot be changed.
+	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp. Their only immutability
+	// rule: once an IP is allocated (Spec.V4ip or Spec.V6ip set), it cannot change.
+	if eipNew.Spec.NatGwDp == "" {
+		if eipOld.Spec.V4ip != "" && eipNew.Spec.V4ip != eipOld.Spec.V4ip {
+			err := fmt.Errorf("IptablesEIP %q: V4ip is immutable once allocated (old: %s, new: %s)",
+				eipNew.Name, eipOld.Spec.V4ip, eipNew.Spec.V4ip)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		if eipOld.Spec.V6ip != "" && eipNew.Spec.V6ip != eipOld.Spec.V6ip {
+			err := fmt.Errorf("IptablesEIP %q: V6ip is immutable once allocated (old: %s, new: %s)",
+				eipNew.Name, eipOld.Spec.V6ip, eipNew.Spec.V6ip)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		return ctrlwebhook.Allowed("by pass")
+	}
 
 	// IptablesEIP is an internal resource of a NatGwDp. Once created and Ready,
 	// its Spec (including V4ip address) is immutable — the Ready check below blocks
