@@ -250,18 +250,14 @@ func collectSvcBgpPrefixes(services []*corev1.Service, nodeName string, bgpExpec
 		if len(svc.Annotations) == 0 {
 			continue
 		}
-		// MetalLB compat: metallb.universe.tf/allow-shared-ip simultaneously replaces
-		// two kube-ovn annotations (if-else gate, takes priority over bgp-vip):
-		//   1. ovn.kubernetes.io/bgp-vip — the annotation VALUE is the VIP CR name.
-		//      The controller (reconcileBgpLbVipServiceLocked) resolves it to an IP via
-		//      virtualIpsLister.Get(vipName) and writes the IP to status.loadBalancer.ingress,
-		//      exactly as it does for ovn.kubernetes.io/bgp-vip.
-		//   2. ovn.kubernetes.io/bgp: "true" — the controller also sets bgp=true on the Service,
-		//      so the speaker's normal Default Mode (ECMP) path handles announcement.
-		//      This gate (isMetalLBCompat) is a safety net for the window between Service
-		//      creation and controller reconciliation, where bgp=true may not be set yet.
-		isMetalLBCompat := svc.Annotations[util.MetalLBAllowSharedIPAnnotation] != ""
-		if !isMetalLBCompat && svc.Annotations[util.BgpVipAnnotation] == "" {
+		// Announcement gate: Service must carry exactly one of the two VIP-binding annotations.
+		// Both annotations carry the VIP CR name as their value; the controller resolves it
+		// to an IP and writes status.loadBalancer.ingress. The speaker then announces that IP.
+		// ovn.kubernetes.io/bgp-vip  — kube-ovn native path
+		// metallb.universe.tf/allow-shared-ip — MetalLB compat (zero-annotation-change migration)
+		hasBgpVip := svc.Annotations[util.BgpVipAnnotation] != ""
+		hasMetalLBCompat := svc.Annotations[util.MetalLBAllowSharedIPAnnotation] != ""
+		if !hasBgpVip && !hasMetalLBCompat {
 			continue
 		}
 
@@ -287,13 +283,11 @@ func collectSvcBgpPrefixes(services []*corev1.Service, nodeName string, bgpExpec
 		}
 
 		// Default Mode (cluster/local) / unsupported: evaluate the bgp policy annotation.
-		// MetalLB-compat services have no ovn.kubernetes.io/bgp annotation; default to cluster.
+		// bgp-vip and allow-shared-ip services need no explicit bgp= annotation;
+		// absent policy defaults to cluster (ECMP), matching MetalLB semantics.
 		policy := svc.Annotations[util.BgpAnnotation]
 		if policy == "" {
-			if !isMetalLBCompat {
-				continue
-			}
-			// MetalLB-compat: imply bgp=cluster (ECMP) when no explicit policy annotation.
+			// Imply bgp=cluster (ECMP) when no explicit policy annotation.
 			policy = announcePolicyCluster
 		}
 		for _, ingress := range svc.Status.LoadBalancer.Ingress {

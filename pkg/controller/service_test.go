@@ -291,7 +291,7 @@ func TestHandleAddBgpLbVipService(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("happy path: ingress and bgp annotation set", func(t *testing.T) {
+	t.Run("happy path: ingress set, bgp=true no longer written by controller", func(t *testing.T) {
 		t.Parallel()
 		ctrl := newBgpLbVipController(t, readyVIP(), lbSvc(vipName))
 		require.NoError(t, ctrl.handleAddBgpLbVipService(key))
@@ -300,7 +300,9 @@ func TestHandleAddBgpLbVipService(t *testing.T) {
 			context.Background(), svcName, metav1.GetOptions{})
 		require.NoError(t, err)
 		require.Equal(t, []v1.LoadBalancerIngress{{IP: vipIP}}, updated.Status.LoadBalancer.Ingress)
-		require.Equal(t, "true", updated.Annotations[util.BgpAnnotation])
+		// The speaker now gates on bgp-vip / allow-shared-ip directly;
+		// the controller no longer writes ovn.kubernetes.io/bgp=true.
+		require.Empty(t, updated.Annotations[util.BgpAnnotation])
 	})
 
 	t.Run("idempotent: second call is a noop", func(t *testing.T) {
@@ -352,7 +354,8 @@ func TestReconcileBgpLbVipServiceLocked(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, updated.Spec.ExternalIPs)
 	require.Equal(t, []v1.LoadBalancerIngress{{IP: vipIP}}, updated.Status.LoadBalancer.Ingress)
-	require.Equal(t, "true", updated.Annotations[util.BgpAnnotation])
+	// bgp=true is no longer written by the controller; the speaker gates directly on bgp-vip.
+	require.Empty(t, updated.Annotations[util.BgpAnnotation])
 }
 
 func TestNeedReconcileBgpLbVipService(t *testing.T) {
@@ -401,7 +404,6 @@ func TestNeedReconcileBgpLbVipService(t *testing.T) {
 	t.Run("already converged service does not reconcile", func(t *testing.T) {
 		t.Parallel()
 		svc := newSvc(true)
-		svc.Annotations[util.BgpAnnotation] = "true"
 		svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: vipIP}}
 		ctrl := newBgpLbVipController(t, newVIP(vipName), svc)
 		need, err := ctrl.needReconcileBgpLbVipService(svc)
@@ -412,7 +414,6 @@ func TestNeedReconcileBgpLbVipService(t *testing.T) {
 	t.Run("drifted ingress requires reconcile", func(t *testing.T) {
 		t.Parallel()
 		svc := newSvc(true)
-		svc.Annotations[util.BgpAnnotation] = "true"
 		svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "198.51.100.9"}}
 		ctrl := newBgpLbVipController(t, newVIP(vipName), svc)
 		need, err := ctrl.needReconcileBgpLbVipService(svc)
@@ -453,24 +454,20 @@ func TestNeedCleanupBgpLbVipServiceBinding(t *testing.T) {
 	t.Run("service with bgp-vip annotation is not cleaned", func(t *testing.T) {
 		t.Parallel()
 		svc := makeService()
-		svc.Annotations = map[string]string{util.BgpVipAnnotation: "vip-a", util.BgpAnnotation: "true"}
+		svc.Annotations = map[string]string{util.BgpVipAnnotation: "vip-a"}
+		svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "203.0.113.10"}}
 		require.False(t, ctrl.needCleanupBgpLbVipServiceBinding(svc))
 	})
 
-	t.Run("service with stale bgp annotation is cleaned", func(t *testing.T) {
+	t.Run("service with stale ingress after vip-annotation removal is cleaned", func(t *testing.T) {
 		t.Parallel()
 		svc := makeService()
-		svc.Annotations = map[string]string{util.BgpAnnotation: "true"}
-		require.True(t, ctrl.needCleanupBgpLbVipServiceBinding(svc))
-	})
-
-	t.Run("service with stale ingress is cleaned", func(t *testing.T) {
-		t.Parallel()
-		svc := makeService()
+		// bgp-vip annotation removed by user; ingress still present from previous binding.
 		svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "203.0.113.10"}}
 		require.True(t, ctrl.needCleanupBgpLbVipServiceBinding(svc))
 	})
 
+	// A Service without any annotation and no ingress — nothing to clean up.
 	t.Run("service without managed state is not cleaned", func(t *testing.T) {
 		t.Parallel()
 		svc := makeService()
@@ -500,7 +497,6 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 			Namespace: ns,
 			Annotations: map[string]string{
 				util.BgpVipAnnotation: "vip-a",
-				util.BgpAnnotation:    "true",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -518,7 +514,6 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 			Namespace: ns,
 			Annotations: map[string]string{
 				util.BgpVipAnnotation: "vip-b",
-				util.BgpAnnotation:    "true",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -562,7 +557,6 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 	cleaned, err := ctrl.config.KubeClient.CoreV1().Services(ns).Get(context.Background(), bindingSvc.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Empty(t, cleaned.Status.LoadBalancer.Ingress)
-	require.Empty(t, cleaned.Annotations[util.BgpAnnotation])
 	// BgpVipAnnotation is a user-managed field; cleanupBgpLbVipServiceBinding must
 	// NOT remove it so the Service can auto-rebind if the VIP is re-created.
 	require.Equal(t, "vip-a", cleaned.Annotations[util.BgpVipAnnotation])

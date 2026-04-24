@@ -58,7 +58,8 @@ const (
 	// BgpLbVip marks a VIP reserved as a BGP-announced external IP for a LoadBalancer Service.
 	// Unlike SwitchLBRuleVip and KubeHostVMVip, no OVN logical switch port is created;
 	// the IP is held in IPAM only, and the controller writes it into the Service
-	// spec.externalIPs / status.loadBalancer.ingress for the BGP speaker to announce.
+	// status.loadBalancer.ingress for the BGP speaker to announce.
+	// spec.externalIPs is intentionally left empty to avoid duplicate output in kubectl.
 	BgpLbVip           = "bgp_lb_vip"
 	SwitchLBRuleSubnet = "switch_lb_subnet"
 

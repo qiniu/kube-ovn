@@ -50,8 +50,8 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: hostpath-init
-          image: {{ .Values.global.registry.address }}/{{ .Values.global.images.kubeovn.repository }}:{{ .Values.global.images.kubeovn.tag }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ .Values.bgpSpeaker.image.registry | default .Values.global.registry.address }}/{{ .Values.bgpSpeaker.image.repository | default .Values.global.images.kubeovn.repository }}:{{ .Values.bgpSpeaker.image.tag | default .Values.global.images.kubeovn.tag }}
+          imagePullPolicy: {{ .Values.bgpSpeaker.image.pullPolicy | default .Values.image.pullPolicy }}
           command:
             - sh
             - -c
@@ -68,8 +68,8 @@ spec:
               mountPath: /var/log/kube-ovn
       containers:
         - name: kube-ovn-speaker
-          image: {{ .Values.global.registry.address }}/{{ .Values.global.images.kubeovn.repository }}:{{ .Values.global.images.kubeovn.tag }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: {{ .Values.bgpSpeaker.image.registry | default .Values.global.registry.address }}/{{ .Values.bgpSpeaker.image.repository | default .Values.global.images.kubeovn.repository }}:{{ .Values.bgpSpeaker.image.tag | default .Values.global.images.kubeovn.tag }}
+          imagePullPolicy: {{ .Values.bgpSpeaker.image.pullPolicy | default .Values.image.pullPolicy }}
           command:
             - /kube-ovn/kube-ovn-speaker
           args:
@@ -79,8 +79,7 @@ spec:
             - --log_file_max_size=200
             - --enable-lb-svc-announce={{ .Values.bgpSpeaker.enableLbSvcAnnounce }}
           {{- with .Values.bgpSpeaker.args }}
-          args:
-            {{- toYaml . | trim | nindent 14 }}
+            {{- toYaml . | trim | nindent 12 }}
           {{- end }}
           env:
             - name: POD_IP

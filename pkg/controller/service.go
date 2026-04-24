@@ -764,7 +764,7 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 	namespace, name := svc.Namespace, svc.Name
 
 	klog.Infof("handle add bgp-lb-vip service %s, vip %s", key, vipName)
-	klog.Infof("bgp-lb-vip service %s current state: ingress=%v bgp=%q", key, svc.Status.LoadBalancer.Ingress, svc.Annotations[util.BgpAnnotation])
+	klog.Infof("bgp-lb-vip service %s current state: ingress=%v", key, svc.Status.LoadBalancer.Ingress)
 
 	vip, err := c.virtualIpsLister.Get(vipName)
 	if err != nil {
@@ -787,31 +787,10 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 	klog.Infof("bgp-lb-vip service %s resolved vip %s to ip %s", key, vipName, vipIP)
 
 	targetSvc := svc.DeepCopy()
-	if targetSvc.Annotations == nil {
-		targetSvc.Annotations = make(map[string]string)
-	}
-
-	// Ensure the BGP speaker annotation is present so collectSvcBgpPrefixes announces the IP.
-	//
-	// NOTE: spec (annotation) and status (loadBalancer.ingress) are written in two separate
-	// API calls because the Kubernetes API server treats them as independent sub-resources.
-	// A bootstrap reconcile will produce two watch events and one extra (idempotent) reconcile
-	// iteration — this is intentional.
-	if targetSvc.Annotations[util.BgpAnnotation] != "true" {
-		klog.Infof("bgp-lb-vip service %s setting bgp annotation", key)
-		targetSvc.Annotations[util.BgpAnnotation] = "true"
-		updatedSvc, updateErr := c.config.KubeClient.CoreV1().Services(namespace).Update(
-			context.Background(), targetSvc, metav1.UpdateOptions{},
-		)
-		if updateErr != nil {
-			klog.Errorf("failed to update service %s/%s: %v", namespace, name, updateErr)
-			return updateErr
-		}
-		klog.Infof("bgp-lb-vip service %s spec updated successfully", key)
-		targetSvc = updatedSvc.DeepCopy()
-	}
 
 	// Set status.loadBalancer.ingress so the BGP speaker discovers the IP.
+	// The speaker uses ovn.kubernetes.io/bgp-vip or metallb.universe.tf/allow-shared-ip
+	// as the announcement gate — no extra controller-written annotation is needed.
 	// kube-proxy also uses ingress IPs for DNAT rules on type=LoadBalancer services.
 	// We only set Ingress here (not spec.externalIPs) — consistent with MetalLB.
 	ingress := []v1.LoadBalancerIngress{{IP: vipIP}}
@@ -873,10 +852,6 @@ func (c *Controller) needReconcileBgpLbVipService(svc *v1.Service) (bool, error)
 
 	desiredIngress := []v1.LoadBalancerIngress{{IP: vip.Status.V4ip}}
 
-	if svc.Annotations[util.BgpAnnotation] != "true" {
-		klog.Infof("bgp-lb-vip service %s needs reconcile: bgp annotation=%q desired=%q", key, svc.Annotations[util.BgpAnnotation], "true")
-		return true, nil
-	}
 	if !equality.Semantic.DeepEqual(svc.Status.LoadBalancer.Ingress, desiredIngress) {
 		klog.Infof("bgp-lb-vip service %s needs reconcile: ingress=%v desired=%v", key, svc.Status.LoadBalancer.Ingress, desiredIngress)
 		return true, nil
@@ -890,15 +865,26 @@ func (c *Controller) needCleanupBgpLbVipServiceBinding(svc *v1.Service) bool {
 	if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
 		return false
 	}
-	// Either annotation means this service owns a VIP binding — do not clean up.
+	// Either annotation means this service still owns a VIP binding — do not clean up.
 	if svc.Annotations[util.BgpVipAnnotation] != "" || svc.Annotations[util.MetalLBAllowSharedIPAnnotation] != "" {
 		return false
 	}
-	// Only clean up if kube-ovn set bgp=true on this Service, proving ownership.
-	// A bare len(ingress) != 0 check has no ownership guarantee and would clear
-	// LoadBalancerStatus from unrelated LB Services managed by cloud providers or
-	// other controllers that happen to have no bgp-vip annotation.
-	return svc.Annotations[util.BgpAnnotation] == "true"
+	// Neither VIP annotation is present but ingress exists: the user removed the bgp-vip
+	// (or allow-shared-ip) annotation after kube-ovn had already written the ingress.
+	// Clean up the stale ingress so kube-proxy stops NATing and the speaker withdraws the route.
+	//
+	// This is safe because:
+	//   - ovn.kubernetes.io/bgp-vip is a kube-ovn-specific annotation; cloud providers
+	//     and other LB controllers do not set it.
+	//   - metallb.universe.tf/allow-shared-ip is a MetalLB annotation that kube-ovn
+	//     recognises for zero-annotation-change migration; a cluster running kube-ovn
+	//     BGP LB is expected to have already replaced MetalLB, so this annotation is
+	//     only present on Services explicitly migrated to kube-ovn.
+	//   - EnableBgpLbVip=true implies a kube-ovn-managed cluster: cloud-provider LB Services
+	//     coexisting in the same cluster are not expected.
+	//   - Therefore any LoadBalancer Service without these annotations is either unrelated
+	//     (no ingress) or a previously-bound bgp-lb-vip whose annotation was removed.
+	return len(svc.Status.LoadBalancer.Ingress) != 0
 }
 
 func (c *Controller) cleanupBgpLbVipServiceBindingByVip(vipName string) error {
@@ -913,6 +899,17 @@ func (c *Controller) cleanupBgpLbVipServiceBindingByVip(vipName string) error {
 		if !ok {
 			continue
 		}
+		// Apply the same VIP priority rule as reconcile: allow-shared-ip takes precedence
+		// over bgp-vip.  If the Service's effective VIP is different from the one being
+		// deleted (e.g. bgp-vip=X, allow-shared-ip=Y and we are deleting X), the Service
+		// is still actively bound via Y — skip cleanup to avoid incorrectly clearing ingress.
+		effectiveVip := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]
+		if effectiveVip == "" {
+			effectiveVip = svc.Annotations[util.BgpVipAnnotation]
+		}
+		if effectiveVip != vipName {
+			continue
+		}
 		if err := c.cleanupBgpLbVipServiceBinding(svc); err != nil {
 			return err
 		}
@@ -922,44 +919,21 @@ func (c *Controller) cleanupBgpLbVipServiceBindingByVip(vipName string) error {
 }
 
 func (c *Controller) cleanupBgpLbVipServiceBinding(svc *v1.Service) error {
+	if len(svc.Status.LoadBalancer.Ingress) == 0 {
+		return nil
+	}
 	targetSvc := svc.DeepCopy()
-	if targetSvc.Annotations == nil {
-		targetSvc.Annotations = make(map[string]string)
+	// Clear LoadBalancerStatus so kube-proxy removes DNAT rules and the BGP speaker
+	// (which gates on bgp-vip / allow-shared-ip) withdraws the route on next reconcile.
+	// Do NOT remove BgpVipAnnotation — it is user-managed; if the VIP CR is re-created
+	// the Service must be able to auto-rebind.
+	targetSvc.Status.LoadBalancer = v1.LoadBalancerStatus{}
+	if _, err := c.config.KubeClient.CoreV1().Services(targetSvc.Namespace).UpdateStatus(
+		context.Background(), targetSvc, metav1.UpdateOptions{},
+	); err != nil {
+		klog.Errorf("failed to cleanup service %s/%s status for bgp-lb-vip: %v", svc.Namespace, svc.Name, err)
+		return err
 	}
-
-	// Clear fields owned by the controller:
-	//   - ovn.kubernetes.io/bgp annotation — cleared so the BGP speaker stops advertising.
-	// Do NOT remove BgpVipAnnotation (ovn.kubernetes.io/bgp-vip) — that is a user-managed
-	// field; if the VIP CR is re-created the Service must be able to auto-rebind.
-	if svc.Annotations[util.BgpAnnotation] != "" {
-		delete(targetSvc.Annotations, util.BgpAnnotation)
-
-		updatedSvc, err := c.config.KubeClient.CoreV1().Services(targetSvc.Namespace).Update(
-			context.Background(), targetSvc, metav1.UpdateOptions{},
-		)
-		if err != nil {
-			klog.Errorf("failed to cleanup service %s/%s spec for bgp-lb-vip: %v", svc.Namespace, svc.Name, err)
-			return err
-		}
-		targetSvc = updatedSvc.DeepCopy()
-	}
-
-	// Clear the entire LoadBalancerStatus (mirrors MetalLB's clearServiceState which does
-	// svc.Status.LoadBalancer = v1.LoadBalancerStatus{}). This is more defensive than
-	// only zeroing the Ingress slice: if LoadBalancerStatus gains new fields in future
-	// Kubernetes versions they will also be cleared.
-	// Note: direct struct comparison is not possible (LoadBalancerStatus contains a slice),
-	// so we check the only current field explicitly.
-	if len(svc.Status.LoadBalancer.Ingress) != 0 {
-		targetSvc.Status.LoadBalancer = v1.LoadBalancerStatus{}
-		if _, err := c.config.KubeClient.CoreV1().Services(targetSvc.Namespace).UpdateStatus(
-			context.Background(), targetSvc, metav1.UpdateOptions{},
-		); err != nil {
-			klog.Errorf("failed to cleanup service %s/%s status for bgp-lb-vip: %v", svc.Namespace, svc.Name, err)
-			return err
-		}
-	}
-
 	return nil
 }
 
