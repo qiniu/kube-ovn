@@ -369,6 +369,32 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 // update: adds missing VIPs, removes stale VIPs, and enqueues endpoint/SLR re-syncs as
 // needed. Only called when EnableLb=true (classic OVN LB mode).
 func (c *Controller) syncServiceOvnLBVips(key string, svc *v1.Service, ips, ipsToDel []string) error {
+	// Re-derive ingress IPs from a fresh subnet check instead of trusting the
+	// ServiceExternalIPFromSubnetAnnotation annotation.  That annotation is
+	// user-writable; reading it here would allow a user who can PATCH Service
+	// annotations to inject arbitrary ingress IPs into the OVN load balancer.
+	// The SwitchLBRuleVipsAnnotation path is kept as-is (explicit VIPs).
+	if _, hasExplicitVips := svc.Annotations[util.SwitchLBRuleVipsAnnotation]; !hasExplicitVips {
+		freshIPs := util.ServiceClusterIPs(*svc)
+		subnets, err := c.subnetsLister.List(labels.Everything())
+		if err != nil {
+			klog.Errorf("failed to list subnets for service %s: %v", key, err)
+			return err
+		}
+	ingressLoop:
+		for _, ingress := range svc.Status.LoadBalancer.Ingress {
+			if ingress.IP == "" {
+				continue
+			}
+			for _, subnet := range subnets {
+				if util.CIDRContainIP(subnet.Spec.CIDRBlock, ingress.IP) {
+					freshIPs = append(freshIPs, ingress.IP)
+					continue ingressLoop
+				}
+			}
+		}
+		ips = freshIPs
+	}
 	vpcName := svc.Annotations[util.VpcAnnotation]
 	if vpcName == "" {
 		vpcName = c.config.ClusterRouter
