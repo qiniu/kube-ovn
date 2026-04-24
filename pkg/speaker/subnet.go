@@ -260,6 +260,11 @@ func collectSvcBgpPrefixes(services []*corev1.Service, nodeName string, bgpExpec
 		if !hasBgpVip && !hasMetalLBCompat {
 			continue
 		}
+		// Only LoadBalancer Services participate in the BGP LB VIP flow;
+		// annotations on other Service types are ignored.
+		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+			continue
+		}
 
 		// Test Mode: static single-node binding via bgp-speaker-node annotation.
 		// Takes precedence over the bgp policy annotation.

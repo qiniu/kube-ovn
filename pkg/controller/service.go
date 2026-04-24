@@ -246,11 +246,10 @@ func (c *Controller) deleteServiceOvnLBVips(service *vpcService) error {
 
 // handleUpdateService reconciles a Service update.
 //
-// When EnableBgpLbVip=true: Service updates are intentionally a no-op for the BGP LB VIP path.
-// VIP binding is established at create time (handleAddBgpLbVipService) and torn down on
-// Service deletion (handleDeleteService) or VIP CR deletion (cleanupBgpLbVipServiceBindingByVip).
-// Skipping update reconciliation avoids incorrectly touching ingress status that is owned
-// by the creation path and prevents false-positive cleanup of third-party LB controllers.
+// When EnableBgpLbVip=true: annotation changes (adding, removing, or switching the
+// bgp-vip / allow-shared-ip annotation) must be reconciled immediately so that
+// status.loadBalancer.ingress tracks the current annotation. reconcileBgpLbVipServiceLocked
+// is idempotent and only calls UpdateStatus when the ingress actually differs.
 func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 	key := svcObject.key
 	keys := strings.Split(key, "#")
@@ -323,9 +322,10 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 	}
 
 	if c.config.EnableBgpLbVip {
-		// BGP LB VIP binding is established at Service creation and torn down at
-		// Service or VIP CR deletion. Updates are intentionally a no-op.
-		return nil
+		// Re-reconcile so that annotation changes (add/remove/switch bgp-vip or
+		// allow-shared-ip) are immediately reflected in status.loadBalancer.ingress.
+		// The mutex is already held here; call the locked variant directly.
+		return c.reconcileBgpLbVipServiceLocked(key, svc)
 	}
 
 	return nil
@@ -745,7 +745,21 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 		vipName = svc.Annotations[util.BgpVipAnnotation]
 	}
 	if vipName == "" {
-		// Service does not request a BGP LB VIP; nothing to do.
+		// The annotation has been removed. If there is stale ingress written by this
+		// controller, clear it so kube-proxy and the BGP speaker see a clean state.
+		// EnableBgpLbVip and EnableLbSvc are mutually exclusive, so no other LB
+		// controller owns the ingress field when this path runs.
+		if len(svc.Status.LoadBalancer.Ingress) > 0 {
+			targetSvc := svc.DeepCopy()
+			targetSvc.Status.LoadBalancer.Ingress = nil
+			if _, err := c.config.KubeClient.CoreV1().Services(svc.Namespace).UpdateStatus(
+				context.Background(), targetSvc, metav1.UpdateOptions{},
+			); err != nil {
+				klog.Errorf("failed to clear stale ingress for service %s/%s: %v", svc.Namespace, svc.Name, err)
+				return err
+			}
+			klog.Infof("bgp-lb-vip service %s/%s: annotation removed, cleared stale ingress", svc.Namespace, svc.Name)
+		}
 		return nil
 	}
 
