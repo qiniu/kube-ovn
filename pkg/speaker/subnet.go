@@ -200,10 +200,52 @@ func collectPodExpectedPrefixes(pods []*corev1.Pod, subnetByName map[string]*kub
 //
 //	controller --enable-bgp-lb-vip=true  →  Service.status.loadBalancer.ingress  →  speaker --enable-lb-svc-announce=true
 //
-// Policy semantics:
-//   - "true" / "cluster": all speaker nodes announce the IP.
-//   - "local": currently announces on all speaker nodes for Services.
-func collectSvcBgpPrefixes(services []*corev1.Service, _ string, bgpExpected prefixMap) {
+// # BGP ANNOUNCEMENT MODEL
+//
+// The upstream router/switch only sees /32 prefixes and their BGP next-hops (node
+// underlay IPs). It has zero visibility into pods, kube-proxy rules, or container
+// ports — it simply forwards packets to whichever node announced the route.
+//
+// Announcement policy (two supported modes, evaluated in priority order):
+//
+// Test Mode — static single-node binding (ovn.kubernetes.io/bgp-speaker-node=<node>):
+//
+//	Only the named node announces the VIP; all other speaker nodes skip it.
+//	The upstream router sees exactly ONE /32 route and forwards all traffic to
+//	that node. kube-proxy/IPVS on that node then DNATs to the correct pod.
+//
+//	  Use case: testing, or upstream switches that do NOT support ECMP.
+//	  NOT for production VM workloads: VMs are migratable, so pinning the
+//	  announcement to a fixed node adds a cross-node hop when the VM moves.
+//	  Failover is manual — update the annotation to redirect to another node.
+//
+// Default Mode — ECMP cluster mode (ovn.kubernetes.io/bgp=cluster / "true", default):
+//
+//	All speaker nodes announce the VIP simultaneously. The upstream router
+//	performs equal-cost multipath (ECMP) across all nodes. kube-proxy/IPVS
+//	on whichever node receives traffic routes to the correct pod.
+//
+//	  Use case: production IaaS / public-cloud LB. VMs are migratable —
+//	  the VIP is never tied to a node, so VM migration is transparent.
+//	  Requires the upstream switch/router to be configured for ECMP.
+//
+// bgp=local current limitation for LB VIPs:
+//
+//	In MetalLB, "local" means "announce only from nodes with a ready endpoint"
+//	(ExternalTrafficPolicy: Local semantics, requires EndpointSlice awareness).
+//
+//	For VM/EIP workloads this degenerates to cluster mode because:
+//	1. The bgp_lb_vip is a floating IP. kube-proxy/IPVS programs it on
+//	   kube-ipvs0 on EVERY node, so every node is a "local endpoint".
+//	   The local filter has no effect — all nodes still announce (ECMP).
+//	2. On VM live migration the EIP follows the VM, but BGP paths do not
+//	   automatically update to reflect the new node. The router keeps all
+//	   N ECMP paths; the migrated VM is still reachable via kube-proxy DNAT
+//	   but without a BGP path update tracking the migration.
+//
+//	TODO: add EndpointSlice-aware local announcement to automatically update
+//	the BGP path on VM live migration. Use bgp=cluster for production until then.
+func collectSvcBgpPrefixes(services []*corev1.Service, nodeName string, bgpExpected prefixMap) {
 	for _, svc := range services {
 		if len(svc.Annotations) == 0 {
 			continue
@@ -211,6 +253,29 @@ func collectSvcBgpPrefixes(services []*corev1.Service, _ string, bgpExpected pre
 		if svc.Annotations[util.BgpVipAnnotation] == "" {
 			continue
 		}
+
+		// Test Mode: static single-node binding via bgp-speaker-node annotation.
+		// Takes precedence over the bgp policy annotation.
+		// For testing or non-ECMP upstreams only — not for production VM workloads.
+		if pinnedNode := svc.Annotations[util.BgpSpeakerNodeAnnotation]; pinnedNode != "" {
+			if pinnedNode != nodeName {
+				klog.V(4).Infof("service %s/%s: bgp-speaker-node=%s (this node=%s), skipping",
+					svc.Namespace, svc.Name, pinnedNode, nodeName)
+				continue
+			}
+			// This node is the pinned speaker (Test Mode) — announce all ingress IPs.
+			for _, ingress := range svc.Status.LoadBalancer.Ingress {
+				if ingress.IP == "" {
+					continue
+				}
+				klog.V(4).Infof("service %s/%s announcing VIP %s via BGP (bgp-speaker-node=%s)",
+					svc.Namespace, svc.Name, ingress.IP, pinnedNode)
+				addExpectedPrefix(ingress.IP, bgpExpected)
+			}
+			continue
+		}
+
+		// Default Mode (cluster/local) / unsupported: evaluate the bgp policy annotation.
 		policy := svc.Annotations[util.BgpAnnotation]
 		if policy == "" {
 			continue
@@ -221,16 +286,45 @@ func collectSvcBgpPrefixes(services []*corev1.Service, _ string, bgpExpected pre
 			}
 			switch policy {
 			case "true", announcePolicyCluster:
-				klog.Infof("service %s/%s announces LoadBalancer ingress IP %s via BGP (policy=%s)", svc.Namespace, svc.Name, ingress.IP, policy)
+				// Default Mode: ECMP — all speaker nodes announce the VIP simultaneously.
+				// The upstream router performs ECMP across all nodes. This is the
+				// recommended production mode for VM/IaaS workloads where VMs are
+				// migratable and must not be tied to a specific node.
+				// V(4): fires every 5s reconcile; actual BGP add/del logged in reconcileRoutes.
+				klog.V(4).Infof("service %s/%s announcing VIP %s via BGP (policy=%s, ECMP)",
+					svc.Namespace, svc.Name, ingress.IP, policy)
 				addExpectedPrefix(ingress.IP, bgpExpected)
 			case announcePolicyLocal:
-				// For LB Services the "local" policy announces on all nodes:
-				// there is no single pod node to pin to, and the external router
-				// performs ECMP over all BGP peers anyway.
-				klog.Infof("service %s/%s announces LoadBalancer ingress IP %s via BGP (policy=%s)", svc.Namespace, svc.Name, ingress.IP, policy)
+				// bgp=local currently behaves identically to bgp=cluster for LB VIPs:
+				// all speaker nodes announce the VIP (ECMP). This is because the
+				// bgp_lb_vip is a floating IP — kube-proxy/IPVS programs it on
+				// kube-ipvs0 on EVERY node, so there is no "node with a local endpoint"
+				// to filter on.
+				//
+				// WARNING: in VM live-migration scenarios the EIP follows the VM to
+				// the destination node, but all BGP speakers continue to announce the
+				// VIP regardless. Traffic still reaches the VM correctly via ECMP +
+				// kube-proxy DNAT, but the migration is NOT transparent at the BGP
+				// layer: the router keeps N equal-cost paths instead of tracking the
+				// VM's new location. If single-path post-migration routing is required,
+				// update bgp-speaker-node to the destination node after migration.
+				//
+				// TODO: implement EndpointSlice-aware local announcement so that only
+				// the node currently hosting the VM announces the VIP, enabling
+				// automatic BGP path update on live migration without manual annotation
+				// changes. Requires adding an EndpointSlice lister to the speaker
+				// controller and wiring ExternalTrafficPolicy: Local semantics.
+				// V(2): suppressed at default verbosity to avoid 5s-reconcile log spam.
+				// Use -v=2 to surface this when debugging bgp=local services.
+				klog.V(2).Infof("WARNING service %s/%s: bgp=local for LoadBalancer VIPs "+
+					"currently announces on all nodes (ECMP); VM live-migration will NOT "+
+					"automatically update the BGP path to the destination node — "+
+					"see TODO in collectSvcBgpPrefixes",
+					svc.Namespace, svc.Name)
 				addExpectedPrefix(ingress.IP, bgpExpected)
 			default:
-				klog.Warningf("service %s/%s: invalid bgp annotation value %q", svc.Namespace, svc.Name, policy)
+				klog.Warningf("service %s/%s: invalid bgp annotation value %q",
+					svc.Namespace, svc.Name, policy)
 			}
 		}
 	}

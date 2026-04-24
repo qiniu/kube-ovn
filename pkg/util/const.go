@@ -15,19 +15,15 @@ const (
 	DepreciatedFinalizerName   = "kube-ovn-controller"
 	KubeOVNControllerFinalizer = "kubeovn.io/kube-ovn-controller"
 
-	AllocatedAnnotation  = "ovn.kubernetes.io/allocated"
-	RoutedAnnotation     = "ovn.kubernetes.io/routed"
-	RoutesAnnotation     = "ovn.kubernetes.io/routes"
-	MacAddressAnnotation = "ovn.kubernetes.io/mac_address"
-	IPAddressAnnotation  = "ovn.kubernetes.io/ip_address"
-	CidrAnnotation       = "ovn.kubernetes.io/cidr"
-	GatewayAnnotation    = "ovn.kubernetes.io/gateway"
-	IPPoolAnnotation     = "ovn.kubernetes.io/ip_pool"
-	BgpAnnotation        = "ovn.kubernetes.io/bgp"
-	// BgpVipAnnotation is set on a LoadBalancer Service to specify the VIP name
-	// (type=bgp_lb_vip) whose allocated IP will be written into spec.externalIPs
-	// and status.loadBalancer.ingress so the BGP speaker can announce it.
-	BgpVipAnnotation             = "ovn.kubernetes.io/bgp-vip"
+	AllocatedAnnotation          = "ovn.kubernetes.io/allocated"
+	RoutedAnnotation             = "ovn.kubernetes.io/routed"
+	RoutesAnnotation             = "ovn.kubernetes.io/routes"
+	MacAddressAnnotation         = "ovn.kubernetes.io/mac_address"
+	IPAddressAnnotation          = "ovn.kubernetes.io/ip_address"
+	CidrAnnotation               = "ovn.kubernetes.io/cidr"
+	GatewayAnnotation            = "ovn.kubernetes.io/gateway"
+	IPPoolAnnotation             = "ovn.kubernetes.io/ip_pool"
+	BgpAnnotation                = "ovn.kubernetes.io/bgp"
 	SnatAnnotation               = "ovn.kubernetes.io/snat"
 	EipAnnotation                = "ovn.kubernetes.io/eip"
 	FipFinalizer                 = "ovn.kubernetes.io/fip"
@@ -405,6 +401,51 @@ const (
 	ContentTypeJSON     = "application/json"
 	ContentTypeProtobuf = runtime.ContentTypeProtobuf
 	AcceptContentTypes  = runtime.ContentTypeProtobuf + "," + "application/json"
+)
+
+// BGP LB VIP annotations
+//
+// These annotations control how LoadBalancer VIPs (bgp_lb_vip type) are announced
+// via BGP. The upstream router/switch only sees /32 prefixes and their BGP next-hops
+// (node underlay IPs). It has zero visibility into pods, kube-proxy rules, or
+// container ports — it simply forwards packets to the node that announced the route.
+//
+// Note: BgpAnnotation (ovn.kubernetes.io/bgp) is the shared policy key used across
+// Pods, Subnets, and LoadBalancer VIPs. It is defined in the general annotation block
+// above. The constants below are specific to the LoadBalancer VIP (bgp_lb_vip) path.
+//
+// Announcement modes (see collectSvcBgpPrefixes in pkg/speaker/subnet.go for full
+// implementation rationale):
+//
+//	bgp=cluster / "true" (default, recommended for production):
+//	  All speaker nodes announce the VIP simultaneously (ECMP). The upstream
+//	  router distributes traffic across all nodes; kube-proxy/IPVS on each node
+//	  routes to the correct VM regardless of entry point. VMs are migratable —
+//	  the VIP is never tied to a node, so live migration is transparent.
+//	  Requires the upstream switch/router to support ECMP.
+//
+//	bgp=local (ECMP with live-migration caveat):
+//	  Currently behaves identically to bgp=cluster. The EIP is a floating IP
+//	  programmed on kube-ipvs0 on EVERY node, so "local endpoint" filtering has
+//	  no effect — all nodes still announce (ECMP). On VM live migration the BGP
+//	  path does NOT automatically follow the VM to the destination node.
+//	  TODO: implement EndpointSlice-aware local announcement.
+//
+//	bgp-speaker-node=<nodeName> (single-node, testing only):
+//	  Only the named node announces the /32 route; all other speakers skip it.
+//	  Use for testing or upstream switches that do NOT support ECMP.
+//	  NOT suitable for production VM workloads: VM migration does not update
+//	  the pinned node, adding a cross-node SNAT hop. Failover is fully manual.
+const (
+	// BgpVipAnnotation is set on a LoadBalancer Service to specify the VIP name
+	// (type=bgp_lb_vip) whose allocated IP will be written into
+	// status.loadBalancer.ingress for BGP speaker announcement.
+	BgpVipAnnotation = "ovn.kubernetes.io/bgp-vip"
+
+	// BgpSpeakerNodeAnnotation pins a LoadBalancer VIP to a single BGP speaker
+	// node. Only that node announces the /32 route; all others skip it.
+	// Use for testing or non-ECMP upstreams only. Failover is manual.
+	BgpSpeakerNodeAnnotation = "ovn.kubernetes.io/bgp-speaker-node"
 )
 
 // Readonly kinds of Kubernetes objects

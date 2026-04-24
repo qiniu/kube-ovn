@@ -300,6 +300,36 @@ func TestCollectSvcBgpPrefixes(t *testing.T) {
 			wantIPs:  []string{"192.168.100.5/32"},
 		},
 		{
+			name: "bgp-speaker-node matches this node: announced (Test Mode)",
+			services: []*corev1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.BgpVipAnnotation:         "vip1",
+						util.BgpSpeakerNodeAnnotation: "node1",
+					},
+				},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "5.5.5.5"}}}},
+			}},
+			wantIPs: []string{"5.5.5.5/32"},
+		},
+		{
+			name: "bgp-speaker-node does NOT match this node: skipped (Test Mode)",
+			services: []*corev1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.BgpVipAnnotation:         "vip1",
+						util.BgpSpeakerNodeAnnotation: "node2",
+					},
+				},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "5.5.5.5"}}}},
+			}},
+			wantNot: []string{"5.5.5.5/32"},
+		},
+		{
 			name:     "no ingress IP: nothing announced",
 			services: []*corev1.Service{makeService("svc1", "default", "true")},
 			wantNot:  []string{},

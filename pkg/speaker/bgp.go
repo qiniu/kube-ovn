@@ -80,6 +80,8 @@ func (c *Controller) announceAndWithdraw(expected, existing set.Set[string]) {
 	for route := range toAdd {
 		if err := c.addRoute(route); err != nil {
 			klog.Error(err)
+		} else {
+			klog.Infof("BGP route announced: %s", route)
 		}
 	}
 
@@ -89,6 +91,8 @@ func (c *Controller) announceAndWithdraw(expected, existing set.Set[string]) {
 	for route := range toDel {
 		if err := c.delRoute(route); err != nil {
 			klog.Error(err)
+		} else {
+			klog.Infof("BGP route withdrawn: %s", route)
 		}
 	}
 }
