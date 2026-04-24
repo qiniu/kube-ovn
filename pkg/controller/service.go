@@ -33,6 +33,12 @@ type updateSvcObject struct {
 	key      string
 	oldPorts []v1.ServicePort
 	newPorts []v1.ServicePort
+	// hadBgpVipAnnotation records whether the previous Service object carried either
+	// the bgp-vip or allow-shared-ip annotation. Used by handleUpdateService to
+	// distinguish "annotation was removed from a controller-owned Service" (clear
+	// stale ingress) from "unrelated LoadBalancer Service with no bgp annotation"
+	// (leave ingress untouched).
+	hadBgpVipAnnotation bool
 }
 
 func (c *Controller) enqueueAddService(obj any) {
@@ -140,9 +146,10 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 	}
 
 	updateSvc := &updateSvcObject{
-		key:      key,
-		oldPorts: oldSvc.Spec.Ports,
-		newPorts: newSvc.Spec.Ports,
+		key:                 key,
+		oldPorts:            oldSvc.Spec.Ports,
+		newPorts:            newSvc.Spec.Ports,
+		hadBgpVipAnnotation: oldSvc.Annotations[util.MetalLBAllowSharedIPAnnotation] != "" || oldSvc.Annotations[util.BgpVipAnnotation] != "",
 	}
 	c.updateServiceQueue.Add(updateSvc)
 }
@@ -325,7 +332,34 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 		// Re-reconcile so that annotation changes (add/remove/switch bgp-vip or
 		// allow-shared-ip) are immediately reflected in status.loadBalancer.ingress.
 		// The mutex is already held here; call the locked variant directly.
-		return c.reconcileBgpLbVipServiceLocked(key, svc)
+		//
+		// Ownership guard: only clear stale ingress when this controller previously
+		// owned the Service (old annotation was set). Services managed by other LB
+		// controllers are left completely untouched.
+		vipName := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]
+		if vipName == "" {
+			vipName = svc.Annotations[util.BgpVipAnnotation]
+		}
+		if vipName == "" && svcObject.hadBgpVipAnnotation && len(svc.Status.LoadBalancer.Ingress) > 0 {
+			// Annotation was removed from a controller-owned Service; clear the stale
+			// ingress so kube-proxy and the BGP speaker see a clean state.
+			// EnableBgpLbVip and EnableLbSvc are mutually exclusive (config validate),
+			// so no other LB controller owns the ingress field when this path runs.
+			targetSvc := svc.DeepCopy()
+			targetSvc.Status.LoadBalancer.Ingress = nil
+			if _, err := c.config.KubeClient.CoreV1().Services(svc.Namespace).UpdateStatus(
+				context.Background(), targetSvc, metav1.UpdateOptions{},
+			); err != nil {
+				klog.Errorf("failed to clear stale ingress for service %s/%s: %v", svc.Namespace, svc.Name, err)
+				return err
+			}
+			klog.Infof("bgp-lb-vip service %s/%s: annotation removed, cleared stale ingress", svc.Namespace, svc.Name)
+			return nil
+		}
+		if vipName != "" {
+			return c.reconcileBgpLbVipServiceLocked(key, svc)
+		}
+		return nil
 	}
 
 	return nil
@@ -648,9 +682,9 @@ func (c *Controller) checkServiceLBIPBelongToSubnet(svc *v1.Service) error {
 	if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
 		return nil
 	}
-	if len(svc.Status.LoadBalancer.Ingress) == 0 {
-		return nil
-	}
+	// Note: do NOT short-circuit when len(ingress)==0. An empty ingress list means
+	// any previously set ServiceExternalIPFromSubnetAnnotation must be removed.
+	// Returning early here would leave the annotation stale after ingress is cleared.
 
 	svc = svc.DeepCopy()
 	if svc.Annotations == nil {
@@ -745,21 +779,9 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 		vipName = svc.Annotations[util.BgpVipAnnotation]
 	}
 	if vipName == "" {
-		// The annotation has been removed. If there is stale ingress written by this
-		// controller, clear it so kube-proxy and the BGP speaker see a clean state.
-		// EnableBgpLbVip and EnableLbSvc are mutually exclusive, so no other LB
-		// controller owns the ingress field when this path runs.
-		if len(svc.Status.LoadBalancer.Ingress) > 0 {
-			targetSvc := svc.DeepCopy()
-			targetSvc.Status.LoadBalancer.Ingress = nil
-			if _, err := c.config.KubeClient.CoreV1().Services(svc.Namespace).UpdateStatus(
-				context.Background(), targetSvc, metav1.UpdateOptions{},
-			); err != nil {
-				klog.Errorf("failed to clear stale ingress for service %s/%s: %v", svc.Namespace, svc.Name, err)
-				return err
-			}
-			klog.Infof("bgp-lb-vip service %s/%s: annotation removed, cleared stale ingress", svc.Namespace, svc.Name)
-		}
+		// Service does not request a BGP LB VIP; nothing to do.
+		// Stale-ingress cleanup after annotation removal is handled in handleUpdateService,
+		// which has ownership context via updateSvcObject.hadBgpVipAnnotation.
 		return nil
 	}
 

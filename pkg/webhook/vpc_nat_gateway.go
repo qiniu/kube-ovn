@@ -123,7 +123,17 @@ func (v *ValidatingHook) iptablesEIPUpdateHook(ctx context.Context, req admissio
 	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp. Their immutability
 	// rule: once an IP is allocated (Spec.V4ip or Spec.V6ip set), it cannot change.
 	// IP format and subnet/CIDR fields are still validated on every spec change.
+	//
+	// Guard: if the old object already had a NatGwDp, this update is attempting to
+	// clear an immutable field (migrating a NAT-backed EIP to IPAM-only is not
+	// supported). Reject before entering the IPAM-only branch so the NAT-gateway
+	// immutability checks below cannot be bypassed.
 	if eipNew.Spec.NatGwDp == "" {
+		if eipOld.Spec.NatGwDp != "" {
+			err := fmt.Errorf("IptablesEIP %q: NatGwDp is immutable once set (cannot be cleared, old: %s)",
+				eipNew.Name, eipOld.Spec.NatGwDp)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
 		if eipOld.Spec.V4ip != "" && eipNew.Spec.V4ip != eipOld.Spec.V4ip {
 			err := fmt.Errorf("IptablesEIP %q: V4ip is immutable once allocated (old: %s, new: %s)",
 				eipNew.Name, eipOld.Spec.V4ip, eipNew.Spec.V4ip)
