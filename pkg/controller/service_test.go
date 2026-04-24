@@ -537,10 +537,14 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 			if !ok {
 				return nil, nil
 			}
+			var keys []string
 			if v := s.Annotations[util.BgpVipAnnotation]; v != "" {
-				return []string{v}, nil
+				keys = append(keys, v)
 			}
-			return nil, nil
+			if v := s.Annotations[util.MetalLBAllowSharedIPAnnotation]; v != "" {
+				keys = append(keys, v)
+			}
+			return keys, nil
 		},
 	})
 	require.NoError(t, err)

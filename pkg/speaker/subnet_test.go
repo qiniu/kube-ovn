@@ -334,6 +334,81 @@ func TestCollectSvcBgpPrefixes(t *testing.T) {
 			services: []*corev1.Service{makeService("svc1", "default", "true")},
 			wantNot:  []string{},
 		},
+		// MetalLB compatibility: metallb.universe.tf/allow-shared-ip
+		{
+			name: "MetalLB compat: allow-shared-ip only, no bgp annotations: announced as cluster (Default Mode)",
+			services: []*corev1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.MetalLBAllowSharedIPAnnotation: "111.62.241.102",
+					},
+				},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
+			}},
+			wantIPs: []string{"111.62.241.102/32"},
+		},
+		{
+			name: "MetalLB compat: allow-shared-ip present, bgp-vip absent: MetalLB key wins",
+			services: []*corev1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.MetalLBAllowSharedIPAnnotation: "111.62.241.102",
+						// ovn.kubernetes.io/bgp-vip intentionally absent
+					},
+				},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
+			}},
+			wantIPs: []string{"111.62.241.102/32"},
+		},
+		{
+			name: "MetalLB compat: allow-shared-ip present, bgp-vip also set: MetalLB key takes priority, bgp-vip ignored",
+			services: []*corev1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.MetalLBAllowSharedIPAnnotation: "111.62.241.102",
+						util.BgpVipAnnotation:               "some-other-vip",
+					},
+				},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
+			}},
+			wantIPs: []string{"111.62.241.102/32"},
+		},
+		{
+			name: "MetalLB compat: allow-shared-ip with bgp-speaker-node matching this node: Test Mode wins",
+			services: []*corev1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.MetalLBAllowSharedIPAnnotation: "111.62.241.102",
+						util.BgpSpeakerNodeAnnotation:       "node1",
+					},
+				},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
+			}},
+			wantIPs: []string{"111.62.241.102/32"},
+		},
+		{
+			name: "MetalLB compat: allow-shared-ip with bgp-speaker-node NOT matching: skipped",
+			services: []*corev1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "svc1",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.MetalLBAllowSharedIPAnnotation: "111.62.241.102",
+						util.BgpSpeakerNodeAnnotation:       "node2",
+					},
+				},
+				Status: corev1.ServiceStatus{LoadBalancer: corev1.LoadBalancerStatus{Ingress: []corev1.LoadBalancerIngress{{IP: "111.62.241.102"}}}},
+			}},
+			wantNot: []string{"111.62.241.102/32"},
+		},
 		{
 			name: "multiple services: each contributes independently",
 			services: []*corev1.Service{

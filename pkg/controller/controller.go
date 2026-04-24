@@ -772,10 +772,16 @@ func Run(ctx context.Context, config *Configuration) {
 			if !ok {
 				return nil, nil
 			}
+			// Index by both kube-ovn and MetalLB compat VIP annotation values,
+			// as both carry the VIP CR name and must trigger cleanup on VIP deletion.
+			var keys []string
 			if v := svc.Annotations[util.BgpVipAnnotation]; v != "" {
-				return []string{v}, nil
+				keys = append(keys, v)
 			}
-			return nil, nil
+			if v := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]; v != "" {
+				keys = append(keys, v)
+			}
+			return keys, nil
 		},
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add bgpVip indexer to service informer")

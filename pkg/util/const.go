@@ -436,6 +436,42 @@ const (
 //	  Use for testing or upstream switches that do NOT support ECMP.
 //	  NOT suitable for production VM workloads: VM migration does not update
 //	  the pinned node, adding a cross-node SNAT hop. Failover is fully manual.
+//
+// # MetalLB Compatibility
+//
+// Services previously managed by MetalLB carry the annotation:
+//
+//	metallb.universe.tf/allow-shared-ip: <vip-cr-name>
+//
+// The annotation value is the name of the VIP CR — not necessarily an IP address.
+// It is common practice to name the VIP CR after the IP itself (e.g. "111.62.241.102"),
+// but that is purely a business/operational naming convention; kube-ovn only checks
+// whether the key is present, not the value format.
+//
+// This single annotation simultaneously replaces TWO kube-ovn annotations:
+//
+//  1. Replaces ovn.kubernetes.io/bgp-vip
+//     The annotation VALUE is the VIP CR name. The controller resolves it to an IP
+//     via virtualIpsLister.Get(vipName) → vip.Status.V4ip, exactly as it does for
+//     ovn.kubernetes.io/bgp-vip, then writes the IP into status.loadBalancer.ingress.
+//
+//  2. Replaces ovn.kubernetes.io/bgp: "true"
+//     Implies bgp=true (Default Mode / ECMP) announcement policy.
+//     No explicit bgp annotation is required on the Service.
+//     (Note: bgp=cluster is equivalent to bgp=true but is used for Pod/Subnet
+//     BGP paths; the LB VIP path uses "true" as written by the controller.)
+//
+// This allows a zero-annotation-change migration from MetalLB to kube-ovn BGP
+// speaker: the existing Service YAML needs no modification.
+//
+// Priority rule (if-else, mutually exclusive):
+//
+//	if metallb.universe.tf/allow-shared-ip is present
+//	  → treat as BGP LB VIP (role 1) with bgp=true policy (role 2); ignore bgp-vip
+//	else if ovn.kubernetes.io/bgp-vip is present
+//	  → treat as BGP LB VIP; honour bgp annotation for policy selection
+//	else
+//	  → service is not a BGP LB VIP; skip
 const (
 	// BgpVipAnnotation is set on a LoadBalancer Service to specify the VIP name
 	// (type=bgp_lb_vip) whose allocated IP will be written into
@@ -446,6 +482,17 @@ const (
 	// node. Only that node announces the /32 route; all others skip it.
 	// Use for testing or non-ECMP upstreams only. Failover is manual.
 	BgpSpeakerNodeAnnotation = "ovn.kubernetes.io/bgp-speaker-node"
+
+	// MetalLBAllowSharedIPAnnotation is MetalLB's shared-IP gate annotation.
+	// Its value is the name of the VIP CR; naming it after the IP (e.g. "111.62.241.102")
+	// is a common operational convention but is not required — kube-ovn only checks
+	// whether the key is present.
+	// kube-ovn treats its presence as simultaneously replacing two kube-ovn annotations:
+	//   1. BgpVipAnnotation (ovn.kubernetes.io/bgp-vip): marks the service as a BGP LB VIP.
+	//   2. BgpAnnotation=true (ovn.kubernetes.io/bgp: "true"): implies Default Mode (ECMP).
+	//      (bgp=cluster is the equivalent for Pod/Subnet paths; LB VIP path uses "true".)
+	// Takes priority over BgpVipAnnotation when both are present.
+	MetalLBAllowSharedIPAnnotation = "metallb.universe.tf/allow-shared-ip"
 )
 
 // Readonly kinds of Kubernetes objects

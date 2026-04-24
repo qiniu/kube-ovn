@@ -749,7 +749,13 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 		return nil
 	}
 
-	vipName := svc.Annotations[util.BgpVipAnnotation]
+	// Resolve VIP CR name: MetalLB compat annotation takes priority over bgp-vip.
+	// metallb.universe.tf/allow-shared-ip value is the VIP CR name (same semantics
+	// as ovn.kubernetes.io/bgp-vip); naming it after the IP is a naming convention only.
+	vipName := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]
+	if vipName == "" {
+		vipName = svc.Annotations[util.BgpVipAnnotation]
+	}
 	if vipName == "" {
 		// Service does not request a BGP LB VIP; nothing to do.
 		return nil
@@ -829,7 +835,11 @@ func (c *Controller) needReconcileBgpLbVipService(svc *v1.Service) (bool, error)
 	if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
 		return false, nil
 	}
-	vipName := svc.Annotations[util.BgpVipAnnotation]
+	// Resolve VIP CR name: MetalLB compat annotation takes priority over bgp-vip.
+	vipName := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]
+	if vipName == "" {
+		vipName = svc.Annotations[util.BgpVipAnnotation]
+	}
 	if vipName == "" {
 		return false, nil
 	}
@@ -880,7 +890,8 @@ func (c *Controller) needCleanupBgpLbVipServiceBinding(svc *v1.Service) bool {
 	if svc.Spec.Type != v1.ServiceTypeLoadBalancer {
 		return false
 	}
-	if svc.Annotations[util.BgpVipAnnotation] != "" {
+	// Either annotation means this service owns a VIP binding — do not clean up.
+	if svc.Annotations[util.BgpVipAnnotation] != "" || svc.Annotations[util.MetalLBAllowSharedIPAnnotation] != "" {
 		return false
 	}
 	if svc.Annotations[util.BgpAnnotation] == "true" {
