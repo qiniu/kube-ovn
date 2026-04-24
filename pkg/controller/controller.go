@@ -399,6 +399,29 @@ func Run(ctx context.Context, config *Configuration) {
 	namespaceInformer := informerFactory.Core().V1().Namespaces()
 	nodeInformer := informerFactory.Core().V1().Nodes()
 	serviceInformer := informerFactory.Core().V1().Services()
+	// Register the bgpVip indexer before the informer factory is started.
+	// AddIndexers must be called before the store begins running; after Start()
+	// the call returns an error and we would fatal-exit.
+	if err = serviceInformer.Informer().AddIndexers(cache.Indexers{
+		bgpVipIndexName: func(obj any) ([]string, error) {
+			svc, ok := obj.(*corev1.Service)
+			if !ok {
+				return nil, nil
+			}
+			// Index by both kube-ovn and MetalLB compat VIP annotation values,
+			// as both carry the VIP CR name and must trigger cleanup on VIP deletion.
+			var keys []string
+			if v := svc.Annotations[util.BgpVipAnnotation]; v != "" {
+				keys = append(keys, v)
+			}
+			if v := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]; v != "" {
+				keys = append(keys, v)
+			}
+			return keys, nil
+		},
+	}); err != nil {
+		util.LogFatalAndExit(err, "failed to add bgpVip indexer to service informer")
+	}
 	endpointSliceInformer := informerFactory.Discovery().V1().EndpointSlices()
 	deploymentInformer := deployInformerFactory.Apps().V1().Deployments()
 	qosPolicyInformer := kubeovnInformerFactory.Kubeovn().V1().QoSPolicies()
@@ -766,26 +789,6 @@ func Run(ctx context.Context, config *Configuration) {
 		util.LogFatalAndExit(err, "failed to add node event handler")
 	}
 
-	if err = serviceInformer.Informer().AddIndexers(cache.Indexers{
-		bgpVipIndexName: func(obj any) ([]string, error) {
-			svc, ok := obj.(*corev1.Service)
-			if !ok {
-				return nil, nil
-			}
-			// Index by both kube-ovn and MetalLB compat VIP annotation values,
-			// as both carry the VIP CR name and must trigger cleanup on VIP deletion.
-			var keys []string
-			if v := svc.Annotations[util.BgpVipAnnotation]; v != "" {
-				keys = append(keys, v)
-			}
-			if v := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]; v != "" {
-				keys = append(keys, v)
-			}
-			return keys, nil
-		},
-	}); err != nil {
-		util.LogFatalAndExit(err, "failed to add bgpVip indexer to service informer")
-	}
 	controller.svcByBgpVipIndexer = serviceInformer.Informer().GetIndexer()
 
 	if _, err = serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{

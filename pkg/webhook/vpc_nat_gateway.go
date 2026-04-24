@@ -85,8 +85,12 @@ func (v *ValidatingHook) iptablesEIPCreateHook(ctx context.Context, req admissio
 	}
 
 	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp; they only need an IP
-	// allocation — skip all NAT-gateway config and gateway-specific validation.
+	// allocation — skip NAT-gateway config checks, but still validate IP format
+	// and subnet/CIDR fields so malformed EIPs are rejected at admission time.
 	if eip.Spec.NatGwDp == "" {
+		if err := v.validateIptablesEIPIPFields(ctx, &eip); err != nil {
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
 		return ctrlwebhook.Allowed("by pass")
 	}
 
@@ -116,8 +120,9 @@ func (v *ValidatingHook) iptablesEIPUpdateHook(ctx context.Context, req admissio
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
-	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp. Their only immutability
+	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp. Their immutability
 	// rule: once an IP is allocated (Spec.V4ip or Spec.V6ip set), it cannot change.
+	// IP format and subnet/CIDR fields are still validated on every spec change.
 	if eipNew.Spec.NatGwDp == "" {
 		if eipOld.Spec.V4ip != "" && eipNew.Spec.V4ip != eipOld.Spec.V4ip {
 			err := fmt.Errorf("IptablesEIP %q: V4ip is immutable once allocated (old: %s, new: %s)",
@@ -128,6 +133,11 @@ func (v *ValidatingHook) iptablesEIPUpdateHook(ctx context.Context, req admissio
 			err := fmt.Errorf("IptablesEIP %q: V6ip is immutable once allocated (old: %s, new: %s)",
 				eipNew.Name, eipOld.Spec.V6ip, eipNew.Spec.V6ip)
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		if eipOld.Spec != eipNew.Spec {
+			if err := v.validateIptablesEIPIPFields(ctx, &eipNew); err != nil {
+				return ctrlwebhook.Errored(http.StatusBadRequest, err)
+			}
 		}
 		return ctrlwebhook.Allowed("by pass")
 	}
@@ -456,7 +466,14 @@ func (v *ValidatingHook) ValidateIptablesEIP(ctx context.Context, eip *ovnv1.Ipt
 	if eip.Spec.NatGwDp == "" {
 		return errors.New("parameter \"natGwDp\" cannot be empty")
 	}
+	return v.validateIptablesEIPIPFields(ctx, eip)
+}
 
+// validateIptablesEIPIPFields validates the IP format and subnet/CIDR fields of an
+// IptablesEIP. It is intentionally separate from the NatGwDp (NAT-gateway) check so
+// that IPAM-only EIPs (lbSvc / bgp_lb_vip, which have no NatGwDp) still receive full
+// structural validation on create and update.
+func (v *ValidatingHook) validateIptablesEIPIPFields(ctx context.Context, eip *ovnv1.IptablesEIP) error {
 	subnet := &ovnv1.Subnet{}
 	externalNetwork := util.GetExternalNetwork(eip.Spec.ExternalSubnet)
 	key := types.NamespacedName{Name: externalNetwork}
