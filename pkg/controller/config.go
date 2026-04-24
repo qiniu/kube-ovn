@@ -464,7 +464,7 @@ func (config *Configuration) initKubeClient() error {
 
 	ExtClient, err := extClientSet.NewForConfig(cfg)
 	if err != nil {
-		klog.Errorf("init extentsion client failed %v", err)
+		klog.Errorf("init extension client failed %v", err)
 		return err
 	}
 	config.ExtClient = ExtClient

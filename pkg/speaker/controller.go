@@ -66,10 +66,12 @@ func NewController(config *Configuration) *Controller {
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
 
 	informerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(config.KubeClient, 0,
+		kubeinformers.WithTransform(util.TrimManagedFields),
 		kubeinformers.WithTweakListOptions(func(listOption *metav1.ListOptions) {
 			listOption.AllowWatchBookmarks = true
 		}))
 	podInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(config.KubeClient, 0,
+		kubeinformers.WithTransform(util.TrimManagedFields),
 		kubeinformers.WithTweakListOptions(func(listOption *metav1.ListOptions) {
 			listOption.FieldSelector = "spec.hostNetwork=false"
 			listOption.AllowWatchBookmarks = true
@@ -88,6 +90,7 @@ func NewController(config *Configuration) *Controller {
 	}
 
 	kubeovnInformerFactory := kubeovninformer.NewSharedInformerFactoryWithOptions(config.KubeOvnClient, 0,
+		kubeovninformer.WithTransform(util.TrimManagedFields),
 		kubeovninformer.WithTweakListOptions(func(listOption *metav1.ListOptions) {
 			listOption.AllowWatchBookmarks = true
 		}))

@@ -67,7 +67,7 @@ func (c *Controller) enqueueDeleteService(obj any) {
 	klog.Infof("enqueue delete service %s/%s", svc.Namespace, svc.Name)
 
 	vip, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]
-	if ok || svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "" || svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] != "" {
+	if ok || (svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "") || svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] != "" {
 		if c.config.EnableNP {
 			netpols, err := c.svcMatchNetworkPolicies(svc)
 			if err != nil {
