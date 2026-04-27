@@ -184,10 +184,9 @@ func newBgpLbVipController(t *testing.T, vip *kubeovnv1.Vip, svc *v1.Service) *C
 				return nil, nil
 			}
 			var keys []string
-			if v := s.Annotations[util.BgpVipAnnotation]; v != "" {
-				keys = append(keys, v)
-			}
 			if v := s.Annotations[util.MetalLBAllowSharedIPAnnotation]; v != "" {
+				keys = append(keys, v)
+			} else if v := s.Annotations[util.BgpVipAnnotation]; v != "" {
 				keys = append(keys, v)
 			}
 			return keys, nil
@@ -414,10 +413,9 @@ func TestCleanupBgpLbVipServiceBindingByVip(t *testing.T) {
 				return nil, nil
 			}
 			var keys []string
-			if v := s.Annotations[util.BgpVipAnnotation]; v != "" {
-				keys = append(keys, v)
-			}
 			if v := s.Annotations[util.MetalLBAllowSharedIPAnnotation]; v != "" {
+				keys = append(keys, v)
+			} else if v := s.Annotations[util.BgpVipAnnotation]; v != "" {
 				keys = append(keys, v)
 			}
 			return keys, nil

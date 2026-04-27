@@ -175,14 +175,14 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 		}
 	}
 
-	if service.Svc.Spec.Type == v1.ServiceTypeLoadBalancer && c.config.EnableLbSvc {
+	if c.config.EnableLbSvc && service.Svc.Spec.Type == v1.ServiceTypeLoadBalancer {
 		if err := c.deleteLbSvc(service.Svc); err != nil {
 			klog.Errorf("failed to delete service %s, %v", service.Svc.Name, err)
 			return err
 		}
 	}
 
-	if service.Svc.Spec.Type == v1.ServiceTypeLoadBalancer && c.config.EnableBgpLbVip {
+	if c.config.EnableBgpLbVip && service.Svc.Spec.Type == v1.ServiceTypeLoadBalancer {
 		if err := c.cleanBgpLbVipService(service.Svc); err != nil {
 			klog.Errorf("failed to clean bgp-lb-vip for service %s: %v", service.Svc.Name, err)
 			return err
@@ -813,8 +813,7 @@ func (c *Controller) reconcileBgpLbVipServiceLocked(key string, svc *v1.Service)
 
 	namespace, name := svc.Namespace, svc.Name
 
-	klog.Infof("handle add bgp-lb-vip service %s, vip %s", key, vipName)
-	klog.Infof("bgp-lb-vip service %s current state: ingress=%v", key, svc.Status.LoadBalancer.Ingress)
+	klog.Infof("reconcile bgp-lb-vip service %s: vip=%s ingress=%v", key, vipName, svc.Status.LoadBalancer.Ingress)
 
 	vip, err := c.virtualIpsLister.Get(vipName)
 	if err != nil {

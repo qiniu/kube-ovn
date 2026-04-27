@@ -408,13 +408,12 @@ func Run(ctx context.Context, config *Configuration) {
 			if !ok {
 				return nil, nil
 			}
-			// Index by both kube-ovn and MetalLB compat VIP annotation values,
-			// as both carry the VIP CR name and must trigger cleanup on VIP deletion.
+			// Index by the effective VIP annotation value (MetalLB compat takes priority).
+			// Exactly one key is emitted so cleanup on VIP deletion hits the right Services.
 			var keys []string
-			if v := svc.Annotations[util.BgpVipAnnotation]; v != "" {
-				keys = append(keys, v)
-			}
 			if v := svc.Annotations[util.MetalLBAllowSharedIPAnnotation]; v != "" {
+				keys = append(keys, v)
+			} else if v := svc.Annotations[util.BgpVipAnnotation]; v != "" {
 				keys = append(keys, v)
 			}
 			return keys, nil

@@ -252,11 +252,17 @@ func (c *Controller) handleUpdateVirtualIP(key string) error {
 				return err
 			}
 		}
-		// bgp_lb_vip holds no OVN LSP; skip all OVN cleanup.
+		// Clean up OVN resources before removing finalizer.
+		// bgp_lb_vip holds no OVN LSP; all other types have at least a virtual LSP named vip.Name.
+		// SwitchLBRuleVip and KubeHostVMVip additionally own a pod-format LSP (portName) because
+		// they call CreateLogicalSwitchPort at creation time.
 		if vip.Spec.Type != util.BgpLbVip {
-			// Clean up resources before removing finalizer
 			switch vip.Spec.Type {
 			case util.SwitchLBRuleVip, util.KubeHostVMVip:
+				// TODO: SwitchLBRuleVip/KubeHostVMVip create a separate pod-format LSP whose name
+				// is derived via a subnet lister lookup. This lookup may race with subnet deletion
+				// and is the only reason delete requires two LSP calls. Consider fixing or
+				// deprecating this pattern so all VIP types use a single, name-stable LSP.
 				subnet, err := c.subnetsLister.Get(vip.Spec.Subnet)
 				if err != nil {
 					klog.Errorf("failed to get subnet %s: %v", vip.Spec.Subnet, err)
@@ -269,14 +275,12 @@ func (c *Controller) handleUpdateVirtualIP(key string) error {
 					klog.Error(err)
 					return err
 				}
-
-				if vip.Spec.Type == util.SwitchLBRuleVip || vip.Spec.Type == util.KubeHostVMVip {
-					if err := c.OVNNbClient.DeleteLogicalSwitchPort(vip.Name); err != nil {
-						klog.Errorf("delete virtual logical switch port %s from logical switch %s: %v", vip.Name, vip.Spec.Subnet, err)
-						return err
-					}
+				if err := c.OVNNbClient.DeleteLogicalSwitchPort(vip.Name); err != nil {
+					klog.Errorf("delete virtual logical switch port %s from logical switch %s: %v", vip.Name, vip.Spec.Subnet, err)
+					return err
 				}
 			default:
+				// type="" (plain VIP): only a virtual LSP named vip.Name exists.
 				if err := c.OVNNbClient.DeleteLogicalSwitchPort(vip.Name); err != nil {
 					klog.Errorf("delete virtual logical switch port %s from logical switch %s: %v", vip.Name, vip.Spec.Subnet, err)
 					return err

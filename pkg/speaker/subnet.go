@@ -255,9 +255,9 @@ func collectSvcBgpPrefixes(services []*corev1.Service, nodeName string, bgpExpec
 		// to an IP and writes status.loadBalancer.ingress. The speaker then announces that IP.
 		// ovn.kubernetes.io/bgp-vip  — kube-ovn native path
 		// metallb.universe.tf/allow-shared-ip — MetalLB compat (zero-annotation-change migration)
-		hasBgpVip := svc.Annotations[util.BgpVipAnnotation] != ""
 		hasMetalLBCompat := svc.Annotations[util.MetalLBAllowSharedIPAnnotation] != ""
-		if !hasBgpVip && !hasMetalLBCompat {
+		hasBgpVip := svc.Annotations[util.BgpVipAnnotation] != ""
+		if !hasMetalLBCompat && !hasBgpVip {
 			continue
 		}
 		// Only LoadBalancer Services participate in the BGP LB VIP flow;
