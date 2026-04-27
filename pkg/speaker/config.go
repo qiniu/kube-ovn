@@ -52,6 +52,7 @@ type Configuration struct {
 	HoldTime                    float64
 	BgpServer                   *gobgp.BgpServer
 	AnnounceClusterIP           bool
+	EnableLbSvcAnnounce         bool
 	GracefulRestart             bool
 	GracefulRestartDeferralTime time.Duration
 	GracefulRestartTime         time.Duration
@@ -79,6 +80,7 @@ func ParseFlags() (*Configuration, error) {
 		argGracefulRestartDeferralTime = pflag.Duration("graceful-restart-deferral-time", DefaultGracefulRestartDeferralTime, "BGP Graceful restart deferral time according to RFC4724 4.1, maximum 18h.")
 		argGracefulRestart             = pflag.BoolP("graceful-restart", "", false, "Enables the BGP Graceful Restart so that routes are preserved on unexpected restarts")
 		argAnnounceClusterIP           = pflag.BoolP("announce-cluster-ip", "", false, "The Cluster IP of the service to announce to the BGP peers.")
+		argEnableLbSvcAnnounce         = pflag.BoolP("enable-lb-svc-announce", "", false, "Whether to announce LoadBalancer Service ingress IPs bound by ovn.kubernetes.io/bgp-vip.")
 		argGrpcHost                    = pflag.IP("grpc-host", net.IP{127, 0, 0, 1}, "The host address for grpc to listen, default: 127.0.0.1")
 		argGrpcPort                    = pflag.Int32("grpc-port", DefaultBGPGrpcPort, "The port for grpc to listen, default:50051")
 		argClusterAs                   = pflag.Uint32("cluster-as", 0, "The AS number of the local BGP speaker (required)")
@@ -144,6 +146,7 @@ func ParseFlags() (*Configuration, error) {
 
 	config := &Configuration{
 		AnnounceClusterIP:     *argAnnounceClusterIP,
+		EnableLbSvcAnnounce:   *argEnableLbSvcAnnounce,
 		GrpcHost:              *argGrpcHost,
 		GrpcPort:              *argGrpcPort,
 		ClusterAs:             *argClusterAs,
@@ -154,10 +157,7 @@ func ParseFlags() (*Configuration, error) {
 			kubeovnv1.ProtocolIPv4: nodeIPv4,
 			kubeovnv1.ProtocolIPv6: nodeIPv6,
 		},
-		PodIPs: map[string]net.IP{
-			kubeovnv1.ProtocolIPv4: net.ParseIP(podIPv4),
-			kubeovnv1.ProtocolIPv6: net.ParseIP(podIPv6),
-		},
+		PodIPs:                      make(map[string]net.IP, 2),
 		NeighborAs:                  *argNeighborAs,
 		AuthPassword:                *argAuthPassword,
 		HoldTime:                    ht,
@@ -183,6 +183,21 @@ func ParseFlags() (*Configuration, error) {
 
 	if err := config.validateRequiredFlags(); err != nil {
 		return nil, err
+	}
+
+	if podIPv4 != "" {
+		if ip := net.ParseIP(podIPv4); ip != nil {
+			config.PodIPs[kubeovnv1.ProtocolIPv4] = ip
+		} else {
+			return nil, fmt.Errorf("failed to parse pod IPv4 address %q", podIPv4)
+		}
+	}
+	if podIPv6 != "" {
+		if ip := net.ParseIP(podIPv6); ip != nil {
+			config.PodIPs[kubeovnv1.ProtocolIPv6] = ip
+		} else {
+			return nil, fmt.Errorf("failed to parse pod IPv6 address %q", podIPv6)
+		}
 	}
 
 	for _, addr := range config.NeighborAddresses {

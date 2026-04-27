@@ -84,6 +84,16 @@ func (v *ValidatingHook) iptablesEIPCreateHook(ctx context.Context, req admissio
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
 
+	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp; they only need an IP
+	// allocation — skip NAT-gateway config checks, but still validate IP format
+	// and subnet/CIDR fields so malformed EIPs are rejected at admission time.
+	if eip.Spec.NatGwDp == "" {
+		if err := v.validateIptablesEIPIPFields(ctx, &eip); err != nil {
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		return ctrlwebhook.Allowed("by pass")
+	}
+
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
@@ -108,6 +118,38 @@ func (v *ValidatingHook) iptablesEIPUpdateHook(ctx context.Context, req admissio
 	eipOld := ovnv1.IptablesEIP{}
 	if err := v.decoder.DecodeRaw(req.OldObject, &eipOld); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
+	}
+
+	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp. Their immutability
+	// rule: once an IP is allocated (Spec.V4ip or Spec.V6ip set), it cannot change.
+	// IP format and subnet/CIDR fields are still validated on every spec change.
+	//
+	// Guard: if the old object already had a NatGwDp, this update is attempting to
+	// clear an immutable field (migrating a NAT-backed EIP to IPAM-only is not
+	// supported). Reject before entering the IPAM-only branch so the NAT-gateway
+	// immutability checks below cannot be bypassed.
+	if eipNew.Spec.NatGwDp == "" {
+		if eipOld.Spec.NatGwDp != "" {
+			err := fmt.Errorf("IptablesEIP %q: NatGwDp is immutable once set (cannot be cleared, old: %s)",
+				eipNew.Name, eipOld.Spec.NatGwDp)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		if eipOld.Spec.V4ip != "" && eipNew.Spec.V4ip != eipOld.Spec.V4ip {
+			err := fmt.Errorf("IptablesEIP %q: V4ip is immutable once allocated (old: %s, new: %s)",
+				eipNew.Name, eipOld.Spec.V4ip, eipNew.Spec.V4ip)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		if eipOld.Spec.V6ip != "" && eipNew.Spec.V6ip != eipOld.Spec.V6ip {
+			err := fmt.Errorf("IptablesEIP %q: V6ip is immutable once allocated (old: %s, new: %s)",
+				eipNew.Name, eipOld.Spec.V6ip, eipNew.Spec.V6ip)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
+		if eipOld.Spec != eipNew.Spec {
+			if err := v.validateIptablesEIPIPFields(ctx, &eipNew); err != nil {
+				return ctrlwebhook.Errored(http.StatusBadRequest, err)
+			}
+		}
+		return ctrlwebhook.Allowed("by pass")
 	}
 
 	// IptablesEIP is an internal resource of a NatGwDp. Once created and Ready,
@@ -151,6 +193,14 @@ func (v *ValidatingHook) iptablesEIPDeleteHook(ctx context.Context, req admissio
 	eip := ovnv1.IptablesEIP{}
 	if err := v.decoder.DecodeRaw(req.OldObject, &eip); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
+	}
+
+	// IPAM-only EIPs (lbSvc / bgp_lb_vip) have no NatGwDp and are managed
+	// without a VPC NAT gateway. Skip gateway-config validation so these EIPs
+	// remain deletable even when --enable-vpc-nat-gw is off or the NAT configmap
+	// is absent — exactly the deployments this PR adds support for.
+	if eip.Spec.NatGwDp == "" {
+		return ctrlwebhook.Allowed("IPAM-only EIP, no NAT gateway config required")
 	}
 
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
@@ -434,7 +484,14 @@ func (v *ValidatingHook) ValidateIptablesEIP(ctx context.Context, eip *ovnv1.Ipt
 	if eip.Spec.NatGwDp == "" {
 		return errors.New("parameter \"natGwDp\" cannot be empty")
 	}
+	return v.validateIptablesEIPIPFields(ctx, eip)
+}
 
+// validateIptablesEIPIPFields validates the IP format and subnet/CIDR fields of an
+// IptablesEIP. It is intentionally separate from the NatGwDp (NAT-gateway) check so
+// that IPAM-only EIPs (lbSvc / bgp_lb_vip, which have no NatGwDp) still receive full
+// structural validation on create and update.
+func (v *ValidatingHook) validateIptablesEIPIPFields(ctx context.Context, eip *ovnv1.IptablesEIP) error {
 	subnet := &ovnv1.Subnet{}
 	externalNetwork := util.GetExternalNetwork(eip.Spec.ExternalSubnet)
 	key := types.NamespacedName{Name: externalNetwork}

@@ -540,13 +540,6 @@ func (c *Controller) handleDeleteNp(key string) error {
 	}
 
 	if err := c.OVNNbClient.DeleteAddressSets(map[string]string{
-		networkPolicyKey: fmt.Sprintf("%s/%s/%s", namespace, npName, "service"),
-	}); err != nil {
-		klog.Errorf("delete np %s service address set: %v", key, err)
-		return err
-	}
-
-	if err := c.OVNNbClient.DeleteAddressSets(map[string]string{
 		networkPolicyKey: fmt.Sprintf("%s/%s/%s", namespace, npName, "ingress"),
 	}); err != nil {
 		klog.Errorf("delete np %s ingress address set: %v", key, err)
@@ -700,7 +693,6 @@ func (c *Controller) fetchPolicySelectedAddresses(namespace, protocol string, np
 
 func svcMatchPods(svcs []*corev1.Service, pod *corev1.Pod, protocol string) ([]string, error) {
 	matchSvcs := []string{}
-	// find svc ip by pod's info
 	for _, svc := range svcs {
 		if isSvcMatchPod(svc, pod) {
 			clusterIPs := util.ServiceClusterIPs(*svc)
@@ -730,8 +722,6 @@ func isSvcMatchPod(svc *corev1.Service, pod *corev1.Pod) bool {
 func (c *Controller) podMatchNetworkPolicies(pod *corev1.Pod) []string {
 	podNs, err := c.namespacesLister.Get(pod.Namespace)
 	if err != nil {
-		klog.Errorf("failed to get namespace %s: %v", pod.Namespace, err)
-		utilruntime.HandleError(err)
 		return nil
 	}
 
@@ -752,14 +742,12 @@ func (c *Controller) podMatchNetworkPolicies(pod *corev1.Pod) []string {
 }
 
 func (c *Controller) svcMatchNetworkPolicies(svc *corev1.Service) ([]string, error) {
-	// find all match pod
 	sel := labels.Set(svc.Spec.Selector).AsSelector()
 	pods, err := c.podsLister.Pods(svc.Namespace).List(sel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pods, %w", err)
 	}
 
-	// find all match netpol
 	nps, err := c.npsLister.NetworkPolicies(corev1.NamespaceAll).List(labels.Everything())
 	if err != nil {
 		return nil, fmt.Errorf("failed to list netpols, %w", err)

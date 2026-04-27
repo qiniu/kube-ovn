@@ -80,6 +80,8 @@ func (c *Controller) announceAndWithdraw(expected, existing set.Set[string]) {
 	for route := range toAdd {
 		if err := c.addRoute(route); err != nil {
 			klog.Error(err)
+		} else {
+			klog.Infof("BGP route announced: %s", route)
 		}
 	}
 
@@ -89,6 +91,8 @@ func (c *Controller) announceAndWithdraw(expected, existing set.Set[string]) {
 	for route := range toDel {
 		if err := c.delRoute(route); err != nil {
 			klog.Error(err)
+		} else {
+			klog.Infof("BGP route withdrawn: %s", route)
 		}
 	}
 }
@@ -136,7 +140,7 @@ func (c *Controller) delRoute(route string) error {
 // getPathRequest returns paths to be used in add/delete path requests for a given route
 func (c *Controller) getPathRequest(route string) ([][]*apiutil.Path, error) {
 	// Should this route be advertised to IPv4 or IPv6 peers
-	// If extended-nexthop is enabled, we advertise IPv4 NLRIs to IPv6 peers and IPv6 NRLIs to IPv4 peers
+	// If extended-nexthop is enabled, we advertise IPv4 NLRIs to IPv6 peers and IPv6 NLRIs to IPv4 peers
 	neighborAddresses := c.config.NeighborAddresses
 	if c.config.ExtendedNexthop {
 		neighborAddresses = append(neighborAddresses, c.config.NeighborIPv6Addresses...)

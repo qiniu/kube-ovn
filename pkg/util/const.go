@@ -55,7 +55,13 @@ const (
 	SwitchLBRuleVipsAnnotation = "ovn.kubernetes.io/switch_lb_vip"
 	SwitchLBRuleVip            = "switch_lb_vip"
 	KubeHostVMVip              = "kube_host_vm_vip"
-	SwitchLBRuleSubnet         = "switch_lb_subnet"
+	// BgpLbVip marks a VIP reserved as a BGP-announced external IP for a LoadBalancer Service.
+	// Unlike SwitchLBRuleVip and KubeHostVMVip, no OVN logical switch port is created;
+	// the IP is held in IPAM only, and the controller writes it into the Service
+	// status.loadBalancer.ingress for the BGP speaker to announce.
+	// spec.externalIPs is intentionally left empty to avoid duplicate output in kubectl.
+	BgpLbVip           = "bgp_lb_vip"
+	SwitchLBRuleSubnet = "switch_lb_subnet"
 
 	LogicalRouterAnnotation = "ovn.kubernetes.io/logical_router"
 	VpcAnnotation           = "ovn.kubernetes.io/vpc"
@@ -398,10 +404,103 @@ const (
 	AcceptContentTypes  = runtime.ContentTypeProtobuf + "," + "application/json"
 )
 
+// BGP LB VIP annotations
+//
+// These annotations control how LoadBalancer VIPs (bgp_lb_vip type) are announced
+// via BGP. The upstream router/switch only sees /32 prefixes and their BGP next-hops
+// (node underlay IPs). It has zero visibility into pods, kube-proxy rules, or
+// container ports — it simply forwards packets to the node that announced the route.
+//
+// Note: BgpAnnotation (ovn.kubernetes.io/bgp) is the shared policy key used across
+// Pods, Subnets, and LoadBalancer VIPs. It is defined in the general annotation block
+// above. The constants below are specific to the LoadBalancer VIP (bgp_lb_vip) path.
+//
+// Announcement modes (see collectSvcBgpPrefixes in pkg/speaker/subnet.go for full
+// implementation rationale):
+//
+//	bgp=cluster / "true" (default, recommended for production):
+//	  All speaker nodes announce the VIP simultaneously (ECMP). The upstream
+//	  router distributes traffic across all nodes; kube-proxy/IPVS on each node
+//	  routes to the correct VM regardless of entry point. VMs are migratable —
+//	  the VIP is never tied to a node, so live migration is transparent.
+//	  Requires the upstream switch/router to support ECMP.
+//
+//	bgp=local (ECMP with live-migration caveat):
+//	  Currently behaves identically to bgp=cluster. The EIP is a floating IP
+//	  programmed on kube-ipvs0 on EVERY node, so "local endpoint" filtering has
+//	  no effect — all nodes still announce (ECMP). On VM live migration the BGP
+//	  path does NOT automatically follow the VM to the destination node.
+//	  TODO: implement EndpointSlice-aware local announcement.
+//
+//	bgp-speaker-node=<nodeName> (single-node, testing only):
+//	  Only the named node announces the /32 route; all other speakers skip it.
+//	  Use for testing or upstream switches that do NOT support ECMP.
+//	  NOT suitable for production VM workloads: VM migration does not update
+//	  the pinned node, adding a cross-node SNAT hop. Failover is fully manual.
+//
+// # MetalLB Compatibility
+//
+// Services previously managed by MetalLB carry the annotation:
+//
+//	metallb.universe.tf/allow-shared-ip: <vip-cr-name>
+//
+// The annotation value is the name of the VIP CR — not necessarily an IP address.
+// It is common practice to name the VIP CR after the IP itself (e.g. "111.62.241.102"),
+// but that is purely a business/operational naming convention; kube-ovn only checks
+// whether the key is present, not the value format.
+//
+// This single annotation simultaneously replaces TWO kube-ovn annotations:
+//
+//  1. Replaces ovn.kubernetes.io/bgp-vip
+//     The annotation VALUE is the VIP CR name. The controller resolves it to an IP
+//     via virtualIpsLister.Get(vipName) → vip.Status.V4ip, exactly as it does for
+//     ovn.kubernetes.io/bgp-vip, then writes the IP into status.loadBalancer.ingress.
+//
+//  2. Replaces ovn.kubernetes.io/bgp: "true"
+//     Implies bgp=true (Default Mode / ECMP) announcement policy.
+//     No explicit bgp annotation is required on the Service.
+//     (Note: bgp=cluster is equivalent to bgp=true but is used for Pod/Subnet
+//     BGP paths; the LB VIP path uses "true" as written by the controller.)
+//
+// This allows a zero-annotation-change migration from MetalLB to kube-ovn BGP
+// speaker: the existing Service YAML needs no modification.
+//
+// Priority rule (if-else, mutually exclusive):
+//
+//	if metallb.universe.tf/allow-shared-ip is present
+//	  → treat as BGP LB VIP (role 1) with bgp=true policy (role 2); ignore bgp-vip
+//	else if ovn.kubernetes.io/bgp-vip is present
+//	  → treat as BGP LB VIP; honour bgp annotation for policy selection
+//	else
+//	  → service is not a BGP LB VIP; skip
+const (
+	// BgpVipAnnotation is set on a LoadBalancer Service to specify the VIP name
+	// (type=bgp_lb_vip) whose allocated IP will be written into
+	// status.loadBalancer.ingress for BGP speaker announcement.
+	BgpVipAnnotation = "ovn.kubernetes.io/bgp-vip"
+
+	// BgpSpeakerNodeAnnotation pins a LoadBalancer VIP to a single BGP speaker
+	// node. Only that node announces the /32 route; all others skip it.
+	// Use for testing or non-ECMP upstreams only. Failover is manual.
+	BgpSpeakerNodeAnnotation = "ovn.kubernetes.io/bgp-speaker-node"
+
+	// MetalLBAllowSharedIPAnnotation is MetalLB's shared-IP gate annotation.
+	// Its value is the name of the VIP CR; naming it after the IP (e.g. "111.62.241.102")
+	// is a common operational convention but is not required — kube-ovn only checks
+	// whether the key is present.
+	// kube-ovn treats its presence as simultaneously replacing two kube-ovn annotations:
+	//   1. BgpVipAnnotation (ovn.kubernetes.io/bgp-vip): marks the service as a BGP LB VIP.
+	//   2. BgpAnnotation=true (ovn.kubernetes.io/bgp: "true"): implies Default Mode (ECMP).
+	//      (bgp=cluster is the equivalent for Pod/Subnet paths; LB VIP path uses "true".)
+	// Takes priority over BgpVipAnnotation when both are present.
+	MetalLBAllowSharedIPAnnotation = "metallb.universe.tf/allow-shared-ip"
+)
+
 // Readonly kinds of Kubernetes objects
 var (
-	KindNode = ObjectKind[*corev1.Node]()
-	KindPod  = ObjectKind[*corev1.Pod]()
+	KindNode    = ObjectKind[*corev1.Node]()
+	KindPod     = ObjectKind[*corev1.Pod]()
+	KindService = ObjectKind[*corev1.Service]()
 
 	KindDeployment  = ObjectKind[*appsv1.Deployment]()
 	KindDaemonSet   = ObjectKind[*appsv1.DaemonSet]()

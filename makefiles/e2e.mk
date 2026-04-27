@@ -81,27 +81,25 @@ e2e: kube-ovn-conformance-e2e
 
 .PHONY: e2e-build
 e2e-build:
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/k8s-network
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/kube-ovn
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/ovn-ic
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/multus
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/non-primary-cni
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/lb-svc
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/vip
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/vpc-egress-gateway
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/iptables-vpc-nat-gw
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/ovn-vpc-nat-gw
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/ha
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/security
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/kubevirt
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/webhook
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/connectivity
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/metallb
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/anp-domain
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/cnp-domain
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/speaker
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/bgp-iptables-eip
-	ginkgo build $(E2E_BUILD_FLAGS) ./test/e2e/tunnel-id
+	$(GINKGO_E2E_BUILD) ./test/e2e/k8s-network
+	$(GINKGO_E2E_BUILD) ./test/e2e/kube-ovn
+	$(GINKGO_E2E_BUILD) ./test/e2e/ovn-ic
+	$(GINKGO_E2E_BUILD) ./test/e2e/multus
+	$(GINKGO_E2E_BUILD) ./test/e2e/non-primary-cni
+	$(GINKGO_E2E_BUILD) ./test/e2e/lb-svc
+	$(GINKGO_E2E_BUILD) ./test/e2e/vip
+	$(GINKGO_E2E_BUILD) ./test/e2e/vpc-egress-gateway
+	$(GINKGO_E2E_BUILD) ./test/e2e/iptables-vpc-nat-gw
+	$(GINKGO_E2E_BUILD) ./test/e2e/ovn-vpc-nat-gw
+	$(GINKGO_E2E_BUILD) ./test/e2e/ha
+	$(GINKGO_E2E_BUILD) ./test/e2e/security
+	$(GINKGO_E2E_BUILD) ./test/e2e/kubevirt
+	$(GINKGO_E2E_BUILD) ./test/e2e/webhook
+	$(GINKGO_E2E_BUILD) ./test/e2e/connectivity
+	$(GINKGO_E2E_BUILD) ./test/e2e/metallb
+	$(GINKGO_E2E_BUILD) ./test/e2e/anp-domain
+	$(GINKGO_E2E_BUILD) ./test/e2e/cnp-domain
+	$(GINKGO_E2E_BUILD) ./test/e2e/bgp-lb-eip
 
 .PHONY: k8s-conformance-e2e
 k8s-conformance-e2e:
@@ -190,6 +188,15 @@ kube-ovn-lb-svc-conformance-e2e:
 	E2E_NETWORK_MODE=$(E2E_NETWORK_MODE) \
 	ginkgo $(GINKGO_OUTPUT_OPT) $(GINKGO_PARALLEL_OPT) --randomize-all -v \
 		--focus=CNI:Kube-OVN ./test/e2e/lb-svc/lb-svc.test -- $(TEST_BIN_ARGS)
+
+.PHONY: bgp-lb-eip-e2e
+bgp-lb-eip-e2e:
+	$(call kind_load_image,kube-ovn,$(AGNHOST_IMAGE),1)
+	$(GINKGO_E2E_BUILD) ./test/e2e/bgp-lb-eip
+	E2E_BRANCH=$(E2E_BRANCH) \
+	E2E_IP_FAMILY=$(E2E_IP_FAMILY) \
+	E2E_NETWORK_MODE=$(E2E_NETWORK_MODE) \
+	$(GINKGO_E2E_RUN) --focus="group:bgp-lb-eip" ./test/e2e/bgp-lb-eip/bgp-lb-eip.test -- $(TEST_BIN_ARGS)
 
 .PHONY: vip-conformance-e2e
 vip-conformance-e2e:
