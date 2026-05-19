@@ -49,6 +49,7 @@ type fakeControllerInformers struct {
 	serviceInformer   coreinformers.ServiceInformer
 	namespaceInformer coreinformers.NamespaceInformer
 	podInformer       coreinformers.PodInformer
+	nodeInformer      coreinformers.NodeInformer
 }
 
 type fakeController struct {
@@ -148,6 +149,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	serviceInformer := kubeInformerFactory.Core().V1().Services()
 	namespaceInformer := kubeInformerFactory.Core().V1().Namespaces()
 	podInformer := kubeInformerFactory.Core().V1().Pods()
+	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
 
 	nadInformerFactory := nadinformers.NewSharedInformerFactory(nadClient, 0)
 	nadInformer := nadInformerFactory.K8sCniCncfIo().V1().NetworkAttachmentDefinitions()
@@ -168,6 +170,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		serviceInformer:   serviceInformer,
 		namespaceInformer: namespaceInformer,
 		podInformer:       podInformer,
+		nodeInformer:      nodeInformer,
 	}
 
 	// Create mock OVN clients
@@ -180,6 +183,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		servicesLister:          serviceInformer.Lister(),
 		namespacesLister:        namespaceInformer.Lister(),
 		podsLister:              podInformer.Lister(),
+		nodesLister:             nodeInformer.Lister(),
 		vpcsLister:              vpcInformer.Lister(),
 		vpcSynced:               alwaysReady,
 		subnetsLister:           subnetInformer.Lister(),

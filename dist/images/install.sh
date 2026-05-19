@@ -3372,6 +3372,11 @@ spec:
                             type: string
                           dstIPs:
                             type: string
+                u2oFeatures:
+                  properties:
+                    overlayOnlyRouting:
+                      type: boolean
+                  type: object
                 u2oInterconnection:
                   description: Enable underlay to overlay interconnection.
                   type: boolean
