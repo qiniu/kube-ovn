@@ -35,21 +35,21 @@ build-go-arm:
 
 .PHONY: build-kube-ovn
 build-kube-ovn: build-debug build-go
-	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) -f dist/images/Dockerfile dist/images/
-	docker build -t $(REGISTRY)/kube-ovn:$(LEGACY_TAG) --build-arg VERSION=$(LEGACY_TAG) -f dist/images/Dockerfile dist/images/
+	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) --build-arg ARCH=amd64 -f dist/images/Dockerfile dist/images/
+#	docker build -t $(REGISTRY)/kube-ovn:$(LEGACY_TAG) --build-arg VERSION=$(LEGACY_TAG) --build-arg ARCH=amd64 -f dist/images/Dockerfile dist/images/
 
 .PHONY: build-kube-ovn-dpdk
 build-kube-ovn-dpdk: build-go
-	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-dpdk --build-arg BASE_TAG=$(RELEASE_TAG)-dpdk -f dist/images/Dockerfile dist/images/
+	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-dpdk --build-arg BASE_TAG=$(RELEASE_TAG)-dpdk --build-arg ARCH=amd64 -f dist/images/Dockerfile dist/images/
 
 .PHONY: build-dev
 build-dev: build-go
-	docker build -t $(REGISTRY)/kube-ovn:$(DEV_TAG) --build-arg VERSION=$(RELEASE_TAG) -f dist/images/Dockerfile dist/images/
+	docker build -t $(REGISTRY)/kube-ovn:$(DEV_TAG) --build-arg VERSION=$(RELEASE_TAG) --build-arg ARCH=amd64 -f dist/images/Dockerfile dist/images/
 
 .PHONY: build-debug
 build-debug:
 	@DEBUG=1 $(MAKE) build-go
-	docker build -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) -f dist/images/Dockerfile dist/images/
+	docker build -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) --build-arg ARCH=amd64 -f dist/images/Dockerfile dist/images/
 
 .PHONY: base-amd64
 base-amd64:
@@ -68,25 +68,25 @@ base-arm64:
 
 .PHONY: build-kit
 build-kit: build-go
-	DOCKER_BUILDKIT=1 docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	DOCKER_BUILDKIT=1 docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
 
 .PHONY: image-kube-ovn
-image-kube-ovn: image-kube-ovn-debug build-go
-	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
-	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(LEGACY_TAG) --build-arg VERSION=$(LEGACY_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+image-kube-ovn: build-go
+	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
+#	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(LEGACY_TAG) --build-arg VERSION=$(LEGACY_TAG) --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
 
 .PHONY: image-kube-ovn-arm64
 image-kube-ovn-arm64: build-go-arm
-	docker buildx build --platform linux/arm64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/arm64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) --build-arg ARCH=arm64 -o type=docker -f dist/images/Dockerfile dist/images/
 
 .PHONY: image-kube-ovn-debug
 image-kube-ovn-debug:
 	@DEBUG=1 $(MAKE) build-go
-	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
 
 .PHONY: image-kube-ovn-dpdk
 image-kube-ovn-dpdk: build-go
-	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-dpdk --build-arg VERSION=$(RELEASE_TAG) --build-arg BASE_TAG=$(RELEASE_TAG)-dpdk -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-dpdk --build-arg VERSION=$(RELEASE_TAG) --build-arg BASE_TAG=$(RELEASE_TAG)-dpdk --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
 
 .PHONY: image-vpc-nat-gateway
 image-vpc-nat-gateway:
@@ -114,7 +114,7 @@ release-arm: release-arm-debug image-kube-ovn-arm64
 .PHONY: release-arm-debug
 release-arm-debug:
 	@DEBUG=1 $(MAKE) build-go-arm
-	docker buildx build --platform linux/arm64 -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/arm64 -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) --build-arg ARCH=arm64 -o type=docker -f dist/images/Dockerfile dist/images/
 
 .PHONY: push-dev
 push-dev:
@@ -126,7 +126,7 @@ push-release: release
 
 .PHONY: tar-kube-ovn
 tar-kube-ovn:
-	docker save $(REGISTRY)/kube-ovn:$(RELEASE_TAG) $(REGISTRY)/kube-ovn:$(LEGACY_TAG) $(REGISTRY)/kube-ovn:$(DEBUG_TAG) -o kube-ovn.tar
+	docker save $(REGISTRY)/kube-ovn:$(RELEASE_TAG) -o kube-ovn.tar
 
 .PHONY: tar-kube-ovn-dpdk
 tar-kube-ovn-dpdk:

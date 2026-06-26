@@ -1,6 +1,31 @@
 # syntax=docker/dockerfile:1
-ARG VERSION
+ARG VERSION=latest
 ARG BASE_TAG=$VERSION
+
+# Intermediate stage: download gobgp CLI binary.
+# Keeps the base image untouched while upgrading third-party binaries.
+FROM ubuntu:24.04 AS qiniu
+ARG ARCH=amd64
+ARG DEBIAN_FRONTEND=noninteractive
+# renovate: datasource=github-releases depName=gobgp packageName=osrg/gobgp versioning=semver
+ARG GOBGP_VERSION=4.6.0
+ARG GOBGP_SHA256_AMD64=6d4491a85dfbaaab8d18bd6855be6b67a117a5a9670eea3ee9f7dddaf50e869c
+ARG GOBGP_SHA256_ARM64=41eb71f4765b3d26fff811cc6b99a91d040c6687c5aa9fc25c7baf3472e2cd66
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -sSf -L --retry 5 -o /tmp/gobgp.tar.gz \
+    "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${ARCH}.tar.gz" && \
+    case "$ARCH" in \
+    amd64) EXPECTED_SHA256="$GOBGP_SHA256_AMD64" ;; \
+    arm64) EXPECTED_SHA256="$GOBGP_SHA256_ARM64" ;; \
+    *) echo "unsupported arch: $ARCH"; exit 1 ;; \
+    esac && \
+    echo "${EXPECTED_SHA256}  /tmp/gobgp.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/gobgp.tar.gz -C /usr/bin gobgp && \
+    chmod +x /usr/bin/gobgp && \
+    rm -f /tmp/gobgp.tar.gz && \
+    apt-get purge -y --auto-remove curl && \
+    rm -rf /var/lib/apt/lists/*
+
 FROM kubeovn/kube-ovn-base:$BASE_TAG AS setcap
 
 COPY *.sh /kube-ovn/
@@ -27,6 +52,7 @@ COPY --chmod=0644 logrotate/* /etc/logrotate.d/
 COPY grace_stop_ovn_controller /usr/share/ovn/scripts/grace_stop_ovn_controller
 
 COPY --from=setcap /kube-ovn /kube-ovn
+COPY --from=qiniu /usr/bin/gobgp /usr/bin/gobgp
 RUN /kube-ovn/iptables-wrapper-installer.sh --no-sanity-check
 
 WORKDIR /kube-ovn

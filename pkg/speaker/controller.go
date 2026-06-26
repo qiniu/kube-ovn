@@ -62,6 +62,11 @@ type Controller struct {
 	gwPodsInformerFactory  kubeinformers.SharedInformerFactory
 	kubeovnInformerFactory kubeovninformer.SharedInformerFactory
 	recorder               record.EventRecorder
+
+	// lastBFDPeerStates caches the most recent BFD session state per peer address.
+	// Used by logBFDStatus to suppress repeated logs when state is unchanged.
+	lastBFDPeerStates     map[string]string
+	lastBFDStatsHasErrors bool
 }
 
 func NewController(config *Configuration) *Controller {
@@ -247,4 +252,6 @@ func (c *Controller) Reconcile() {
 		// Default: Pod/Subnet/Service VIP announcements without EIP mode.
 		c.syncSubnetRoutes()
 	}
+
+	c.logBFDStatus()
 }

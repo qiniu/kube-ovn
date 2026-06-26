@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"slices"
@@ -70,6 +71,12 @@ type Configuration struct {
 	VpcNatGwNamespace string
 	NodeRouteEIPMode  bool
 
+	// BFD (Bidirectional Forwarding Detection) configuration
+	EnableBFD              bool
+	BFDMinTX               uint32 // minimum transmit interval in milliseconds (converted to microseconds for GoBGP)
+	BFDMinRX               uint32 // minimum receive interval in milliseconds (converted to microseconds for GoBGP)
+	BFDDetectionMultiplier uint8  // RFC 5880 §6.8.1: valid range 1-255
+
 	NodeName       string
 	KubeConfigFile string
 	KubeClient     kubernetes.Interface
@@ -109,6 +116,10 @@ func ParseFlags() (*Configuration, error) {
 		argLogPerm                     = pflag.String("log-perm", "640", "The permission for the log file")
 		argVpcNatGwNamespace           = pflag.String("vpc-nat-gw-namespace", "kube-system", "The namespace where VPC NAT Gateway pods are deployed, default: kube-system")
 		argNodeRouteEIPMode            = pflag.BoolP("node-route-eip-mode", "", false, "Make the BGP speaker announce EIPs for local NAT gateway pods. Mutually exclusive with --nat-gw-mode. Speaker runs on node with host network and announces EIPs for vpc-nat-gw pods on the same node")
+		argEnableBFD                   = pflag.BoolP("enable-bfd", "", false, "Enable BFD (Bidirectional Forwarding Detection) for fast failure detection")
+		argBFDMinTX                    = pflag.Uint32("bfd-min-tx", 1000, "BFD minimum transmit interval in milliseconds (default 1000, max 4294967)")
+		argBFDMinRX                    = pflag.Uint32("bfd-min-rx", 1000, "BFD minimum receive interval in milliseconds (default 1000, max 4294967)")
+		argBFDDetectionMultiplier      = pflag.Uint8("bfd-detection-multiplier", 3, "BFD detection multiplier (default 3, valid range 1-255 per RFC 5880)")
 	)
 	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
 	klog.InitFlags(klogFlags)
@@ -184,6 +195,10 @@ func ParseFlags() (*Configuration, error) {
 		LogPerm:                     *argLogPerm,
 		VpcNatGwNamespace:           *argVpcNatGwNamespace,
 		NodeRouteEIPMode:            *argNodeRouteEIPMode,
+		EnableBFD:                   *argEnableBFD,
+		BFDMinTX:                    *argBFDMinTX,
+		BFDMinRX:                    *argBFDMinRX,
+		BFDDetectionMultiplier:      *argBFDDetectionMultiplier,
 	}
 
 	if err := config.validateMutuallyExclusiveModes(); err != nil {
@@ -286,6 +301,22 @@ func (config *Configuration) validateRequiredFlags() error {
 	// NodeRouteEIPMode requires NodeName to identify local NAT gateway pods
 	if config.NodeRouteEIPMode && config.NodeName == "" {
 		missingFlags = append(missingFlags, "--node-route-eip-mode requires --node-name to be specified")
+	}
+
+	if config.EnableBFD {
+		if config.BFDDetectionMultiplier == 0 {
+			missingFlags = append(missingFlags, "--bfd-detection-multiplier must be between 1 and 255")
+		}
+		if config.BFDMinTX == 0 {
+			missingFlags = append(missingFlags, "--bfd-min-tx must be > 0")
+		} else if config.BFDMinTX > math.MaxUint32/1000 {
+			missingFlags = append(missingFlags, "--bfd-min-tx must be <= 4294967 ms to avoid uint32 overflow in ms-to-μs conversion")
+		}
+		if config.BFDMinRX == 0 {
+			missingFlags = append(missingFlags, "--bfd-min-rx must be > 0")
+		} else if config.BFDMinRX > math.MaxUint32/1000 {
+			missingFlags = append(missingFlags, "--bfd-min-rx must be <= 4294967 ms to avoid uint32 overflow in ms-to-μs conversion")
+		}
 	}
 
 	if len(missingFlags) > 0 {
@@ -460,6 +491,13 @@ func (config *Configuration) initBgpServer() error {
 				})
 			}
 
+			peer.Bfd = newBFDPeerConfig(config)
+			if peer.Bfd != nil {
+				klog.Infof("BFD enabled for peer %s: MinTX=%dms(%dμs), MinRX=%dms(%dμs), Multiplier=%d",
+					addr.String(), config.BFDMinTX, config.BFDMinTX*1000,
+					config.BFDMinRX, config.BFDMinRX*1000, config.BFDDetectionMultiplier)
+			}
+
 			logBgpPeer(peer)
 			if err := addPeerWithRetry(s, peer); err != nil {
 				err = fmt.Errorf("failed to add peer %s: %w", addr.String(), err)
@@ -499,7 +537,7 @@ func addPeerWithRetry(s *gobgp.BgpServer, peer *api.Peer) error {
 
 // logBgpPeer logs the BGP peer configuration details, masking sensitive information.
 func logBgpPeer(peer *api.Peer) {
-	klog.Infof("BGP Peer Configuration: NeighborAddress=%s, LocalAddress=%s, PeerAsn=%d, HoldTime=%d, PassiveMode=%v, EbgpMultihop=%v, GracefulRestart=%v, AfiSafis=%v",
+	klog.Infof("BGP Peer Configuration: NeighborAddress=%s, LocalAddress=%s, PeerAsn=%d, HoldTime=%d, PassiveMode=%v, EbgpMultihop=%v, GracefulRestart=%v, AfiSafis=%v, BFD=%v",
 		peer.Conf.NeighborAddress,
 		peer.Transport.LocalAddress,
 		peer.Conf.PeerAsn,
@@ -507,7 +545,8 @@ func logBgpPeer(peer *api.Peer) {
 		peer.Transport.PassiveMode,
 		peer.EbgpMultihop,
 		peer.GracefulRestart,
-		peer.AfiSafis)
+		peer.AfiSafis,
+		peer.Bfd)
 }
 
 // watchPeerState monitors BGP peer state changes and logs detailed information
@@ -515,18 +554,27 @@ func logBgpPeer(peer *api.Peer) {
 func (config *Configuration) watchPeerState() {
 	err := config.BgpServer.WatchEvent(context.Background(), gobgp.WatchEventMessageCallbacks{
 		OnPeerUpdate: func(peer *apiutil.WatchEventMessage_PeerEvent, _ time.Time) {
-			if peer == nil {
+			if peer == nil || peer.Type != apiutil.PEER_EVENT_STATE {
 				return
 			}
 			p := peer.Peer
 			neighborAddr := p.Conf.NeighborAddress.String()
-			localAddr := p.Transport.LocalAddress.String()
-			state := p.State.SessionState.String()
-			peerAS := p.Conf.PeerASN
 
-			if peer.Type == apiutil.PEER_EVENT_STATE {
+			var bfdState string
+			if config.EnableBFD {
+				config.BgpServer.ListBfdPeer(context.Background(), func(addr string, st *api.BfdPeerState) {
+					if addr == neighborAddr && st != nil {
+						bfdState = bfdSessionStateString(st.SessionState)
+					}
+				})
+			}
+
+			if bfdState != "" {
+				klog.Infof("BGP peer state changed: neighbor=%s, state=%s, localAddress=%s, peerAS=%d, bfd=%s",
+					neighborAddr, p.State.SessionState, p.Transport.LocalAddress, p.Conf.PeerASN, bfdState)
+			} else {
 				klog.Infof("BGP peer state changed: neighbor=%s, state=%s, localAddress=%s, peerAS=%d",
-					neighborAddr, state, localAddr, peerAS)
+					neighborAddr, p.State.SessionState, p.Transport.LocalAddress, p.Conf.PeerASN)
 			}
 		},
 	}, gobgp.WatchPeer())
