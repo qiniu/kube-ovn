@@ -66,7 +66,18 @@ type Controller struct {
 	// lastBFDPeerStates caches the most recent BFD session state per peer address.
 	// Used by logBFDStatus to suppress repeated logs when state is unchanged.
 	lastBFDPeerStates     map[string]string
+	lastBFDErrorCounters  bfdErrorCounters
+	hasLastBFDStatsSample bool
 	lastBFDStatsHasErrors bool
+
+	// lastBGPPeers / lastBFDPeers track the per-peer series exported in the
+	// previous metrics collection cycle, keyed by peer address (BGP also keeps
+	// the peer ASN needed to delete its label set). They let collectBGPMetrics /
+	// collectBFDMetrics delete only the series of peers that disappeared, instead
+	// of Reset()-ing every series each cycle, which would expose a brief empty
+	// window to a concurrent Prometheus scrape (metric flapping).
+	lastBGPPeers map[string]string
+	lastBFDPeers map[string]struct{}
 }
 
 func NewController(config *Configuration) *Controller {
@@ -162,6 +173,10 @@ func NewController(config *Configuration) *Controller {
 		controller.initNodeRouteEIPMode()
 	}
 
+	if config.EnableMetrics {
+		registerSpeakerMetrics()
+	}
+
 	return controller
 }
 
@@ -254,4 +269,8 @@ func (c *Controller) Reconcile() {
 	}
 
 	c.logBFDStatus()
+
+	if c.config.EnableMetrics {
+		c.collectMetrics()
+	}
 }
