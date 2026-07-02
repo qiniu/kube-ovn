@@ -103,6 +103,7 @@ func (c *Controller) enqueueUpdateSubnet(oldObj, newObj any) {
 		oldSubnet.Spec.GatewayType != newSubnet.Spec.GatewayType ||
 		!reflect.DeepEqual(oldSubnet.Spec.U2OFeatures, newSubnet.Spec.U2OFeatures) ||
 		oldSubnet.Spec.GatewayNode != newSubnet.Spec.GatewayNode ||
+		!reflect.DeepEqual(oldSubnet.Spec.GatewayNodeSelectors, newSubnet.Spec.GatewayNodeSelectors) ||
 		oldSubnet.Spec.LogicalGateway != newSubnet.Spec.LogicalGateway ||
 		oldSubnet.Spec.Gateway != newSubnet.Spec.Gateway ||
 		!slices.Equal(oldSubnet.Spec.ExcludeIps, newSubnet.Spec.ExcludeIps) ||
@@ -119,6 +120,7 @@ func (c *Controller) enqueueUpdateSubnet(oldObj, newObj any) {
 		(oldSubnet.Spec.EnableLb != nil && newSubnet.Spec.EnableLb != nil && *oldSubnet.Spec.EnableLb != *newSubnet.Spec.EnableLb) ||
 		oldSubnet.Spec.EnableEcmp != newSubnet.Spec.EnableEcmp ||
 		!reflect.DeepEqual(oldSubnet.Spec.Acls, newSubnet.Spec.Acls) ||
+		oldSubnet.Spec.AllowEWTraffic != newSubnet.Spec.AllowEWTraffic ||
 		oldSubnet.Spec.U2OInterconnection != newSubnet.Spec.U2OInterconnection ||
 		oldSubnet.Spec.RouteTable != newSubnet.Spec.RouteTable ||
 		oldSubnet.Spec.Vpc != newSubnet.Spec.Vpc ||
