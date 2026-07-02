@@ -3373,8 +3373,10 @@ spec:
                           dstIPs:
                             type: string
                 u2oFeatures:
+                  description: Feature configurations for underlay to overlay interconnection.
                   properties:
                     overlayOnlyRouting:
+                      description: OverlayOnlyRouting controls whether only overlay CIDRs use U2O routing.
                       type: boolean
                   type: object
                 u2oInterconnection:

@@ -93,6 +93,9 @@ func (c *Controller) enqueueUpdateSubnet(oldObj, newObj any) {
 		c.addOrUpdateVpcQueue.Add(newSubnet.Spec.Vpc)
 	}
 
+	// Only fields reconciled by the subnet controller trigger a subnet requeue.
+	// Other spec fields are handled by their own control paths and intentionally
+	// stay out of this whitelist to match upstream behavior.
 	if oldSubnet.Spec.Private != newSubnet.Spec.Private ||
 		oldSubnet.Spec.CIDRBlock != newSubnet.Spec.CIDRBlock ||
 		!slices.Equal(oldSubnet.Spec.AllowSubnets, newSubnet.Spec.AllowSubnets) ||
@@ -2638,7 +2641,11 @@ func (c *Controller) deleteStaleU2ORoutePolicies(subnet *kubeovnv1.Subnet, desir
 	}
 
 	logicalRouter, err := c.OVNNbClient.GetLogicalRouter(lr, true)
-	if err == nil && logicalRouter == nil {
+	if err != nil {
+		klog.Errorf("failed to get logical router %s: %v", lr, err)
+		return err
+	}
+	if logicalRouter == nil {
 		klog.Infof("logical router %s already deleted", lr)
 		return nil
 	}
