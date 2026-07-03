@@ -88,14 +88,15 @@ func (c *Controller) enqueueUpdateSubnet(oldObj, newObj any) {
 		return
 	}
 
-	if oldSubnet.Spec.U2OInterconnection != newSubnet.Spec.U2OInterconnection {
-		klog.Infof("enqueue update vpc %s triggered by u2o interconnection change of subnet %s", newSubnet.Spec.Vpc, key)
-		c.addOrUpdateVpcQueue.Add(newSubnet.Spec.Vpc)
-	}
-
+	// Intentionally excluded spec fields:
+	// - Default, Provider, Mtu, DisableGatewayCheck, NodeNetwork:
+	//   creation-time or pod-side semantics, not reconciled here.
+	// - EnableExternalLBAddress, ExternalEgressGateway, PolicyRoutingPriority,
+	//   PolicyRoutingTableID, DisableInterConnection:
+	//   handled by other control paths outside the subnet controller queue.
 	// Only fields reconciled by the subnet controller trigger a subnet requeue.
-	// Other spec fields are handled by their own control paths and intentionally
-	// stay out of this whitelist to match upstream behavior.
+	// Keep this whitelist and the coverage test in subnet_test.go in sync when
+	// SubnetSpec changes.
 	if oldSubnet.Spec.Private != newSubnet.Spec.Private ||
 		oldSubnet.Spec.CIDRBlock != newSubnet.Spec.CIDRBlock ||
 		!slices.Equal(oldSubnet.Spec.AllowSubnets, newSubnet.Spec.AllowSubnets) ||
@@ -2440,6 +2441,10 @@ func (c *Controller) addPolicyRouteForU2OInterconn(subnet *kubeovnv1.Subnet) err
 		if _, _, err := c.syncU2OOverlayCIDRsAddressSet(subnet.Spec.Vpc, ""); err != nil {
 			return err
 		}
+	} else {
+		if _, _, err := c.syncU2OOverlayCIDRsAddressSet(subnet.Spec.Vpc, subnet.Name); err != nil {
+			return err
+		}
 	}
 
 	overlayOnlyExternalIDs := buildPolicyRouteExternalIDs(subnet.Name, map[string]string{
@@ -2584,6 +2589,35 @@ func u2oOverlayCIDRsAddressSetExternalIDs(vpcName string) map[string]string {
 	}
 }
 
+func (c *Controller) deleteU2OOverlayCIDRsAddressSet(vpcName string) error {
+	if vpcName == "" {
+		return nil
+	}
+	v4Name, v6Name := u2oOverlayCIDRsAddressSetNames(vpcName)
+	if err := c.OVNNbClient.DeleteAddressSet(v4Name, v6Name); err != nil {
+		klog.Errorf("delete u2o overlay cidrs address set for vpc %s: %v", vpcName, err)
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) shouldKeepU2OOverlayCIDRsAddressSet(vpcName, excludeSubnet string) (bool, error) {
+	subnets, err := c.subnetsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list subnets: %v", err)
+		return false, err
+	}
+	for _, subnet := range subnets {
+		if subnet.Name == excludeSubnet || subnet.Spec.Vpc != vpcName || subnet.Spec.Vlan == "" {
+			continue
+		}
+		if subnet.Spec.U2OInterconnection && u2oOverlayOnlyRoutingEnabled(subnet) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (c *Controller) syncU2OOverlayCIDRsAddressSet(vpcName, excludeSubnet string) (v4CIDRs, v6CIDRs []string, err error) {
 	if vpcName == "" {
 		return nil, nil, nil
@@ -2591,8 +2625,18 @@ func (c *Controller) syncU2OOverlayCIDRsAddressSet(vpcName, excludeSubnet string
 
 	v4Name, v6Name := u2oOverlayCIDRsAddressSetNames(vpcName)
 	externalIDs := u2oOverlayCIDRsAddressSetExternalIDs(vpcName)
+	keepAddressSet, err := c.shouldKeepU2OOverlayCIDRsAddressSet(vpcName, excludeSubnet)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !keepAddressSet {
+		return nil, nil, c.deleteU2OOverlayCIDRsAddressSet(vpcName)
+	}
 	if v4CIDRs, v6CIDRs, err = c.buildU2OOverlayCIDRs(vpcName, excludeSubnet); err != nil {
 		return nil, nil, err
+	}
+	if len(v4CIDRs) == 0 && len(v6CIDRs) == 0 {
+		return nil, nil, c.deleteU2OOverlayCIDRsAddressSet(vpcName)
 	}
 	if err := c.OVNNbClient.CreateAddressSet(v4Name, externalIDs); err != nil {
 		klog.Errorf("create address set %s: %v", v4Name, err)
@@ -2678,8 +2722,12 @@ func (c *Controller) deleteStaleU2ORoutePolicies(subnet *kubeovnv1.Subnet, desir
 }
 
 func (c *Controller) deletePolicyRouteForU2OInterconn(subnet *kubeovnv1.Subnet) error {
+	cleanupOverlayCIDRs := func() error {
+		_, _, err := c.syncU2OOverlayCIDRsAddressSet(subnet.Spec.Vpc, subnet.Name)
+		return err
+	}
 	if !c.logicalRouterExists(subnet.Spec.Vpc) {
-		return nil
+		return cleanupOverlayCIDRs()
 	}
 	policies, err := c.OVNNbClient.ListLogicalRouterPolicies(subnet.Spec.Vpc, -1, map[string]string{
 		"isU2ORoutePolicy": "true",
@@ -2691,7 +2739,7 @@ func (c *Controller) deletePolicyRouteForU2OInterconn(subnet *kubeovnv1.Subnet) 
 		return err
 	}
 	if len(policies) == 0 {
-		return nil
+		return cleanupOverlayCIDRs()
 	}
 
 	lr := subnet.Status.U2OInterconnectionVPC
@@ -2721,7 +2769,7 @@ func (c *Controller) deletePolicyRouteForU2OInterconn(subnet *kubeovnv1.Subnet) 
 		return err
 	}
 
-	return nil
+	return cleanupOverlayCIDRs()
 }
 
 func (c *Controller) addCustomVPCStaticRouteForSubnet(subnet *kubeovnv1.Subnet) error {

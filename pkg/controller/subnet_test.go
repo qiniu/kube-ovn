@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -15,6 +16,87 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
+
+func TestSubnetSpecFieldsCoveredByEnqueueUpdateSubnetClassification(t *testing.T) {
+	t.Parallel()
+
+	whitelist := map[string]struct{}{
+		"Private":                {},
+		"CIDRBlock":              {},
+		"AllowSubnets":           {},
+		"Namespaces":             {},
+		"GatewayType":            {},
+		"U2OFeatures":            {},
+		"GatewayNode":            {},
+		"GatewayNodeSelectors":   {},
+		"LogicalGateway":         {},
+		"Gateway":                {},
+		"ExcludeIps":             {},
+		"Vips":                   {},
+		"Vlan":                   {},
+		"EnableDHCP":             {},
+		"DHCPv4Options":          {},
+		"DHCPv6Options":          {},
+		"EnableIPv6RA":           {},
+		"IPv6RAConfigs":          {},
+		"Protocol":               {},
+		"EnableLb":               {},
+		"EnableEcmp":             {},
+		"Acls":                   {},
+		"AllowEWTraffic":         {},
+		"U2OInterconnection":     {},
+		"RouteTable":             {},
+		"Vpc":                    {},
+		"NatOutgoing":            {},
+		"EnableMulticastSnoop":   {},
+		"NatOutgoingPolicyRules": {},
+		"NamespaceSelectors":     {},
+		"U2OInterconnectionIP":   {},
+	}
+	excluded := map[string]struct{}{
+		"Default":                 {},
+		"Provider":                {},
+		"ExternalEgressGateway":   {},
+		"PolicyRoutingPriority":   {},
+		"PolicyRoutingTableID":    {},
+		"Mtu":                     {},
+		"DisableGatewayCheck":     {},
+		"DisableInterConnection":  {},
+		"EnableExternalLBAddress": {},
+		"NodeNetwork":             {},
+	}
+
+	covered := make(map[string]string, len(whitelist)+len(excluded))
+	for field := range whitelist {
+		covered[field] = "whitelist"
+	}
+	for field := range excluded {
+		if prev, ok := covered[field]; ok {
+			t.Fatalf("SubnetSpec field %s is classified twice: %s and excluded", field, prev)
+		}
+		covered[field] = "excluded"
+	}
+
+	specType := reflect.TypeOf(kubeovnv1.SubnetSpec{})
+	actual := make(map[string]struct{}, specType.NumField())
+	for i := 0; i < specType.NumField(); i++ {
+		field := specType.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		actual[field.Name] = struct{}{}
+		if _, ok := covered[field.Name]; !ok {
+			t.Fatalf("SubnetSpec field %s is not classified for enqueueUpdateSubnet", field.Name)
+		}
+	}
+
+	for field := range covered {
+		if _, ok := actual[field]; !ok {
+			t.Fatalf("classified field %s does not exist in SubnetSpec", field)
+		}
+	}
+	require.Len(t, covered, len(actual))
+}
 
 func TestAddPolicyRouteForU2OInterconn_OverlayOnlyRouting(t *testing.T) {
 	t.Parallel()
@@ -113,7 +195,18 @@ func TestSyncU2OOverlayCIDRsAddressSet_UpdatesAfterOverlaySubnetDeletion(t *test
 
 	overlayA := &kubeovnv1.Subnet{ObjectMeta: metav1.ObjectMeta{Name: overlayAName}, Spec: kubeovnv1.SubnetSpec{Vpc: vpcName, CIDRBlock: overlayAV4 + "," + overlayAV6}}
 	overlayB := &kubeovnv1.Subnet{ObjectMeta: metav1.ObjectMeta{Name: overlayBName}, Spec: kubeovnv1.SubnetSpec{Vpc: vpcName, CIDRBlock: overlayBV4 + "," + overlayBV6}}
-	underlay := &kubeovnv1.Subnet{ObjectMeta: metav1.ObjectMeta{Name: underlayName}, Spec: kubeovnv1.SubnetSpec{Vpc: vpcName, Vlan: underlayVlan, CIDRBlock: underlayCIDR}}
+	underlay := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: underlayName},
+		Spec: kubeovnv1.SubnetSpec{
+			Vpc:                vpcName,
+			Vlan:               underlayVlan,
+			CIDRBlock:          underlayCIDR,
+			U2OInterconnection: true,
+			U2OFeatures: kubeovnv1.U2OFeatures{
+				OverlayOnlyRouting: true,
+			},
+		},
+	}
 
 	fc := newFakeController(t)
 	ctrl := fc.fakeController
@@ -148,6 +241,90 @@ func TestSyncU2OOverlayCIDRsAddressSet_UpdatesAfterOverlaySubnetDeletion(t *test
 	require.NoError(t, err)
 	require.Equal(t, []string{overlayAV4}, v4CIDRs)
 	require.Equal(t, []string{overlayAV6}, v6CIDRs)
+
+	require.NoError(t, fc.fakeInformers.subnetInformer.Informer().GetStore().Delete(overlayA))
+	mockOvnClient.EXPECT().DeleteAddressSet(overlayCIDRs4Ag, overlayCIDRs6Ag).Return(nil)
+	v4CIDRs, v6CIDRs, err = ctrl.syncU2OOverlayCIDRsAddressSet(vpcName, "")
+	require.NoError(t, err)
+	require.Nil(t, v4CIDRs)
+	require.Nil(t, v6CIDRs)
+}
+
+func TestAddPolicyRouteForU2OInterconn_DisablesOverlayOnlyRoutingCleansStalePolicies(t *testing.T) {
+	t.Parallel()
+
+	const (
+		subnetName  = "subnet-a"
+		vlanName    = "vlan1"
+		cidr        = "10.16.1.0/24"
+		overlayCIDR = "10.244.0.0/16"
+		gateway     = "10.16.1.1"
+	)
+
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: subnetName},
+		Spec: kubeovnv1.SubnetSpec{
+			Vpc:                util.DefaultVpc,
+			Vlan:               vlanName,
+			CIDRBlock:          cidr,
+			Gateway:            gateway,
+			U2OInterconnection: true,
+		},
+		Status: kubeovnv1.SubnetStatus{
+			U2OInterconnectionVPC: util.DefaultVpc,
+		},
+	}
+	overlaySubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "overlay-a"},
+		Spec: kubeovnv1.SubnetSpec{
+			Vpc:       util.DefaultVpc,
+			CIDRBlock: overlayCIDR,
+		},
+	}
+
+	fc := newFakeController(t)
+	ctrl := fc.fakeController
+	mockOvnClient := fc.mockOvnClient
+	require.NoError(t, fc.fakeInformers.subnetInformer.Informer().GetStore().Add(subnet))
+	require.NoError(t, fc.fakeInformers.subnetInformer.Informer().GetStore().Add(overlaySubnet))
+
+	u2oExcludeIP4Ag := strings.ReplaceAll(fmt.Sprintf(util.U2OExcludeIPAg, subnet.Name, "ip4"), "-", ".")
+	u2oExcludeIP6Ag := strings.ReplaceAll(fmt.Sprintf(util.U2OExcludeIPAg, subnet.Name, "ip6"), "-", ".")
+	overlayCIDRs4Ag, overlayCIDRs6Ag := u2oOverlayCIDRsAddressSetNames(subnet.Spec.Vpc)
+	routeExternalIDs := map[string]string{
+		"vendor":           util.CniTypeName,
+		"subnet":           subnet.Name,
+		"isU2ORoutePolicy": "true",
+	}
+
+	match1 := fmt.Sprintf("ip4.dst == %s", cidr)
+	match2 := fmt.Sprintf("ip4.dst == $%s && ip4.src == %s", u2oExcludeIP4Ag, cidr)
+	match3 := fmt.Sprintf("ip4.src == %s", cidr)
+	matchSameSubnet := fmt.Sprintf("ip4.src == %s && ip4.dst == %s", cidr, cidr)
+	matchOverlayToUnderlay := fmt.Sprintf("ip4.src == $%s && ip4.dst == %s", overlayCIDRs4Ag, cidr)
+
+	mockOvnClient.EXPECT().CreateAddressSet(u2oExcludeIP4Ag, routeExternalIDs).Return(nil)
+	mockOvnClient.EXPECT().CreateAddressSet(u2oExcludeIP6Ag, routeExternalIDs).Return(nil)
+	mockOvnClient.EXPECT().DeleteAddressSet(overlayCIDRs4Ag, overlayCIDRs6Ag).Return(nil)
+	mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.U2OSubnetPolicyPriority, match1, string(kubeovnv1.PolicyRouteActionAllow), ([]string)(nil), ([]string)(nil), routeExternalIDs).Return(nil)
+	mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.SubnetRouterPolicyPriority, match2, string(kubeovnv1.PolicyRouteActionReroute), []string{gateway}, ([]string)(nil), routeExternalIDs).Return(nil)
+	mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.GatewayRouterPolicyPriority, match3, string(kubeovnv1.PolicyRouteActionReroute), []string{gateway}, ([]string)(nil), routeExternalIDs).Return(nil)
+	mockOvnClient.EXPECT().GetLogicalRouter(util.DefaultVpc, true).Return(&ovnnb.LogicalRouter{Name: util.DefaultVpc}, nil)
+	mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, -1, map[string]string{
+		"isU2ORoutePolicy": "true",
+		"vendor":           util.CniTypeName,
+		"subnet":           subnet.Name,
+	}, true).Return([]*ovnnb.LogicalRouterPolicy{
+		{UUID: "overlay-allow", Priority: util.U2OSubnetPolicyPriority, Match: matchOverlayToUnderlay},
+		{UUID: "overlay-same-subnet", Priority: util.U2OSameSubnetPolicyPriority, Match: matchSameSubnet},
+		{UUID: "overlay-gw", Priority: util.U2OPhysicalGatewayPolicyPriority, Match: match3},
+	}, nil)
+	mockOvnClient.EXPECT().DeleteLogicalRouterPolicyByUUID(util.DefaultVpc, "overlay-allow").Return(nil)
+	mockOvnClient.EXPECT().DeleteLogicalRouterPolicyByUUID(util.DefaultVpc, "overlay-same-subnet").Return(nil)
+	mockOvnClient.EXPECT().DeleteLogicalRouterPolicyByUUID(util.DefaultVpc, "overlay-gw").Return(nil)
+
+	err := ctrl.addPolicyRouteForU2OInterconn(subnet)
+	require.NoError(t, err)
 }
 
 func Test_reconcileVips(t *testing.T) {
