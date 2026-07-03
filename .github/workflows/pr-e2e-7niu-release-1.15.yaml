@@ -24,7 +24,13 @@ env:
   # renovate: datasource=github-releases depName=golangci-lint packageName=golangci/golangci-lint
   GOLANGCI_LINT_VERSION: v2.10.1
   JINJANATOR_VERSION: '25.3.1'
+  # qiniu uses a fork-specific branch name, but the code line still tracks the
+  # upstream release-1.15 version semantics.
   TARGET_BRANCH: 7niu-release-1.15
+  # Master e2e parses E2E_BRANCH as a Kube-OVN version gate (release-* only).
+  # The tested image still comes from the current PR tarball; this value is only
+  # used so SkipVersionPriorTo() can classify the branch as release-1.15.
+  MASTER_E2E_BRANCH: release-1.15
   E2E_SOURCE_BRANCH: master
   MASTER_E2E_NAT_GW_IMAGE: docker.io/kubeovn/vpc-nat-gateway:v1.14.25
 
@@ -259,7 +265,9 @@ jobs:
         id: e2e
         working-directory: test/e2e/source
         env:
-          E2E_BRANCH: ${{ env.TARGET_BRANCH }}
+          # test/e2e/source is only the upstream master test harness. The actual
+          # kube-ovn under test is the tar/image built from this PR branch.
+          E2E_BRANCH: ${{ env.MASTER_E2E_BRANCH }}
           E2E_IP_FAMILY: ipv4
           E2E_NETWORK_MODE: overlay
           SUITE_TARGET: ${{ matrix.suite.target }}
@@ -356,7 +364,7 @@ jobs:
         id: e2e
         working-directory: test/e2e/source
         env:
-          E2E_BRANCH: ${{ env.TARGET_BRANCH }}
+          E2E_BRANCH: ${{ env.MASTER_E2E_BRANCH }}
           E2E_IP_FAMILY: ipv4
           E2E_NETWORK_MODE: overlay
         run: make kube-ovn-ha-e2e
@@ -480,7 +488,7 @@ jobs:
         id: e2e_multus
         working-directory: test/e2e/source
         env:
-          E2E_BRANCH: ${{ env.TARGET_BRANCH }}
+          E2E_BRANCH: ${{ env.MASTER_E2E_BRANCH }}
           E2E_IP_FAMILY: ipv4
           E2E_NETWORK_MODE: overlay
         run: make kube-ovn-multus-conformance-e2e
@@ -490,7 +498,7 @@ jobs:
         if: success()
         working-directory: test/e2e/source
         env:
-          E2E_BRANCH: ${{ env.TARGET_BRANCH }}
+          E2E_BRANCH: ${{ env.MASTER_E2E_BRANCH }}
           E2E_IP_FAMILY: ipv4
           E2E_NETWORK_MODE: overlay
         run: make iptables-vpc-nat-gw-conformance-e2e
