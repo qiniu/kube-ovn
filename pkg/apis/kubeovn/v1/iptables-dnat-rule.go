@@ -52,6 +52,9 @@ const (
 	// enabling load-balancing across backends. Implemented via nftables numgen random
 	// map-based DNAT: new connections are distributed randomly across backends and then
 	// pinned by conntrack (connection-level balancing, no client-IP affinity).
+	// IPv4 only: the nft rules use `ip daddr`/`ip saddr`, so share requires an EIP with an
+	// IPv4 address; the webhook rejects share on an IPv6-only EIP and the controller requeues
+	// while the EIP is still being allocated (v4 not yet assigned).
 	DnatRuleTypeShare = "share"
 )
 
