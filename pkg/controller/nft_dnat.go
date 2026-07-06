@@ -71,7 +71,7 @@ func (c *Controller) createNftDnatMapInPod(dp, protocol, v4ip, externalPort stri
 		return err
 	}
 
-	backendStr := strings.Join(backends, ";")
+	backendStr := strings.Join(backends, "@")
 	rule := fmt.Sprintf("%s,%s,%s,%s", v4ip, externalPort, protocol, backendStr)
 	if err = c.execNatGwRules(gwPod, natGwNftDnatMapAdd, []string{rule}); err != nil {
 		klog.Errorf("failed to create nft dnat map, err: %v", err)
