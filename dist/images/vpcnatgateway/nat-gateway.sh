@@ -516,6 +516,10 @@ function del_dnat() {
 
 NFT_TABLE="kube-ovn"
 NFT_SERVICES_MAP="service-ips"
+# WARNING: this base chain is owned exclusively by the share-dnat feature. add_nft_dnat_map
+# flushes it on every add/update and re-adds its single vmap dispatch rule, so any other rule
+# injected into this chain would be silently wiped. Do NOT reuse NFT_PREROUTING_CHAIN for other
+# components; add a separate chain (or a different priority hook) if new prerouting rules are needed.
 NFT_PREROUTING_CHAIN="prerouting"
 
 # Generate a per-identity chain name from eip:port:protocol.
@@ -614,6 +618,7 @@ function add_nft_dnat_map() {
         # Atomic transaction:
         # 1. Ensure table, base chain, vmap exist (idempotent)
         # 2. Flush + re-add dispatch rule in base chain
+        #    (base chain is share-dnat-exclusive; flush wipes any other rule in it, see NFT_PREROUTING_CHAIN)
         # 3. Flush per-identity chain + add new dnat rule
         # 4. Ensure vmap element points to this chain
         if ! nft_transaction \
