@@ -543,7 +543,9 @@ function add_nft_dnat_map() {
     # Add or update share-type DNAT backends for a given identity.
     # Uses atomic nft transaction: ensure infrastructure + flush per-identity chain + re-add rule.
     # All nft add operations are idempotent (no-op if already exists).
-    # Format: eip,dport,protocol,ip1:port1;ip2:port2;ip3:port3
+    # Format: eip,dport,protocol,ip1:port1@ip2:port2@ip3:port3
+    # Backends are '@'-separated (not ';') because the rule is passed as a single argument
+    # through pod-exec into a shell context, where ';' would act as a command separator.
     check_inited
     for rule in "$@"
     do

@@ -51,7 +51,10 @@ const (
 //  3. Add new rule with numgen random mod N map { all backends }
 //  4. Ensure vmap element dispatches to this chain
 //
-// The backends format passed to the gateway script is "ip1:port1;ip2:port2;...".
+// The backends format passed to the gateway script is "ip1:port1@ip2:port2@...".
+// '@' is used as the separator (not ';') because the rule string is passed as a single
+// argument through the pod-exec API into a shell context, where ';' would be interpreted
+// as a command separator; '@' never appears in an ip:port and is shell-safe.
 func (c *Controller) createNftDnatMapInPod(dp, protocol, v4ip, externalPort string, backends []string) error {
 	if v4ip == "" {
 		// Share DNAT is implemented with `ip daddr`/`ip saddr` nft rules and only supports IPv4.
@@ -138,6 +141,12 @@ func dedupSortedBackends(backends []string) []string {
 // momentarily not-yet-Ready gets excluded and silently dropped from the map by the last writer.
 // A sibling's Spec backend is populated as soon as it exists, so using it makes the rebuild
 // order-independent. Siblings that are being deleted are skipped so their backend is not re-added.
+//
+// This relies on the informer cache being in sync: a sibling's Spec must already be visible in
+// the lister for its backend to be included. If a sibling was just created and its create event
+// has not yet propagated to this lister cache, the last writer will build a map that temporarily
+// omits that backend. This is not a bug: the missing sibling's own add/update event triggers a
+// later reconcile that rebuilds the full map, so the set self-heals to the complete backend list.
 func (c *Controller) getShareBackends(gwName, eipName, externalPort, protocol, dnatName string) ([]string, error) {
 	// The label selector only coarse-filters by gateway name + external port; the EIP
 	// identity is intentionally enforced as a Spec post-filter below (d.Spec.EIP != eipName)
@@ -196,6 +205,13 @@ func (c *Controller) getShareBackends(gwName, eipName, externalPort, protocol, d
 
 // cleanupShareDnatInPod rebuilds the share nft map with the remaining backends for the given
 // identity, or deletes the rule entirely when no backend is left after excluding dnatName.
+//
+// When a single backend is removed while the identity still has other backends, this rebuilds
+// the per-identity map in place without deleting the identity or flushing conntrack. Established
+// connections that were pinned to the removed backend may therefore be rehashed to a different
+// backend (or dropped) by the new numgen map. This is the expected behavior when detaching a
+// backend from a load balancer. Conntrack is only cleared on full identity deletion (see
+// deleteNftDnatMapInPod / del_nft_dnat_map in the gateway script).
 func (c *Controller) cleanupShareDnatInPod(key, gwName, eipName, protocol, v4ip, externalPort, dnatName string) error {
 	remainingBackends, err := c.getShareBackends(gwName, eipName, externalPort, protocol, dnatName)
 	if err != nil {

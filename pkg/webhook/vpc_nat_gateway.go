@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -563,20 +562,12 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 		return errors.New("parameter \"internalPort\" cannot be empty")
 	}
 
-	if port, err := strconv.Atoi(dnat.Spec.ExternalPort); err != nil {
-		errMsg := fmt.Errorf("failed to parse externalPort %s: %w", dnat.Spec.ExternalPort, err)
-		return errMsg
-	} else if port < 0 || port > 65535 {
-		err := fmt.Errorf("externalPort %s is not a valid port", dnat.Spec.ExternalPort)
-		return err
+	if err := util.ValidatePort(dnat.Spec.ExternalPort); err != nil {
+		return fmt.Errorf("externalPort %s is not a valid port: %w", dnat.Spec.ExternalPort, err)
 	}
 
-	if port, err := strconv.Atoi(dnat.Spec.InternalPort); err != nil {
-		errMsg := fmt.Errorf("failed to parse internalIP %s: %w", dnat.Spec.InternalPort, err)
-		return errMsg
-	} else if port < 0 || port > 65535 {
-		err := fmt.Errorf("internalIP %s is not a valid port", dnat.Spec.InternalPort)
-		return err
+	if err := util.ValidatePort(dnat.Spec.InternalPort); err != nil {
+		return fmt.Errorf("internalPort %s is not a valid port: %w", dnat.Spec.InternalPort, err)
 	}
 
 	if net.ParseIP(dnat.Spec.InternalIP) == nil {
