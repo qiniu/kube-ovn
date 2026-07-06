@@ -49,8 +49,9 @@ const (
 
 	// DnatRuleTypeShare means multiple DNAT rules can share the same EIP:Port.
 	// Different internal IP:Port backends are allowed to coexist under the same identity,
-	// enabling load-balancing across backends. Implemented via nftables jhash map-based DNAT
-	// (distributes traffic by hashing src IP + src port), introduced to support nft LB scenarios.
+	// enabling load-balancing across backends. Implemented via nftables numgen random
+	// map-based DNAT: new connections are distributed randomly across backends and then
+	// pinned by conntrack (connection-level balancing, no client-IP affinity).
 	DnatRuleTypeShare = "share"
 )
 
@@ -67,7 +68,9 @@ type IptablesDnatRuleSpec struct {
 	//   nft LB feature was introduced; any duplicate identity is rejected.
 	// - "share": Multiple DNAT rules may share the same EIP:Port identity, each
 	//   contributing a different internal IP:Port as a backend. Traffic is distributed
-	//   across backends using nftables jhash map-based DNAT (hash of src IP + src port).
+	//   across backends using nftables numgen random map-based DNAT: each new connection
+	//   picks a backend at random and is then pinned by conntrack (connection-level
+	//   balancing, no client-IP affinity).
 	// +kubebuilder:validation:Enum=exclusive;share
 	// +kubebuilder:default=exclusive
 	// +optional

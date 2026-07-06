@@ -62,7 +62,9 @@ func (c *Controller) createNftDnatMapInPod(dp, protocol, v4ip, externalPort stri
 	}
 	// Normalize the backend set: dedup and sort so that an unchanged set of backends always
 	// produces an identical nft map. Without this, the lister's non-deterministic order would
-	// reshuffle the map keys on every rebuild/redo and gratuitously rehash live connections.
+	// rewrite the numgen random map on every rebuild/redo even when nothing changed, causing
+	// gratuitous nft rule churn (and reshuffling index->backend, which only affects the random
+	// choice for new connections; established connections stay pinned by conntrack).
 	backends = dedupSortedBackends(backends)
 	if len(backends) == 0 {
 		return fmt.Errorf("cannot create nft dnat map for %s:%s (%s): no backends", v4ip, externalPort, protocol)
@@ -207,11 +209,13 @@ func (c *Controller) getShareBackends(gwName, eipName, externalPort, protocol, d
 // identity, or deletes the rule entirely when no backend is left after excluding dnatName.
 //
 // When a single backend is removed while the identity still has other backends, this rebuilds
-// the per-identity map in place without deleting the identity or flushing conntrack. Established
-// connections that were pinned to the removed backend may therefore be rehashed to a different
-// backend (or dropped) by the new numgen map. This is the expected behavior when detaching a
-// backend from a load balancer. Conntrack is only cleared on full identity deletion (see
-// deleteNftDnatMapInPod / del_nft_dnat_map in the gateway script).
+// the per-identity map in place without deleting the identity or flushing conntrack. Backends are
+// balanced with numgen random, so established connections are pinned by conntrack: connections to
+// surviving backends are unaffected, and connections to the removed backend are not flushed here
+// (they simply break once that backend is gone). New connections are distributed by the rebuilt
+// numgen random map. This is the expected behavior when detaching a backend from a load balancer.
+// Conntrack is only cleared on full identity deletion (see deleteNftDnatMapInPod /
+// del_nft_dnat_map in the gateway script).
 func (c *Controller) cleanupShareDnatInPod(key, gwName, eipName, protocol, v4ip, externalPort, dnatName string) error {
 	remainingBackends, err := c.getShareBackends(gwName, eipName, externalPort, protocol, dnatName)
 	if err != nil {
