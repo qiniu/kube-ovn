@@ -656,6 +656,13 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 	}
 	klog.V(3).Infof("handle update dnat %s", key)
 
+	// add or update should make sure vpc nat enabled. Checked before validateDnatRule and the
+	// isDnatDuplicated lister scan (matching handleAddIptablesDnatRule) so we do not scan when
+	// the NAT GW is disabled.
+	if vpcNatEnabled != "true" {
+		return errors.New("iptables nat gw not enable")
+	}
+
 	if err := c.validateDnatRule(cachedDnat); err != nil {
 		return err
 	}
@@ -668,10 +675,6 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 	if dup, err := c.isDnatDuplicated(eip.Spec.NatGwDp, cachedDnat.Spec.EIP, cachedDnat.Name, cachedDnat.Spec.ExternalPort, cachedDnat.Spec.Protocol, cachedDnat.Spec.Type); dup || err != nil {
 		klog.Errorf("failed to update dnat, %v", err)
 		return err
-	}
-	// add or update should make sure vpc nat enabled
-	if vpcNatEnabled != "true" {
-		return errors.New("iptables nat gw not enable")
 	}
 
 	if eip.Spec.NatGwDp == "" {
