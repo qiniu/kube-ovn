@@ -556,6 +556,22 @@ function add_nft_dnat_map() {
             exit 1
         fi
 
+        # Defense-in-depth format validation: the controller and webhook already validate
+        # these fields, but the shell must not blindly interpolate values into the nft
+        # transaction if an upstream check is ever bypassed (manual call / future call site).
+        if ! [[ "$eip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "Error: invalid eip in nft-dnat-map rule: $eip"
+            exit 1
+        fi
+        if ! [[ "$dport" =~ ^[0-9]+$ ]] || [ "$dport" -lt 1 ] || [ "$dport" -gt 65535 ]; then
+            echo "Error: invalid external port in nft-dnat-map rule: $dport"
+            exit 1
+        fi
+        if [ "$protocol" != "tcp" ] && [ "$protocol" != "udp" ] && [ "$protocol" != "TCP" ] && [ "$protocol" != "UDP" ]; then
+            echo "Error: invalid protocol in nft-dnat-map rule: $protocol"
+            exit 1
+        fi
+
         # Parse backends and count them
         IFS='@' read -ra backend_list <<< "$backends"
         local count=${#backend_list[@]}
@@ -573,6 +589,14 @@ function add_nft_dnat_map() {
         local map_entries=""
         for i in "${!backend_list[@]}"; do
             IFS=':' read -r ip port <<< "${backend_list[$i]}"
+            if ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+                echo "Error: invalid backend ip in nft-dnat-map rule: $ip"
+                exit 1
+            fi
+            if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                echo "Error: invalid backend port in nft-dnat-map rule: $port"
+                exit 1
+            fi
             if [ -n "$map_entries" ]; then
                 map_entries="$map_entries, "
             fi
