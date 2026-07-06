@@ -246,6 +246,16 @@ func (c *Controller) cleanupShareDnatInPod(key, gwName, eipName, protocol, v4ip,
 // isDnatDuplicated checks if a DNAT rule with the same identity already exists.
 // For Share type rules, multiple rules with the same identity can coexist.
 // For Exclusive type, only one rule per identity is allowed.
+//
+// Consistency note: this check (and the equivalent webhook check in ValidateIptablesDnat) reads
+// the informer lister / controller-runtime cache, which is only eventually consistent. If two
+// conflicting exclusive rules are created concurrently before either is visible in the cache,
+// both can pass this check and be admitted. This is a pre-existing limitation of the cache-based
+// duplicate detection, not specific to the share feature (the share feature only widens the set
+// of legitimately-coexisting objects under one identity). The reconcile loop is the eventual
+// authority: it re-runs this check on every sync, so a conflict that slipped through is detected
+// on a subsequent reconcile and the offending rule fails to become Ready (last-writer-wins /
+// eventual consistency). The webhook is best-effort admission-time protection, not a hard guarantee.
 func (c *Controller) isDnatDuplicated(gwName, eipName, dnatName, externalPort, protocol, dnatType string) (bool, error) {
 	// Check if the tuple "eip:external port:protocol" is already used by another DNAT rule.
 	// EIP identity is enforced via the Spec post-filter (d.Spec.EIP != eipName) below rather
