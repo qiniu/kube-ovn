@@ -32,6 +32,14 @@ import (
 //   - Shell variables: UPPER_CASE (NFT_TABLE, NFT_SERVICES_MAP, ...)
 //   - nft object names: lower_case with hyphens/underscores (Linux/nftables convention)
 //   - Per-identity chain: "dnat-" + md5(eip:port:protocol)[:8]  (generated in shell)
+//
+// TODO(share-dnat): source-IP session affinity is not supported yet. Backends are selected
+// purely at random (numgen random) and then pinned per-connection by conntrack; there is no
+// client-IP affinity. kube-proxy's nftables backend implements ClientIP affinity by recording
+// the source IP in a dynamic nftables set ("update @affinity-set { ip saddr }" in the per-endpoint
+// chain, plus a preceding "ip saddr @affinity-set goto <ep>" lookup), layered on top of the same
+// numgen random dispatch (not jhash). The same approach could be adopted here if per-client
+// affinity is needed in the future.
 
 const (
 	// natGwNftDnatMapAdd is the shell command for adding/updating a share DNAT identity.
