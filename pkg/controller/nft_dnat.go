@@ -28,6 +28,18 @@ import (
 //   - Add new identity: create chain + add rule + add vmap element
 //   - Remove identity: delete vmap element + flush & delete chain
 //
+// Coexistence with exclusive (iptables) DNAT:
+//   Two DNAT paths run in the same gateway pod. Exclusive-type rules use iptables
+//   nat/PREROUTING (priority NF_IP_PRI_NAT_DST, ~ -100), while share-type rules use this nft
+//   base chain at priority -150, so the nft hook runs first. This is not a functional conflict
+//   because the webhook enforces that a given identity (eip + externalPort + protocol) is
+//   mutually exclusive across types, and DNAT/FIP for the same EIP are also mutually exclusive;
+//   a packet is therefore only ever matched by one path. The ordering matters mainly for
+//   troubleshooting boundary cases, e.g. when a rule's type is switched after conntrack has
+//   already pinned a connection (existing flows keep their old destination until they expire).
+//   Recommendation: within a single gateway, prefer using one mode consistently (share/nft) so
+//   there is a single DNAT path to reason about and debug.
+//
 // Naming conventions:
 //   - Shell variables: UPPER_CASE (NFT_TABLE, NFT_SERVICES_MAP, ...)
 //   - nft object names: lower_case with hyphens/underscores (Linux/nftables convention)
