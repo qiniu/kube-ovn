@@ -620,6 +620,9 @@ function add_nft_dnat_map() {
         # 2. Flush + re-add dispatch rule in base chain
         #    (base chain is share-dnat-exclusive; flush wipes any other rule in it, see NFT_PREROUTING_CHAIN)
         # 3. Flush per-identity chain + add new dnat rule
+        #    (the `meta l4proto $nft_proto` match is technically redundant here, since a packet
+        #     only reaches this chain via the vmap key that already selects by protocol; it is
+        #     kept for parity with kube-proxy's per-service dnat rule and as an explicit guard)
         # 4. Ensure vmap element points to this chain
         if ! nft_transaction \
             "add table ip $NFT_TABLE" \
