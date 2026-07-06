@@ -635,6 +635,7 @@ function del_nft_dnat_map() {
     # Delete a share-type DNAT identity entirely.
     # Removes vmap element + flushes and deletes per-identity chain.
     # Format: eip,dport,protocol
+    check_inited
 
     # Check if table exists (global precondition): if absent there is nothing to delete
     # for any rule, so return early. Kept outside the loop so a missing table does not
