@@ -611,6 +611,15 @@ function del_nft_dnat_map() {
     # Delete a share-type DNAT identity entirely.
     # Removes vmap element + flushes and deletes per-identity chain.
     # Format: eip,dport,protocol
+
+    # Check if table exists (global precondition): if absent there is nothing to delete
+    # for any rule, so return early. Kept outside the loop so a missing table does not
+    # silently skip the remaining rules in a batch call.
+    if ! nft list table ip $NFT_TABLE >/dev/null 2>&1; then
+        echo "NFT table $NFT_TABLE does not exist, nothing to delete"
+        return 0
+    fi
+
     for rule in "$@"
     do
         IFS=',' read -r eip dport protocol <<< "$rule"
@@ -618,12 +627,6 @@ function del_nft_dnat_map() {
         if [ -z "$eip" ] || [ -z "$dport" ] || [ -z "$protocol" ]; then
             echo "Error: invalid nft-dnat-map identity: $rule"
             exit 1
-        fi
-
-        # Check if table exists
-        if ! nft list table ip $NFT_TABLE >/dev/null 2>&1; then
-            echo "NFT table $NFT_TABLE does not exist, nothing to delete"
-            return 0
         fi
 
         local identity_chain nft_proto
