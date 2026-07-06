@@ -524,14 +524,14 @@ NFT_PREROUTING_CHAIN="prerouting"
 
 # Generate a per-identity chain name from eip:port:protocol.
 # Uses md5 hash prefix for uniqueness (same idea as kube-proxy's hashAndTruncate).
-# Tradeoff: only the first 8 hex chars (32 bits) of the md5 are used. Collision probability
+# Tradeoff: only the first 12 hex chars (48 bits) of the md5 are used. Collision probability
 # is negligible for the number of identities on a single gateway; a collision would make two
 # identities share (and mutually flush) the same per-identity chain. Widen the prefix if the
 # per-gateway identity count ever grows large enough for this to matter.
 function nft_identity_chain_name() {
     local eip=$1 dport=$2 protocol=$3
     local hash
-    hash=$(echo -n "${eip}:${dport}:${protocol}" | md5sum | cut -c1-8)
+    hash=$(echo -n "${eip}:${dport}:${protocol}" | md5sum | cut -c1-12)
     echo "dnat-${hash}"
 }
 

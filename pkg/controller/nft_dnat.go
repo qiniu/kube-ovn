@@ -43,7 +43,7 @@ import (
 // Naming conventions:
 //   - Shell variables: UPPER_CASE (NFT_TABLE, NFT_SERVICES_MAP, ...)
 //   - nft object names: lower_case with hyphens/underscores (Linux/nftables convention)
-//   - Per-identity chain: "dnat-" + md5(eip:port:protocol)[:8]  (generated in shell)
+//   - Per-identity chain: "dnat-" + md5(eip:port:protocol)[:12]  (generated in shell)
 //
 // TODO(share-dnat): source-IP session affinity is not supported yet. Backends are selected
 // purely at random (numgen random) and then pinned per-connection by conntrack; there is no

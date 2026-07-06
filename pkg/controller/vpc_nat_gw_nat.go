@@ -807,7 +807,12 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 
 		switch cachedDnat.Spec.Type {
 		case kubeovnv1.DnatRuleTypeShare:
-			// Share type: rebuild nft rule with all backends
+			// Share type: rebuild nft rule with all backends.
+			// Identity fields are read from Status (redo replays the last successfully-applied
+			// state after a gateway pod restart), except eipName which uses Spec.EIP on purpose:
+			// getShareBackends filters siblings by their Spec.EIP, so the lookup key must also be
+			// Spec.EIP to match. In the normal redo case Spec.EIP == Status EIP; they can only
+			// diverge in the rare "EIP renamed while not-yet-Ready + pod restart" corner case.
 			backends, err := c.getShareBackends(cachedDnat.Status.NatGwDp, cachedDnat.Spec.EIP, cachedDnat.Status.ExternalPort, cachedDnat.Status.Protocol, cachedDnat.Name)
 			if err != nil {
 				klog.Errorf("failed to get share backends for dnat %s: %v", key, err)

@@ -59,10 +59,15 @@ const (
 )
 
 type IptablesDnatRuleSpec struct {
-	EIP          string `json:"eip"`
+	// EIP name for DNAT rule
+	EIP string `json:"eip"`
+	// External port number
 	ExternalPort string `json:"externalPort"`
-	Protocol     string `json:"protocol,omitempty"`
-	InternalIP   string `json:"internalIp"`
+	// Protocol type (TCP or UDP)
+	Protocol string `json:"protocol,omitempty"`
+	// Internal IP address to forward traffic to
+	InternalIP string `json:"internalIp"`
+	// Internal port number to forward traffic to
 	InternalPort string `json:"internalPort"`
 	// Type of the DNAT rule, controls whether the EIP:Port identity can be shared
 	// by multiple internal backends:
@@ -81,16 +86,25 @@ type IptablesDnatRuleSpec struct {
 }
 
 type IptablesDnatRuleStatus struct {
+	// Indicates whether the DNAT rule is ready
 	// +optional
 	// +patchStrategy=merge
-	Ready        bool   `json:"ready" patchStrategy:"merge"`
-	V4ip         string `json:"v4ip" patchStrategy:"merge"`
-	V6ip         string `json:"v6ip" patchStrategy:"merge"`
-	NatGwDp      string `json:"natGwDp" patchStrategy:"merge"`
-	Redo         string `json:"redo" patchStrategy:"merge"`
-	Protocol     string `json:"protocol"  patchStrategy:"merge"`
-	InternalIP   string `json:"internalIp"  patchStrategy:"merge"`
+	Ready bool `json:"ready" patchStrategy:"merge"`
+	// V4ip is the IPv4 address of the DNAT rule
+	V4ip string `json:"v4ip" patchStrategy:"merge"`
+	// V6ip is the IPv6 address of the DNAT rule
+	V6ip string `json:"v6ip" patchStrategy:"merge"`
+	// NatGwDp is the NAT gateway data path
+	NatGwDp string `json:"natGwDp" patchStrategy:"merge"`
+	// Redo operation status
+	Redo string `json:"redo" patchStrategy:"merge"`
+	// Protocol type of the DNAT rule
+	Protocol string `json:"protocol"  patchStrategy:"merge"`
+	// Internal IP address configured in the DNAT rule
+	InternalIP string `json:"internalIp"  patchStrategy:"merge"`
+	// Internal port configured in the DNAT rule
 	InternalPort string `json:"internalPort"  patchStrategy:"merge"`
+	// External port configured in the DNAT rule
 	ExternalPort string `json:"externalPort"  patchStrategy:"merge"`
 
 	// Conditions represents the latest state of the object
