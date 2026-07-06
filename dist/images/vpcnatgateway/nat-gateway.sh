@@ -520,6 +520,10 @@ NFT_PREROUTING_CHAIN="prerouting"
 
 # Generate a per-identity chain name from eip:port:protocol.
 # Uses md5 hash prefix for uniqueness (same idea as kube-proxy's hashAndTruncate).
+# Tradeoff: only the first 8 hex chars (32 bits) of the md5 are used. Collision probability
+# is negligible for the number of identities on a single gateway; a collision would make two
+# identities share (and mutually flush) the same per-identity chain. Widen the prefix if the
+# per-gateway identity count ever grows large enough for this to matter.
 function nft_identity_chain_name() {
     local eip=$1 dport=$2 protocol=$3
     local hash
@@ -654,6 +658,22 @@ function del_nft_dnat_map() {
             exit 1
         fi
 
+        # Defense-in-depth format validation, matching add_nft_dnat_map: the shell must not
+        # blindly interpolate values into nft delete element / conntrack if an upstream check
+        # is ever bypassed (manual call / future call site).
+        if ! [[ "$eip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "Error: invalid eip in nft-dnat-map identity: $eip"
+            exit 1
+        fi
+        if ! [[ "$dport" =~ ^[0-9]+$ ]] || [ "$dport" -lt 1 ] || [ "$dport" -gt 65535 ]; then
+            echo "Error: invalid external port in nft-dnat-map identity: $dport"
+            exit 1
+        fi
+        if [ "$protocol" != "tcp" ] && [ "$protocol" != "udp" ] && [ "$protocol" != "TCP" ] && [ "$protocol" != "UDP" ]; then
+            echo "Error: invalid protocol in nft-dnat-map identity: $protocol"
+            exit 1
+        fi
+
         local identity_chain nft_proto
         identity_chain=$(nft_identity_chain_name "$eip" "$dport" "$protocol")
         nft_proto=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
@@ -668,7 +688,7 @@ function del_nft_dnat_map() {
             "delete chain ip $NFT_TABLE $identity_chain"
 
         # Clean up conntrack entries for this identity
-        conntrack -D -d "$eip" -p "$protocol" --dport "$dport" 2>/dev/null || true
+        conntrack -D -d "$eip" -p "$nft_proto" --dport "$dport" 2>/dev/null || true
 
         echo "Deleted nft share dnat: $eip:$dport ($protocol) (chain=$identity_chain)"
     done
