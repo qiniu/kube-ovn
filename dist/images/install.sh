@@ -1943,6 +1943,9 @@ spec:
       - jsonPath: .spec.internalPort
         name: InternalPort
         type: string
+      - jsonPath: .spec.type
+        name: Type
+        type: string
       - jsonPath: .status.natGwDp
         name: NatGwDp
         type: string
@@ -2025,6 +2028,13 @@ spec:
                 internalPort:
                   type: string
                   description: Internal port number to forward traffic to
+                type:
+                  type: string
+                  description: 'DNAT rule type: exclusive (default, single iptables DNAT for 1:1 port forwarding) or share (nftables map-based load balancing across multiple backends)'
+                  enum:
+                    - exclusive
+                    - share
+                  default: exclusive
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
