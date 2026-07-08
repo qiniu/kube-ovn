@@ -4785,6 +4785,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - mountPath: /var/run/ovn
               name: host-run-ovn
@@ -4959,6 +4963,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - mountPath: /lib/modules
               name: host-modules
@@ -5219,10 +5227,6 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 45
           resources:
-            requests:
-              cpu: 200m
-              hugepages-2Mi: 1Gi
-              memory: 200Mi
             limits:
               cpu: 1000m
               hugepages-2Mi: 1Gi
@@ -5372,6 +5376,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - name: kube-ovn-log
               mountPath: /var/log/kube-ovn
@@ -5562,6 +5570,10 @@ spec:
               - ALL
           privileged: true
           runAsUser: 0
+        resources:
+          limits:
+            cpu: 100m
+            memory: 100Mi
         volumeMounts:
           - name: usr-local-sbin
             mountPath: /usr/local/sbin
@@ -5587,6 +5599,10 @@ spec:
         securityContext:
           runAsUser: 0
           privileged: true
+        resources:
+          limits:
+            cpu: 100m
+            memory: 100Mi
         volumeMounts:
           - mountPath: /opt/cni/bin
             name: cni-bin
@@ -5839,6 +5855,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - name: kube-ovn-log
               mountPath: /var/log/kube-ovn
@@ -6218,6 +6238,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - name: kube-ovn-log
               mountPath: /var/log/kube-ovn
