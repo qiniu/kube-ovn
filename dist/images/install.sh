@@ -4846,9 +4846,6 @@ spec:
             - name: ENABLE_COMPACT
               value: "$ENABLE_COMPACT"
           resources:
-            requests:
-              cpu: 300m
-              memory: 300Mi
             limits:
               cpu: 4
               memory: 4Gi
@@ -5072,9 +5069,6 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 45
           resources:
-            requests:
-              cpu: 200m
-              memory: 200Mi
             limits:
               cpu: "2"
               memory: 1000Mi
@@ -5494,9 +5488,6 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 5
           resources:
-            requests:
-              cpu: 200m
-              memory: 200Mi
             limits:
               cpu: 1000m
               memory: 1Gi
@@ -5734,9 +5725,6 @@ spec:
             scheme: ${PROBE_HTTP_SCHEME}
           timeoutSeconds: 5
         resources:
-          requests:
-            cpu: 100m
-            memory: 100Mi
           limits:
             cpu: 1000m
             memory: 1Gi
@@ -5906,9 +5894,6 @@ spec:
             - name: ENABLE_BIND_LOCAL_IP
               value: "$ENABLE_BIND_LOCAL_IP"
           resources:
-            requests:
-              cpu: 200m
-              memory: 200Mi
             limits:
               cpu: 200m
               memory: 200Mi
@@ -6100,9 +6085,6 @@ spec:
             - name: OVN_DB_IPS
               value: $addresses
           resources:
-            requests:
-              cpu: 300m
-              memory: 200Mi
             limits:
               cpu: 3
               memory: 1Gi
@@ -6310,9 +6292,6 @@ spec:
             - mountPath: /var/run/tls
               name: kube-ovn-tls
           resources:
-            requests:
-              cpu: 100m
-              memory: 100Mi
             limits:
               cpu: 200m
               memory: 400Mi
