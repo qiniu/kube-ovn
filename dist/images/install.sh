@@ -4785,6 +4785,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - mountPath: /var/run/ovn
               name: host-run-ovn
@@ -4842,12 +4846,9 @@ spec:
             - name: ENABLE_COMPACT
               value: "$ENABLE_COMPACT"
           resources:
-            requests:
+            limits:
               cpu: 300m
               memory: 300Mi
-            limits:
-              cpu: 4
-              memory: 4Gi
               ephemeral-storage: 1Gi
           volumeMounts:
             - mountPath: /var/run/ovn
@@ -4959,6 +4960,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - mountPath: /lib/modules
               name: host-modules
@@ -5064,12 +5069,9 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 45
           resources:
-            requests:
+            limits:
               cpu: 200m
               memory: 200Mi
-            limits:
-              cpu: "2"
-              memory: 1000Mi
               ephemeral-storage: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -5219,10 +5221,6 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 45
           resources:
-            requests:
-              cpu: 200m
-              hugepages-2Mi: 1Gi
-              memory: 200Mi
             limits:
               cpu: 1000m
               hugepages-2Mi: 1Gi
@@ -5372,6 +5370,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - name: kube-ovn-log
               mountPath: /var/log/kube-ovn
@@ -5486,12 +5488,9 @@ spec:
             failureThreshold: 5
             timeoutSeconds: 5
           resources:
-            requests:
+            limits:
               cpu: 200m
               memory: 200Mi
-            limits:
-              cpu: 1000m
-              memory: 1Gi
               ephemeral-storage: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -5562,6 +5561,10 @@ spec:
               - ALL
           privileged: true
           runAsUser: 0
+        resources:
+          limits:
+            cpu: 100m
+            memory: 100Mi
         volumeMounts:
           - name: usr-local-sbin
             mountPath: /usr/local/sbin
@@ -5587,6 +5590,10 @@ spec:
         securityContext:
           runAsUser: 0
           privileged: true
+        resources:
+          limits:
+            cpu: 100m
+            memory: 100Mi
         volumeMounts:
           - mountPath: /opt/cni/bin
             name: cni-bin
@@ -5718,12 +5725,9 @@ spec:
             scheme: ${PROBE_HTTP_SCHEME}
           timeoutSeconds: 5
         resources:
-          requests:
+          limits:
             cpu: 100m
             memory: 100Mi
-          limits:
-            cpu: 1000m
-            memory: 1Gi
             ephemeral-storage: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -5839,6 +5843,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - name: kube-ovn-log
               mountPath: /var/log/kube-ovn
@@ -5886,9 +5894,6 @@ spec:
             - name: ENABLE_BIND_LOCAL_IP
               value: "$ENABLE_BIND_LOCAL_IP"
           resources:
-            requests:
-              cpu: 200m
-              memory: 200Mi
             limits:
               cpu: 200m
               memory: 200Mi
@@ -6080,12 +6085,9 @@ spec:
             - name: OVN_DB_IPS
               value: $addresses
           resources:
-            requests:
+            limits:
               cpu: 300m
               memory: 200Mi
-            limits:
-              cpu: 3
-              memory: 1Gi
               ephemeral-storage: 1Gi
           volumeMounts:
             - mountPath: /var/run/ovn
@@ -6218,6 +6220,10 @@ spec:
                 - ALL
             privileged: true
             runAsUser: 0
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
           volumeMounts:
             - name: kube-ovn-log
               mountPath: /var/log/kube-ovn
@@ -6286,12 +6292,9 @@ spec:
             - mountPath: /var/run/tls
               name: kube-ovn-tls
           resources:
-            requests:
+            limits:
               cpu: 100m
               memory: 100Mi
-            limits:
-              cpu: 200m
-              memory: 400Mi
               ephemeral-storage: 1Gi
           livenessProbe:
             httpGet:
