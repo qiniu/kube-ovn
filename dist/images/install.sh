@@ -4847,8 +4847,8 @@ spec:
               value: "$ENABLE_COMPACT"
           resources:
             limits:
-              cpu: 4
-              memory: 4Gi
+              cpu: 300m
+              memory: 300Mi
               ephemeral-storage: 1Gi
           volumeMounts:
             - mountPath: /var/run/ovn
@@ -5070,8 +5070,8 @@ spec:
             timeoutSeconds: 45
           resources:
             limits:
-              cpu: "2"
-              memory: 1000Mi
+              cpu: 200m
+              memory: 200Mi
               ephemeral-storage: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -5489,8 +5489,8 @@ spec:
             timeoutSeconds: 5
           resources:
             limits:
-              cpu: 1000m
-              memory: 1Gi
+              cpu: 200m
+              memory: 200Mi
               ephemeral-storage: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -5726,8 +5726,8 @@ spec:
           timeoutSeconds: 5
         resources:
           limits:
-            cpu: 1000m
-            memory: 1Gi
+            cpu: 100m
+            memory: 100Mi
             ephemeral-storage: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -6086,8 +6086,8 @@ spec:
               value: $addresses
           resources:
             limits:
-              cpu: 3
-              memory: 1Gi
+              cpu: 300m
+              memory: 200Mi
               ephemeral-storage: 1Gi
           volumeMounts:
             - mountPath: /var/run/ovn
@@ -6293,8 +6293,8 @@ spec:
               name: kube-ovn-tls
           resources:
             limits:
-              cpu: 200m
-              memory: 400Mi
+              cpu: 100m
+              memory: 100Mi
               ephemeral-storage: 1Gi
           livenessProbe:
             httpGet:
