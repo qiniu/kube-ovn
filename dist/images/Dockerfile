@@ -8,9 +8,9 @@ FROM ubuntu:24.04 AS qiniu
 ARG ARCH=amd64
 ARG DEBIAN_FRONTEND=noninteractive
 # renovate: datasource=github-releases depName=gobgp packageName=osrg/gobgp versioning=semver
-ARG GOBGP_VERSION=4.6.0
-ARG GOBGP_SHA256_AMD64=6d4491a85dfbaaab8d18bd6855be6b67a117a5a9670eea3ee9f7dddaf50e869c
-ARG GOBGP_SHA256_ARM64=41eb71f4765b3d26fff811cc6b99a91d040c6687c5aa9fc25c7baf3472e2cd66
+ARG GOBGP_VERSION=4.7.0
+ARG GOBGP_SHA256_AMD64=05d98ca0d7bbcb2f50a6b7b6ee51c5e5b5fd64d6a310ee807040ed9d7104d5e0
+ARG GOBGP_SHA256_ARM64=9e582f0d5914ad706621d17047ce247879939aa9a359cb9f5a7446244adfec98
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
     curl -sSf -L --retry 5 -o /tmp/gobgp.tar.gz \
     "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${ARCH}.tar.gz" && \
