@@ -756,3 +756,39 @@ func TestDeleteNamedPortByPodWithRestartableInitContainers(t *testing.T) {
 	result = np.GetNamedPortByNs("test-ns")
 	assert.Empty(t, result, "both regular and sidecar init container named ports should be deleted")
 }
+
+func TestTunnelKeyNotReady(t *testing.T) {
+	ovnSubnet := func(tunnelKey int) *kubeovnv1.Subnet {
+		return &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+			Status:     kubeovnv1.SubnetStatus{TunnelKey: tunnelKey},
+		}
+	}
+	underlaySubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "underlay-subnet"},
+		Spec:       kubeovnv1.SubnetSpec{Provider: "underlay.default"},
+		Status:     kubeovnv1.SubnetStatus{TunnelKey: 0},
+	}
+
+	tests := []struct {
+		name     string
+		enable   bool
+		subnet   *kubeovnv1.Subnet
+		expected bool
+	}{
+		{"recording disabled, key not ready", false, ovnSubnet(0), false},
+		{"recording disabled, key ready", false, ovnSubnet(5), false},
+		{"ovn subnet, tunnel key not ready", true, ovnSubnet(0), true},
+		{"ovn subnet, tunnel key ready", true, ovnSubnet(5), false},
+		{"non-ovn subnet is ignored", true, underlaySubnet, false},
+		{"nil subnet is nil-safe", true, nil, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Controller{config: &Configuration{EnableRecordTunnelKey: tt.enable}}
+			assert.Equal(t, tt.expected, c.tunnelKeyNotReady(tt.subnet))
+		})
+	}
+}
