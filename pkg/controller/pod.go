@@ -553,13 +553,16 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 	return c.reconcileRouteSubnets(pod, needRouteSubnets(pod, podNets))
 }
 
-// tunnelKeyNotReady reports whether tunnel-key recording is enabled for the given
-// OVN subnet but its tunnel key (VNI) has not been synced from OVN SB yet. When it
-// returns true the pod must not be allocated an IP: proceeding to the CNI add while
-// the tunnel key is still missing would make Cilium VPC mode compute the endpoint
-// with the non-VPC scheme and produce dirty data. See reconcileAllocateSubnets.
+// tunnelKeyNotReady reports whether an IP must not be allocated from the given subnet yet
+// because its tunnel key (VNI) has not been synced from OVN SB (still 0).
+//
+// The pod allocation path does NOT wait for subnet.Status.Ready: once the subnet is registered
+// in IPAM during subnet reconciliation, pod workers can start allocating IPs from it, possibly
+// before the tunnel key has been synced from OVN SB. Allocating in that window would record a
+// stale tunnel_key=0 in the pod annotation and make Cilium fall back to the non-VPC endpoint
+// scheme. reconcileAllocateSubnets checks this on the resolved subnet before it persists a pod.
 func (c *Controller) tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
-	return c.config.EnableRecordTunnelKey && isOvnSubnet(subnet) && subnet.Status.TunnelKey == 0
+	return isOvnSubnet(subnet) && subnet.Status.TunnelKey == 0
 }
 
 // do the same thing as add pod
@@ -582,24 +585,6 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 	// Avoid create lsp for already running pod in ovn-nb when controller restart
 	patch := util.KVPatch{}
 	for _, podNet := range needAllocatePodNets {
-		// For OVN subnets, when tunnel key recording is enabled, the tunnel key (VNI) MUST be
-		// ready BEFORE allocating an IP (i.e. before the pod IP annotation is written and the
-		// CNI add is triggered).
-		//
-		// Background: the tunnel key is synced asynchronously from OVN SB after the logical
-		// switch is created, so it may not be ready yet at pod allocation time. Cilium, in VPC
-		// mode, relies on this tunnel key to compute the endpoint. If the IP were allocated
-		// (and the CNI add proceeded) while the tunnel key is still missing, Cilium would fall
-		// back to the non-VPC scheme when computing the endpoint, producing wrong/dirty data.
-		//
-		// We therefore cannot "bring the network up first and backfill the annotation later":
-		// that would inevitably introduce dirty data. The tunnel key must be resolved before
-		// the CNI add. If it is not ready yet, requeue the pod and wait.
-		if c.tunnelKeyNotReady(podNet.Subnet) {
-			err := fmt.Errorf("subnet %s tunnel key is not ready, waiting before allocating IP for pod %s/%s", podNet.Subnet.Name, namespace, name)
-			klog.Info(err)
-			return nil, err
-		}
 		// the subnet may changed when alloc static ip from the latter subnet after ns supports multi subnets
 		v4IP, v6IP, mac, subnet, err := c.acquireAddress(pod, podNet)
 		if err != nil {
@@ -617,22 +602,23 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		patch[fmt.Sprintf(util.CidrAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.CIDRBlock
 		patch[fmt.Sprintf(util.GatewayAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.Gateway
 		if isOvnSubnet(podNet.Subnet) {
+			// Gate: never persist an OVN pod whose subnet tunnel key (VNI) has not been synced from
+			// OVN SB yet, otherwise Cilium falls back to the non-VPC endpoint scheme. This runs on the
+			// resolved subnet (which may differ from podNet.Subnet for a static IP in a multi-subnet
+			// namespace) before any LSP or annotation is persisted, so the pod is simply requeued
+			// until the key is ready. A non-OVN resolved subnet has no tunnel key and is left as-is.
+			if c.tunnelKeyNotReady(subnet) {
+				err := fmt.Errorf("subnet %s tunnel key not observed on allocation, requeuing", subnet.Name)
+				c.recorder.Eventf(pod, v1.EventTypeWarning, "AcquireAddressFailed", err.Error())
+				klog.Error(err)
+				return nil, err
+			}
 			patch[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, podNet.ProviderName)] = subnet.Name
 			if pod.Annotations[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] == "" {
 				patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = c.config.PodNicType
 			}
-			// Defensive guard: the subnet may have switched during acquireAddress (multi-subnet
-			// static IP), so the actually allocated subnet may differ from podNet.Subnet. The
-			// tunnel key must still be resolved before recording it and proceeding to the CNI
-			// add (see the rationale above: a missing tunnel key makes Cilium VPC mode fall
-			// back to the non-VPC endpoint scheme and produces dirty data). If it is not ready,
-			// requeue and wait.
-			if c.tunnelKeyNotReady(subnet) {
-				err := fmt.Errorf("subnet %s tunnel key is not ready, waiting for pod %s/%s", subnet.Name, namespace, name)
-				klog.Info(err)
-				return nil, err
-			}
-			if c.config.EnableRecordTunnelKey {
+			// Record the tunnel key (VNI) so Cilium can recognize this as a VPC pod during CNI add.
+			if subnet.Status.TunnelKey != 0 {
 				patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = strconv.Itoa(subnet.Status.TunnelKey)
 			}
 		} else {

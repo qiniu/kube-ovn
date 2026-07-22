@@ -705,6 +705,28 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 		}
 	}
 
+	// Sync tunnel_key from OVN SB into subnet status before any path that can mark the subnet
+	// Ready. reconcileSubnet below sets Ready for centralized-gateway subnets, so the sync must
+	// run first to guarantee that Ready implies a non-zero TunnelKey. The SB Datapath_Binding that
+	// carries the tunnel key is created by northd once the NB logical switch exists, so this must
+	// run after CreateLogicalSwitch above.
+	//
+	// Trade-off: on a brand-new subnet's first reconcile, northd may not have created the
+	// Datapath_Binding yet, so syncSubnetTunnelKey fails and we requeue. DHCP/LB were already
+	// configured above (they don't depend on the tunnel key), so the only effect is that marking
+	// the subnet Ready is delayed by one requeue cycle. A new subnet has no pods yet, so there is
+	// no side effect on pod networking.
+	//
+	// Known limitation: if the Datapath_Binding never appears (a genuine NB/SB desync, which the
+	// mandatory-VNI invariant says should not happen), the subnet stays NotReady and requeues,
+	// logging the sync error each cycle. That per-cycle error log is the diagnosis signal.
+	if isOvnSubnet(subnet) && subnet.Status.TunnelKey == 0 {
+		if err := c.syncSubnetTunnelKey(subnet); err != nil {
+			klog.Errorf("failed to sync tunnel key for subnet %s: %v", subnet.Name, err)
+			return err
+		}
+	}
+
 	if err := c.reconcileSubnet(subnet); err != nil {
 		klog.Errorf("reconcile subnet for %s failed, %v", subnet.Name, err)
 		return err
@@ -771,15 +793,6 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 	for _, p := range ippools {
 		if p.Spec.Subnet == subnet.Name {
 			c.addOrUpdateIPPoolQueue.Add(p.Name)
-		}
-	}
-
-	// Sync tunnel_key from OVN SB to subnet status (only when enabled and not already set)
-	// OVN subnets must have tunnel_key; non-OVN subnets (e.g., underlay) skip this
-	if c.config.EnableRecordTunnelKey && isOvnSubnet(subnet) && subnet.Status.TunnelKey == 0 {
-		if err := c.syncSubnetTunnelKey(subnet); err != nil {
-			klog.Errorf("failed to sync tunnel key for subnet %s: %v", subnet.Name, err)
-			return err
 		}
 	}
 
@@ -3286,6 +3299,10 @@ func (c *Controller) syncSubnetTunnelKey(subnet *kubeovnv1.Subnet) error {
 		klog.Errorf("failed to patch tunnel key for subnet %s: %v", subnet.Name, err)
 		return err
 	}
+	// Keep the in-memory status consistent with the API so later status patches in the same
+	// reconcile (which serialize the whole status) stay consistent, and so correctness does not
+	// silently depend on the tunnelKey json omitempty tag.
+	subnet.Status.TunnelKey = tunnelKey
 	klog.Infof("synced tunnel key %d for subnet %s", tunnelKey, subnet.Name)
 	return nil
 }

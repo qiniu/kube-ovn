@@ -143,8 +143,10 @@ type SubnetStatus struct {
 	NatOutgoingPolicyRules []NatOutgoingPolicyRuleStatus `json:"natOutgoingPolicyRules"`
 	McastQuerierIP         string                        `json:"mcastQuerierIP"`
 	McastQuerierMAC        string                        `json:"mcastQuerierMAC"`
-	// TunnelKey is the OVN logical switch tunnel_key from Datapath_Binding.
-	// This is only populated when EnableRecordTunnelKey is enabled.
+	// TunnelKey is the OVN logical switch tunnel_key (VNI) read from the SB Datapath_Binding.
+	// It is synced for every OVN subnet before the subnet is marked Ready, and stays 0 for
+	// non-OVN subnets. The omitempty tag is required: patchSubnetStatus serializes the whole
+	// status, so without it a 0 value here would overwrite an already-synced tunnel_key.
 	TunnelKey int `json:"tunnelKey,omitempty"`
 }
 

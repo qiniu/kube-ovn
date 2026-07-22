@@ -8,6 +8,7 @@ import (
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -686,6 +687,96 @@ func newIPAMForTest(subnets []*kubeovnv1.Subnet) *ipam.IPAM {
 	return ipamInstance
 }
 
+// TestReconcileAllocateSubnets_gatedOnTunnelKey verifies the core behavior of this change: a pod
+// is not persisted with an IP from an OVN subnet whose tunnel key (VNI) has not been synced from
+// OVN SB yet; instead the allocation returns an error so the pod is requeued.
+func TestReconcileAllocateSubnets_gatedOnTunnelKey(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.LogicalSwitchAnnotation: "ovn-subnet",
+			},
+		},
+	}
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.1.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  util.OvnProvider,
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100, TunnelKey: 0},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:    []*kubeovnv1.Subnet{subnet},
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.ipam = newIPAMForTest([]*kubeovnv1.Subnet{subnet})
+
+	podNets, err := c.getPodKubeovnNets(pod)
+	require.NoError(t, err)
+	require.Greater(t, len(podNets), 0)
+
+	_, err = c.reconcileAllocateSubnets(pod, podNets)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "tunnel key not observed")
+}
+
+// TestReconcileAllocateSubnets_allowedWhenTunnelKeySynced is the happy-path counterpart of the gate
+// test: once the subnet tunnel key (VNI) is synced, allocation must proceed and record the tunnel_key
+// annotation on the pod. It guards against a regression that over-blocks allocation.
+func TestReconcileAllocateSubnets_allowedWhenTunnelKeySynced(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.LogicalSwitchAnnotation: "ovn-subnet",
+			},
+		},
+	}
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.1.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  util.OvnProvider,
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100, TunnelKey: 1234},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:    []*kubeovnv1.Subnet{subnet},
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.ipam = newIPAMForTest([]*kubeovnv1.Subnet{subnet})
+
+	// The only OVN NB call on the happy path is creating the logical switch port.
+	fc.mockOvnClient.EXPECT().CreateLogicalSwitchPort(
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+	).Return(nil)
+
+	podNets, err := c.getPodKubeovnNets(pod)
+	require.NoError(t, err)
+	require.Greater(t, len(podNets), 0)
+
+	allocated, err := c.reconcileAllocateSubnets(pod, podNets)
+	require.NoError(t, err)
+	require.NotNil(t, allocated)
+	tunnelKeyKey := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNets[0].ProviderName)
+	require.Equal(t, "1234", allocated.Annotations[tunnelKeyKey])
+}
+
 func TestGetNamedPortByNsReturnsCopy(t *testing.T) {
 	np := NewNamedPort()
 	pod := &corev1.Pod{
@@ -773,21 +864,18 @@ func TestTunnelKeyNotReady(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		enable   bool
 		subnet   *kubeovnv1.Subnet
 		expected bool
 	}{
-		{"recording disabled, key not ready", false, ovnSubnet(0), false},
-		{"recording disabled, key ready", false, ovnSubnet(5), false},
-		{"ovn subnet, tunnel key not ready", true, ovnSubnet(0), true},
-		{"ovn subnet, tunnel key ready", true, ovnSubnet(5), false},
-		{"non-ovn subnet is ignored", true, underlaySubnet, false},
-		{"nil subnet is nil-safe", true, nil, false},
+		{"ovn subnet, tunnel key not ready", ovnSubnet(0), true},
+		{"ovn subnet, tunnel key ready", ovnSubnet(5), false},
+		{"non-ovn subnet is ignored", underlaySubnet, false},
+		{"nil subnet is nil-safe", nil, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Controller{config: &Configuration{EnableRecordTunnelKey: tt.enable}}
+			c := &Controller{config: &Configuration{}}
 			assert.Equal(t, tt.expected, c.tunnelKeyNotReady(tt.subnet))
 		})
 	}
