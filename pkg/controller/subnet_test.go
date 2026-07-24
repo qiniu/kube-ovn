@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -662,6 +663,42 @@ func Test_handleAddOrUpdateSubnet_vlanValidationError(t *testing.T) {
 	err = ctrl.handleAddOrUpdateSubnet("test-underlay")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to validate vlan")
+}
+
+func Test_syncSubnetTunnelKey(t *testing.T) {
+	t.Parallel()
+
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-ovn-subnet"},
+		Spec:       kubeovnv1.SubnetSpec{CIDRBlock: "10.10.0.0/24", Gateway: "10.10.0.1"},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Subnets: []*kubeovnv1.Subnet{subnet},
+	})
+	require.NoError(t, err)
+	ctrl := fc.fakeController
+
+	t.Run("patches TunnelKey from OVN SB", func(t *testing.T) {
+		fc.mockOvnSbClient.EXPECT().GetLogicalSwitchTunnelKey("test-ovn-subnet").Return(99, nil)
+
+		err := ctrl.syncSubnetTunnelKey(subnet)
+		require.NoError(t, err)
+
+		updated, err := ctrl.config.KubeOvnClient.KubeovnV1().Subnets().Get(
+			context.Background(), "test-ovn-subnet", metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Equal(t, 99, updated.Status.TunnelKey)
+	})
+
+	t.Run("returns error when SB client fails", func(t *testing.T) {
+		fc.mockOvnSbClient.EXPECT().GetLogicalSwitchTunnelKey("test-ovn-subnet").
+			Return(0, errors.New("sb unavailable"))
+
+		err := ctrl.syncSubnetTunnelKey(subnet)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "sb unavailable")
+	})
 }
 
 func Test_isOvnSubnet(t *testing.T) {
