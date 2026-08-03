@@ -323,11 +323,15 @@ func (c *Controller) shouldDeleteMacvlanForMaster(master, excludeSubnet string) 
 // macvlan sub-interfaces for all macvlan-type subnets exist and are up on the node.
 //
 // The sub-interfaces are normally created once in response to subnet events. If an
-// interface is later lost (e.g. the master interface flaps, or the sub-interface is
-// deleted by an external actor), there is no event to trigger recreation, which
-// previously required a manual daemon pod restart to recover. This loop detects the
-// missing interface and recreates it automatically. When an interface is recreated,
-// its EIP routes are lost as well, so the affected EIP routes are re-synced.
+// interface is later lost or brought down (e.g. the master interface flaps, or the
+// sub-interface is deleted/set down by an external actor), there is no event to trigger
+// recovery, which previously required a manual daemon pod restart. This loop detects the
+// missing or down interface and restores it automatically.
+//
+// The kernel flushes an interface's SCOPE_LINK routes when the interface is deleted or
+// administratively set down (IFF_UP cleared). Both cases therefore require re-syncing the
+// EIP routes after the interface is restored. A pure carrier flap (master down/up) keeps
+// the sub-interface IFF_UP and its routes intact, so it does not need a route resync.
 //
 // TOCTOU note: this loop and the subnet delete worker both act on the shared informer
 // cache from separate goroutines. If a subnet's List() snapshot here is taken just
@@ -355,7 +359,7 @@ func (c *Controller) loopEnsureMacvlanSubInterfaces() {
 		}
 	}
 
-	recreated := false
+	needResync := false
 	for master := range masters {
 		macvlanName, err := util.GenMacvlanIfaceName(master)
 		if err != nil {
@@ -363,15 +367,19 @@ func (c *Controller) loopEnsureMacvlanSubInterfaces() {
 			continue
 		}
 
-		// Detect whether the sub-interface is missing before (re)creating it so we
-		// know whether EIP routes need to be restored afterwards.
-		missing := false
-		if _, err := netlink.LinkByName(macvlanName); err != nil {
+		// Detect whether the sub-interface's routes were flushed before restoring it, so
+		// we know whether EIP routes need to be re-synced afterwards. Routes are flushed
+		// when the interface is gone (recreated below) or administratively down (brought
+		// up below); a carrier flap keeps IFF_UP and its routes, so it is not counted.
+		routesFlushed := false
+		if link, err := netlink.LinkByName(macvlanName); err != nil {
 			if _, ok := err.(netlink.LinkNotFoundError); !ok {
 				klog.Errorf("failed to check macvlan sub-interface %s: %v", macvlanName, err)
 				continue
 			}
-			missing = true
+			routesFlushed = true // interface missing, will be recreated
+		} else if link.Attrs().Flags&net.FlagUp == 0 {
+			routesFlushed = true // interface administratively down, will be brought up
 		}
 
 		if err := c.createMacvlanSubInterface(master); err != nil {
@@ -379,14 +387,14 @@ func (c *Controller) loopEnsureMacvlanSubInterfaces() {
 			continue
 		}
 
-		if missing {
-			klog.Warningf("macvlan sub-interface %s was missing and has been recreated", macvlanName)
-			recreated = true
+		if routesFlushed {
+			klog.Warningf("macvlan sub-interface %s was missing or down and has been restored", macvlanName)
+			needResync = true
 		}
 	}
 
-	// A recreated interface starts with no routes, so restore the EIP routes.
-	if recreated {
+	// A restored interface has lost its routes, so re-add the EIP routes.
+	if needResync {
 		c.resyncLocalIptablesEipRoutes()
 	}
 }
