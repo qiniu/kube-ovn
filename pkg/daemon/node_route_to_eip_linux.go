@@ -194,7 +194,8 @@ func addEIPRoute(eip, macvlanSubIfName string) error {
 		return err
 	}
 
-	klog.Infof("added route for EIP %s via macvlan sub-interface %s", eip, macvlanSubIfName)
+	// V(3): RouteReplace is idempotent and re-applied on every keepalive cycle.
+	klog.V(3).Infof("added route for EIP %s via macvlan sub-interface %s", eip, macvlanSubIfName)
 	return nil
 }
 
@@ -320,18 +321,20 @@ func (c *Controller) shouldDeleteMacvlanForMaster(master, excludeSubnet string) 
 }
 
 // loopEnsureMacvlanSubInterfaces is a keepalive loop that periodically ensures the
-// macvlan sub-interfaces for all macvlan-type subnets exist and are up on the node.
+// macvlan sub-interfaces for all macvlan-type subnets exist and are up on the node, and
+// that their EIP routes are present.
 //
 // The sub-interfaces are normally created once in response to subnet events. If an
 // interface is later lost or brought down (e.g. the master interface flaps, or the
 // sub-interface is deleted/set down by an external actor), there is no event to trigger
-// recovery, which previously required a manual daemon pod restart. This loop detects the
-// missing or down interface and restores it automatically.
+// recovery, which previously required a manual daemon pod restart. This loop recreates
+// the interface (createMacvlanSubInterface also brings it back up) automatically.
 //
-// The kernel flushes an interface's SCOPE_LINK routes when the interface is deleted or
-// administratively set down (IFF_UP cleared). Both cases therefore require re-syncing the
-// EIP routes after the interface is restored. A pure carrier flap (master down/up) keeps
-// the sub-interface IFF_UP and its routes intact, so it does not need a route resync.
+// The kernel flushes an interface's SCOPE_LINK routes when it is deleted or set down, so
+// after ensuring the interfaces we unconditionally re-apply the EIP routes. RouteReplace
+// is idempotent, so refreshing every cycle is cheap and, unlike detecting the exact
+// down/up transition, has no polling blind spot: no matter how the interface flaps
+// between two polls, the next cycle restores its routes.
 //
 // TOCTOU note: this loop and the subnet delete worker both act on the shared informer
 // cache from separate goroutines. If a subnet's List() snapshot here is taken just
@@ -359,49 +362,23 @@ func (c *Controller) loopEnsureMacvlanSubInterfaces() {
 		}
 	}
 
-	needResync := false
+	if len(masters) == 0 {
+		return
+	}
+
 	for master := range masters {
-		macvlanName, err := util.GenMacvlanIfaceName(master)
-		if err != nil {
-			klog.Errorf("failed to generate macvlan name for master %s: %v", master, err)
-			continue
-		}
-
-		// Detect whether the sub-interface's routes were flushed before restoring it, so
-		// we know whether EIP routes need to be re-synced afterwards. Routes are flushed
-		// when the interface is gone (recreated below) or administratively down (brought
-		// up below); a carrier flap keeps IFF_UP and its routes, so it is not counted.
-		routesFlushed := false
-		if link, err := netlink.LinkByName(macvlanName); err != nil {
-			if _, ok := err.(netlink.LinkNotFoundError); !ok {
-				klog.Errorf("failed to check macvlan sub-interface %s: %v", macvlanName, err)
-				continue
-			}
-			routesFlushed = true // interface missing, will be recreated
-		} else if link.Attrs().Flags&net.FlagUp == 0 {
-			routesFlushed = true // interface administratively down, will be brought up
-		}
-
 		if err := c.createMacvlanSubInterface(master); err != nil {
 			klog.Errorf("failed to ensure macvlan sub-interface for master %s: %v", master, err)
-			continue
-		}
-
-		if routesFlushed {
-			klog.Warningf("macvlan sub-interface %s was missing or down and has been restored", macvlanName)
-			needResync = true
 		}
 	}
 
-	// A restored interface has lost its routes, so re-add the EIP routes.
-	if needResync {
-		c.resyncLocalIptablesEipRoutes()
-	}
+	// Idempotently re-apply EIP routes every cycle so they survive any interface flap.
+	c.resyncLocalIptablesEipRoutes()
 }
 
 // resyncLocalIptablesEipRoutes re-enqueues all ready IptablesEIPs so their routes are
 // re-added on the node. The EIP route worker is idempotent and only adds routes when the
-// NAT GW pod is on the local node, so this is safe to call unconditionally.
+// NAT GW pod is on the local node, so this is safe to call on every keepalive cycle.
 func (c *Controller) resyncLocalIptablesEipRoutes() {
 	eips, err := c.iptablesEipsLister.List(labels.Everything())
 	if err != nil {
@@ -417,7 +394,8 @@ func (c *Controller) resyncLocalIptablesEipRoutes() {
 		if info == nil {
 			continue
 		}
-		klog.Infof("re-enqueue iptables-eip %s to restore route after macvlan recreation", eip.Name)
+		// V(4): this runs every keepalive cycle, so keep it quiet on the steady state.
+		klog.V(4).Infof("re-enqueue iptables-eip %s to refresh its route", eip.Name)
 		c.iptablesEipQueue.Add(*info)
 	}
 }
@@ -639,7 +617,7 @@ func (c *Controller) processNextIptablesEipItem() bool {
 // syncIptablesEipRoute syncs the route for an IptablesEIP.
 // It adds the route if NAT GW pod is on this node, or deletes the route if not.
 func (c *Controller) syncIptablesEipRoute(info eipRouteInfo) error {
-	klog.Infof("syncing iptables-eip route for %s", info.eipName)
+	klog.V(3).Infof("syncing iptables-eip route for %s", info.eipName)
 
 	// Check if EIP was deleted - skip if it was to prevent race conditions
 	if _, deleted := c.deletedEIPs.Load(info.eipName); deleted {
