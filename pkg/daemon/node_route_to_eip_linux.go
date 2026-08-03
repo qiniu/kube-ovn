@@ -188,6 +188,10 @@ func addEIPRoute(eip, macvlanSubIfName string) error {
 		Scope:     netlink.SCOPE_LINK,
 	}
 
+	// Use RouteReplace (RTM_NEWROUTE with NLM_F_CREATE|NLM_F_REPLACE) rather than del+add:
+	// the kernel updates the FIB entry atomically, so an existing route is never removed
+	// mid-flight (no traffic gap) and a missing one is created. This makes it safe to
+	// re-apply idempotently on every keepalive cycle regardless of the current state.
 	if err := netlink.RouteReplace(route); err != nil {
 		err = fmt.Errorf("failed to add route for EIP %s via %s: %w", eip, macvlanSubIfName, err)
 		klog.Error(err)
