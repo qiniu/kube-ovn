@@ -29,8 +29,9 @@ package daemon
 //     - Delete: enqueueDeleteIptablesEip → iptablesEipDeleteQueue
 //       → runIptablesEipDeleteWorker() → handleDeleteIptablesEipRoute() → deleteEIPRoute()
 //
-//  3. NAT GW Pod event (pod update with VpcNatGatewayLabel):
-//     enqueueUpdatePod() → handleNatGwPodUpdate() → enqueueEipsForNatGw()
+//  3. NAT GW Pod event (pod with VpcNatGatewayLabel):
+//     - Update: enqueueUpdatePod() → handleNatGwPodUpdate() → enqueueEipsForNatGw()
+//     - Delete: enqueueDeletePod() → handleNatGwPodDelete() → enqueueEipsForNatGw()
 //     → syncIptablesEipRoute() → addEIPRoute() / deleteEIPRoute()
 //
 // Prerequisites:
@@ -380,9 +381,17 @@ func (c *Controller) loopEnsureMacvlanSubInterfaces() {
 	c.resyncLocalIptablesEipRoutes()
 }
 
-// resyncLocalIptablesEipRoutes re-enqueues all ready IptablesEIPs so their routes are
-// re-added on the node. The EIP route worker is idempotent and only adds routes when the
-// NAT GW pod is on the local node, so this is safe to call on every keepalive cycle.
+// resyncLocalIptablesEipRoutes re-enqueues all ready IptablesEIPs so the route worker can
+// converge each one on this node: syncIptablesEipRoute adds the route when the NAT GW pod
+// is local and deletes it otherwise.
+//
+// It deliberately processes every ready EIP, not just local ones. The pod informer here is
+// node-scoped and only has an update handler, so when a NAT GW pod is rescheduled to
+// another node the old node reliably gets neither a usable update (Case 1 of
+// handleNatGwPodUpdate cannot fire under a node-scoped informer) nor a delete event. This
+// periodic full pass is what removes the now-stale route on the node the pod moved away
+// from, and also self-heals after a daemon restart. Skipping non-local EIPs would leak
+// those routes.
 func (c *Controller) resyncLocalIptablesEipRoutes() {
 	eips, err := c.iptablesEipsLister.List(labels.Everything())
 	if err != nil {
@@ -399,7 +408,7 @@ func (c *Controller) resyncLocalIptablesEipRoutes() {
 			continue
 		}
 		// V(4): this runs every keepalive cycle, so keep it quiet on the steady state.
-		klog.V(4).Infof("re-enqueue iptables-eip %s to refresh its route", eip.Name)
+		klog.V(4).Infof("re-enqueue iptables-eip %s to sync its route", eip.Name)
 		c.iptablesEipQueue.Add(*info)
 	}
 }
@@ -746,4 +755,23 @@ func (c *Controller) handleNatGwPodUpdate(oldPod, newPod *corev1.Pod) {
 		klog.Infof("NAT GW pod %s no longer running on this node (phase: %s), enqueuing EIPs to delete routes", newPod.Name, newPod.Status.Phase)
 		c.enqueueEipsForNatGw(natGwName)
 	}
+}
+
+// handleNatGwPodDelete handles NAT GW pod delete events. The pod informer is node-scoped,
+// so a delete event only reaches the node the pod was running on, which is exactly where
+// its EIP routes become stale. Enqueue the gateway's EIPs so the route worker removes them
+// promptly instead of waiting for the periodic resync (the route worker deletes the routes
+// because the NAT GW pod is no longer local).
+func (c *Controller) handleNatGwPodDelete(pod *corev1.Pod) {
+	if !isVpcNatGwPod(pod) {
+		return
+	}
+
+	natGwName := getNatGwNameFromPod(pod)
+	if natGwName == "" {
+		return
+	}
+
+	klog.Infof("NAT GW pod %s deleted from this node, enqueuing EIPs to delete routes", pod.Name)
+	c.enqueueEipsForNatGw(natGwName)
 }
