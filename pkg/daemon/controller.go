@@ -223,6 +223,7 @@ func NewController(config *Configuration,
 
 	if _, err = podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: controller.enqueueUpdatePod,
+		DeleteFunc: controller.enqueueDeletePod,
 	}); err != nil {
 		return nil, err
 	}
@@ -808,6 +809,28 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 	}
 }
 
+func (c *Controller) enqueueDeletePod(obj any) {
+	if !c.config.EnableNodeLocalAccessVpcNatGwEIP {
+		return
+	}
+	var pod *v1.Pod
+	switch t := obj.(type) {
+	case *v1.Pod:
+		pod = t
+	case cache.DeletedFinalStateUnknown:
+		p, ok := t.Obj.(*v1.Pod)
+		if !ok {
+			klog.Warningf("unexpected object type in tombstone: %T", t.Obj)
+			return
+		}
+		pod = p
+	default:
+		klog.Warningf("unexpected type: %T", obj)
+		return
+	}
+	c.handleNatGwPodDelete(pod)
+}
+
 func (c *Controller) runUpdatePodWorker() {
 	for c.processNextUpdatePodWorkItem() {
 	}
@@ -1000,6 +1023,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 		go wait.Until(c.runMacvlanSubnetWorker, time.Second, stopCh)
 		go wait.Until(c.runIptablesEipWorker, time.Second, stopCh)
 		go wait.Until(c.runIptablesEipDeleteWorker, time.Second, stopCh)
+		go wait.Until(c.loopEnsureMacvlanSubInterfaces, 5*time.Second, stopCh)
 	}
 	go wait.Until(c.runGateway, 3*time.Second, stopCh)
 	go wait.Until(c.loopEncapIPCheck, 3*time.Second, stopCh)

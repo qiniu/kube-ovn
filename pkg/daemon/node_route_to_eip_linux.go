@@ -29,8 +29,9 @@ package daemon
 //     - Delete: enqueueDeleteIptablesEip → iptablesEipDeleteQueue
 //       → runIptablesEipDeleteWorker() → handleDeleteIptablesEipRoute() → deleteEIPRoute()
 //
-//  3. NAT GW Pod event (pod update with VpcNatGatewayLabel):
-//     enqueueUpdatePod() → handleNatGwPodUpdate() → enqueueEipsForNatGw()
+//  3. NAT GW Pod event (pod with VpcNatGatewayLabel):
+//     - Update: enqueueUpdatePod() → handleNatGwPodUpdate() → enqueueEipsForNatGw()
+//     - Delete: enqueueDeletePod() → handleNatGwPodDelete() → enqueueEipsForNatGw()
 //     → syncIptablesEipRoute() → addEIPRoute() / deleteEIPRoute()
 //
 // Prerequisites:
@@ -188,13 +189,18 @@ func addEIPRoute(eip, macvlanSubIfName string) error {
 		Scope:     netlink.SCOPE_LINK,
 	}
 
+	// Use RouteReplace (RTM_NEWROUTE with NLM_F_CREATE|NLM_F_REPLACE) rather than del+add:
+	// the kernel updates the FIB entry atomically, so an existing route is never removed
+	// mid-flight (no traffic gap) and a missing one is created. This makes it safe to
+	// re-apply idempotently on every keepalive cycle regardless of the current state.
 	if err := netlink.RouteReplace(route); err != nil {
 		err = fmt.Errorf("failed to add route for EIP %s via %s: %w", eip, macvlanSubIfName, err)
 		klog.Error(err)
 		return err
 	}
 
-	klog.Infof("added route for EIP %s via macvlan sub-interface %s", eip, macvlanSubIfName)
+	// V(3): RouteReplace is idempotent and re-applied on every keepalive cycle.
+	klog.V(3).Infof("added route for EIP %s via macvlan sub-interface %s", eip, macvlanSubIfName)
 	return nil
 }
 
@@ -317,6 +323,94 @@ func (c *Controller) shouldDeleteMacvlanForMaster(master, excludeSubnet string) 
 		}
 	}
 	return true
+}
+
+// loopEnsureMacvlanSubInterfaces is a keepalive loop that periodically ensures the
+// macvlan sub-interfaces for all macvlan-type subnets exist and are up on the node, and
+// that their EIP routes are present.
+//
+// The sub-interfaces are normally created once in response to subnet events. If an
+// interface is later lost or brought down (e.g. the master interface flaps, or the
+// sub-interface is deleted/set down by an external actor), there is no event to trigger
+// recovery, which previously required a manual daemon pod restart. This loop recreates
+// the interface (createMacvlanSubInterface also brings it back up) automatically.
+//
+// The kernel flushes an interface's SCOPE_LINK routes when it is deleted or set down, so
+// after ensuring the interfaces we unconditionally re-apply the EIP routes. RouteReplace
+// is idempotent, so refreshing every cycle is cheap and, unlike detecting the exact
+// down/up transition, has no polling blind spot: no matter how the interface flaps
+// between two polls, the next cycle restores its routes.
+//
+// TOCTOU note: this loop and the subnet delete worker both act on the shared informer
+// cache from separate goroutines. If a subnet's List() snapshot here is taken just
+// before the subnet deletion propagates, the delete worker may remove the interface in
+// between, and this loop then recreates it as an orphan (no subnet references its
+// master anymore, so nothing deletes it afterwards). The impact is bounded and benign:
+// a macvlan NAD/subnet is effectively a cluster singleton that is meant to persist, so
+// deletion (and thus this window) is extremely rare; an orphaned sub-interface carries
+// no IP and no routes, so it causes no network issues and only occurs when the feature
+// is being torn down anyway.
+func (c *Controller) loopEnsureMacvlanSubInterfaces() {
+	subnets, err := c.subnetsLister.List(labels.SelectorFromSet(labels.Set{
+		util.NadMacvlanTypeLabel: "true",
+	}))
+	if err != nil {
+		klog.Errorf("failed to list macvlan subnets: %v", err)
+		return
+	}
+
+	// Collect the set of unique master interfaces in use by macvlan subnets.
+	masters := make(map[string]struct{})
+	for _, subnet := range subnets {
+		if master := subnet.Annotations[util.NadMacvlanMasterAnnotation]; master != "" {
+			masters[master] = struct{}{}
+		}
+	}
+
+	if len(masters) == 0 {
+		return
+	}
+
+	for master := range masters {
+		if err := c.createMacvlanSubInterface(master); err != nil {
+			klog.Errorf("failed to ensure macvlan sub-interface for master %s: %v", master, err)
+		}
+	}
+
+	// Idempotently re-apply EIP routes every cycle so they survive any interface flap.
+	c.resyncLocalIptablesEipRoutes()
+}
+
+// resyncLocalIptablesEipRoutes re-enqueues all ready IptablesEIPs so the route worker can
+// converge each one on this node: syncIptablesEipRoute adds the route when the NAT GW pod
+// is local and deletes it otherwise.
+//
+// It deliberately processes every ready EIP, not just local ones. The pod informer here is
+// node-scoped and only has an update handler, so when a NAT GW pod is rescheduled to
+// another node the old node reliably gets neither a usable update (Case 1 of
+// handleNatGwPodUpdate cannot fire under a node-scoped informer) nor a delete event. This
+// periodic full pass is what removes the now-stale route on the node the pod moved away
+// from, and also self-heals after a daemon restart. Skipping non-local EIPs would leak
+// those routes.
+func (c *Controller) resyncLocalIptablesEipRoutes() {
+	eips, err := c.iptablesEipsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list iptables-eips for route resync: %v", err)
+		return
+	}
+
+	for _, eip := range eips {
+		if !shouldEnqueueIptablesEip(eip) {
+			continue
+		}
+		info := c.buildEipRouteInfo(eip)
+		if info == nil {
+			continue
+		}
+		// V(4): this runs every keepalive cycle, so keep it quiet on the steady state.
+		klog.V(4).Infof("re-enqueue iptables-eip %s to sync its route", eip.Name)
+		c.iptablesEipQueue.Add(*info)
+	}
 }
 
 // hasNatGwPodOnLocalNode checks if the NAT GW pod for the given NatGwDp is scheduled on the local node.
@@ -536,7 +630,7 @@ func (c *Controller) processNextIptablesEipItem() bool {
 // syncIptablesEipRoute syncs the route for an IptablesEIP.
 // It adds the route if NAT GW pod is on this node, or deletes the route if not.
 func (c *Controller) syncIptablesEipRoute(info eipRouteInfo) error {
-	klog.Infof("syncing iptables-eip route for %s", info.eipName)
+	klog.V(3).Infof("syncing iptables-eip route for %s", info.eipName)
 
 	// Check if EIP was deleted - skip if it was to prevent race conditions
 	if _, deleted := c.deletedEIPs.Load(info.eipName); deleted {
@@ -661,4 +755,23 @@ func (c *Controller) handleNatGwPodUpdate(oldPod, newPod *corev1.Pod) {
 		klog.Infof("NAT GW pod %s no longer running on this node (phase: %s), enqueuing EIPs to delete routes", newPod.Name, newPod.Status.Phase)
 		c.enqueueEipsForNatGw(natGwName)
 	}
+}
+
+// handleNatGwPodDelete handles NAT GW pod delete events. The pod informer is node-scoped,
+// so a delete event only reaches the node the pod was running on, which is exactly where
+// its EIP routes become stale. Enqueue the gateway's EIPs so the route worker removes them
+// promptly instead of waiting for the periodic resync (the route worker deletes the routes
+// because the NAT GW pod is no longer local).
+func (c *Controller) handleNatGwPodDelete(pod *corev1.Pod) {
+	if !isVpcNatGwPod(pod) {
+		return
+	}
+
+	natGwName := getNatGwNameFromPod(pod)
+	if natGwName == "" {
+		return
+	}
+
+	klog.Infof("NAT GW pod %s deleted from this node, enqueuing EIPs to delete routes", pod.Name)
+	c.enqueueEipsForNatGw(natGwName)
 }

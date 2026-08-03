@@ -7,8 +7,10 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -290,5 +292,141 @@ func TestDeletedEIPsStateManagement(t *testing.T) {
 		_, exists2 := c.deletedEIPs.Load("eip-2")
 		assert.False(t, exists1, "eip-1 should be cleared")
 		assert.True(t, exists2, "eip-2 should still be marked")
+	})
+}
+
+func TestResyncLocalIptablesEipRoutes(t *testing.T) {
+	const master = "eth0"
+	macvlanName, err := util.GenMacvlanIfaceName(master)
+	require.NoError(t, err)
+
+	newEIP := func(name, v4ip, externalSubnet string, ready bool) *kubeovnv1.IptablesEIP {
+		return &kubeovnv1.IptablesEIP{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: kubeovnv1.IptablesEIPSpec{
+				V4ip:           v4ip,
+				ExternalSubnet: externalSubnet,
+			},
+			Status: kubeovnv1.IptablesEIPStatus{Ready: ready},
+		}
+	}
+
+	// subnetWithMaster resolves buildEipRouteInfo; subnetNoMaster makes it return nil.
+	subnetWithMaster := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "ext-subnet",
+			Annotations: map[string]string{util.NadMacvlanMasterAnnotation: master},
+		},
+	}
+	subnetNoMaster := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-subnet-no-master"},
+	}
+
+	eips := []*kubeovnv1.IptablesEIP{
+		newEIP("eip-ready", "1.1.1.1", "ext-subnet", true),                      // enqueued
+		newEIP("eip-not-ready", "1.1.1.2", "ext-subnet", false),                 // skip: not ready
+		newEIP("eip-no-external-subnet", "1.1.1.3", "", true),                   // skip: no ExternalSubnet
+		newEIP("eip-no-v4ip", "", "ext-subnet", true),                           // skip: buildEipRouteInfo nil
+		newEIP("eip-subnet-no-master", "1.1.1.4", "ext-subnet-no-master", true), // skip: no master
+		newEIP("eip-subnet-missing", "1.1.1.5", "nonexistent", true),            // skip: subnet not found
+	}
+
+	subnetIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, subnetIndexer.Add(subnetWithMaster))
+	require.NoError(t, subnetIndexer.Add(subnetNoMaster))
+
+	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, eip := range eips {
+		require.NoError(t, eipIndexer.Add(eip))
+	}
+
+	c := &Controller{
+		subnetsLister:      kubeovnlister.NewSubnetLister(subnetIndexer),
+		iptablesEipsLister: kubeovnlister.NewIptablesEIPLister(eipIndexer),
+		iptablesEipQueue:   newTypedRateLimitingQueue[eipRouteInfo]("test-iptables-eip", nil),
+	}
+	defer c.iptablesEipQueue.ShutDown()
+
+	c.resyncLocalIptablesEipRoutes()
+
+	// Only the ready EIP backed by a subnet with a macvlan master should be enqueued;
+	// the route worker (not exercised here) later decides add vs delete by NAT GW locality.
+	require.Equal(t, 1, c.iptablesEipQueue.Len())
+	item, _ := c.iptablesEipQueue.Get()
+	assert.Equal(t, "eip-ready", item.eipName)
+	assert.Equal(t, "1.1.1.1", item.v4ip)
+	assert.Equal(t, macvlanName, item.macvlanName)
+}
+
+func TestHandleNatGwPodDelete(t *testing.T) {
+	const (
+		master    = "eth0"
+		natGwName = "gw1"
+	)
+	macvlanName, err := util.GenMacvlanIfaceName(master)
+	require.NoError(t, err)
+
+	subnetWithMaster := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "ext-subnet",
+			Annotations: map[string]string{util.NadMacvlanMasterAnnotation: master},
+		},
+	}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "eip-1",
+			Labels: map[string]string{util.VpcNatGatewayNameLabel: natGwName},
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			V4ip:           "1.1.1.1",
+			ExternalSubnet: "ext-subnet",
+			NatGwDp:        natGwName,
+		},
+		Status: kubeovnv1.IptablesEIPStatus{Ready: true},
+	}
+
+	subnetIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, subnetIndexer.Add(subnetWithMaster))
+	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, eipIndexer.Add(eip))
+
+	newController := func() *Controller {
+		return &Controller{
+			subnetsLister:      kubeovnlister.NewSubnetLister(subnetIndexer),
+			iptablesEipsLister: kubeovnlister.NewIptablesEIPLister(eipIndexer),
+			iptablesEipQueue:   newTypedRateLimitingQueue[eipRouteInfo]("test-natgw-delete", nil),
+		}
+	}
+
+	t.Run("nat gw pod delete enqueues its eips", func(t *testing.T) {
+		c := newController()
+		defer c.iptablesEipQueue.ShutDown()
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: util.GenNatGwPodName(natGwName),
+				Labels: map[string]string{
+					util.VpcNatGatewayLabel:     "true",
+					util.VpcNatGatewayNameLabel: natGwName,
+				},
+			},
+		}
+		c.handleNatGwPodDelete(pod)
+
+		require.Equal(t, 1, c.iptablesEipQueue.Len())
+		item, _ := c.iptablesEipQueue.Get()
+		assert.Equal(t, "eip-1", item.eipName)
+		assert.Equal(t, "1.1.1.1", item.v4ip)
+		assert.Equal(t, macvlanName, item.macvlanName)
+	})
+
+	t.Run("non nat gw pod is ignored", func(t *testing.T) {
+		c := newController()
+		defer c.iptablesEipQueue.ShutDown()
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "some-pod", Labels: map[string]string{"app": "test"}},
+		}
+		c.handleNatGwPodDelete(pod)
+
+		assert.Equal(t, 0, c.iptablesEipQueue.Len())
 	})
 }
