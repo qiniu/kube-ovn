@@ -319,6 +319,101 @@ func (c *Controller) shouldDeleteMacvlanForMaster(master, excludeSubnet string) 
 	return true
 }
 
+// loopEnsureMacvlanSubInterfaces is a keepalive loop that periodically ensures the
+// macvlan sub-interfaces for all macvlan-type subnets exist and are up on the node.
+//
+// The sub-interfaces are normally created once in response to subnet events. If an
+// interface is later lost (e.g. the master interface flaps, or the sub-interface is
+// deleted by an external actor), there is no event to trigger recreation, which
+// previously required a manual daemon pod restart to recover. This loop detects the
+// missing interface and recreates it automatically. When an interface is recreated,
+// its EIP routes are lost as well, so the affected EIP routes are re-synced.
+//
+// TOCTOU note: this loop and the subnet delete worker both act on the shared informer
+// cache from separate goroutines. If a subnet's List() snapshot here is taken just
+// before the subnet deletion propagates, the delete worker may remove the interface in
+// between, and this loop then recreates it as an orphan (no subnet references its
+// master anymore, so nothing deletes it afterwards). The impact is bounded and benign:
+// a macvlan NAD/subnet is effectively a cluster singleton that is meant to persist, so
+// deletion (and thus this window) is extremely rare; an orphaned sub-interface carries
+// no IP and no routes, so it causes no network issues and only occurs when the feature
+// is being torn down anyway.
+func (c *Controller) loopEnsureMacvlanSubInterfaces() {
+	subnets, err := c.subnetsLister.List(labels.SelectorFromSet(labels.Set{
+		util.NadMacvlanTypeLabel: "true",
+	}))
+	if err != nil {
+		klog.Errorf("failed to list macvlan subnets: %v", err)
+		return
+	}
+
+	// Collect the set of unique master interfaces in use by macvlan subnets.
+	masters := make(map[string]struct{})
+	for _, subnet := range subnets {
+		if master := subnet.Annotations[util.NadMacvlanMasterAnnotation]; master != "" {
+			masters[master] = struct{}{}
+		}
+	}
+
+	recreated := false
+	for master := range masters {
+		macvlanName, err := util.GenMacvlanIfaceName(master)
+		if err != nil {
+			klog.Errorf("failed to generate macvlan name for master %s: %v", master, err)
+			continue
+		}
+
+		// Detect whether the sub-interface is missing before (re)creating it so we
+		// know whether EIP routes need to be restored afterwards.
+		missing := false
+		if _, err := netlink.LinkByName(macvlanName); err != nil {
+			if _, ok := err.(netlink.LinkNotFoundError); !ok {
+				klog.Errorf("failed to check macvlan sub-interface %s: %v", macvlanName, err)
+				continue
+			}
+			missing = true
+		}
+
+		if err := c.createMacvlanSubInterface(master); err != nil {
+			klog.Errorf("failed to ensure macvlan sub-interface for master %s: %v", master, err)
+			continue
+		}
+
+		if missing {
+			klog.Warningf("macvlan sub-interface %s was missing and has been recreated", macvlanName)
+			recreated = true
+		}
+	}
+
+	// A recreated interface starts with no routes, so restore the EIP routes.
+	if recreated {
+		c.resyncLocalIptablesEipRoutes()
+	}
+}
+
+// resyncLocalIptablesEipRoutes re-enqueues all ready IptablesEIPs so their routes are
+// re-added on the node. The EIP route worker is idempotent and only adds routes when the
+// NAT GW pod is on the local node, so this is safe to call unconditionally.
+func (c *Controller) resyncLocalIptablesEipRoutes() {
+	eips, err := c.iptablesEipsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list iptables-eips for route resync: %v", err)
+		return
+	}
+
+	for _, eip := range eips {
+		if !shouldEnqueueIptablesEip(eip) {
+			continue
+		}
+		info := c.buildEipRouteInfo(eip)
+		if info == nil {
+			continue
+		}
+		klog.Infof("re-enqueue iptables-eip %s to restore route after macvlan recreation", eip.Name)
+		c.iptablesEipQueue.Add(*info)
+	}
+}
+
 // hasNatGwPodOnLocalNode checks if the NAT GW pod for the given NatGwDp is scheduled on the local node.
 // NAT GW pod name is generated from NatGwDp field using the pattern: vpc-nat-gw-{natGwDp}-0
 // Note: This only checks NodeName, not pod phase. The caller should check EIP Ready status

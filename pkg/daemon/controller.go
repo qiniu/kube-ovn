@@ -1000,6 +1000,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 		go wait.Until(c.runMacvlanSubnetWorker, time.Second, stopCh)
 		go wait.Until(c.runIptablesEipWorker, time.Second, stopCh)
 		go wait.Until(c.runIptablesEipDeleteWorker, time.Second, stopCh)
+		go wait.Until(c.loopEnsureMacvlanSubInterfaces, 5*time.Second, stopCh)
 	}
 	go wait.Until(c.runGateway, 3*time.Second, stopCh)
 	go wait.Until(c.loopEncapIPCheck, 3*time.Second, stopCh)
