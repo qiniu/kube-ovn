@@ -588,8 +588,11 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 //     (enqueuePodTunnelKeyRepair); the repair worker patches them from
 //     subnet.Status.TunnelKey shortly after startup, retrying with backoff
 //     until the key becomes available (subnet reconcile may still be
-//     syncing it). A CNI ADD racing ahead of the repair is retried by the
-//     kubelet once the annotation is in place.
+//     syncing it). Note the CNI server only waits for allocated=true, so a
+//     CNI ADD for a legacy pod racing ahead of the repair proceeds without
+//     the annotation; if the ADD succeeds there is no kubelet retry, and the
+//     stale Cilium endpoint is corrected by the ordered cilium restart in the
+//     upgrade sequence below.
 //     Enqueue is not one-shot: the pod reconcile path (handleAddOrUpdatePod)
 //     and a post-start resync (resyncPodTunnelKey, bounded to the backfill
 //     window) also enqueue repairs, so a pod the startup sweep missed (e.g.
@@ -623,9 +626,10 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 //   - The upgrade sequence above is operator discipline, not enforced by code:
 //     restarting cilium before the backfill completes leaves already-created
 //     endpoints on the non-VPC scheme until the next cilium restart.
-//   - A CNI ADD racing the repair for a legacy pod relies on the kubelet
-//     retrying once the annotation lands; Cilium itself may keep the stale
-//     endpoint until restarted (see the upgrade sequence).
+//   - A CNI ADD racing the repair for a legacy pod is not closed by the CNI
+//     server (it only waits for allocated=true) nor by a kubelet retry when
+//     the ADD succeeds; the stale Cilium endpoint is corrected by the ordered
+//     cilium restart in the upgrade sequence above.
 //
 // tunnelKeyNotReady reports whether an IP must not be allocated from the given subnet yet
 // because its tunnel key (VNI) has not been synced from OVN SB (still 0).
