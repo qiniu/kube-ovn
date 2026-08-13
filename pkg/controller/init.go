@@ -441,13 +441,23 @@ func (c *Controller) InitIPAM() error {
 			continue
 		}
 
+		// Enqueue OVN pods missing the tunnel_key (VNI) annotation into the
+		// dedicated repair queue. Cilium (native-vpc mode) keys pod identities
+		// by this annotation; pods allocated before the subnet tunnel key was
+		// synced from OVN SB (or before this code existed) keep a missing
+		// annotation forever. The enqueue is annotation-driven
+		// (podProvidersMissingTunnelKey), so it runs before the network
+		// resolution below and cannot be skipped by a transient NAD/namespace
+		// resolution failure - no periodic resync is needed. The repair handler
+		// retries until the subnet key becomes available, so pods are enqueued
+		// even if it is still 0.
+		c.enqueuePodTunnelKeyRepair(pod)
+
 		podNets, err := c.getPodKubeovnNets(pod)
 		if err != nil {
 			klog.Errorf("failed to get pod kubeovn nets %s.%s address %s: %v", pod.Name, pod.Namespace, pod.Annotations[util.IPAddressAnnotation], err)
-			// The pod is skipped for IPAM and for the tunnel_key repair sweep;
-			// observable via metricPodTunnelKeySkipped, healed by the periodic
-			// resync or the pod reconcile path once the network resolves.
-			metricPodTunnelKeySkipped.Inc()
+			// The pod is skipped for IPAM restoration only; its tunnel_key
+			// repair was already enqueued above.
 			continue
 		}
 
@@ -476,15 +486,6 @@ func (c *Controller) InitIPAM() error {
 				// Append ExternalIds is added in v1.7, used for upgrading from v1.6.3. It should be deleted now since v1.7 is not used anymore.
 			}
 		}
-
-		// Enqueue OVN pods missing the tunnel_key (VNI) annotation into the
-		// dedicated repair queue. Cilium (native-vpc mode) keys pod identities
-		// by this annotation; pods allocated before the subnet tunnel key was
-		// synced from OVN SB (or before this code existed) keep a missing
-		// annotation forever. Reuses the pod-level filtering (hostNetwork,
-		// alive) done above. The repair handler retries until the subnet key
-		// becomes available, so pods are enqueued even if it is still 0.
-		c.enqueuePodTunnelKeyRepair(pod, podNets)
 	}
 
 	klog.Infof("Init IPAM from vip CR")

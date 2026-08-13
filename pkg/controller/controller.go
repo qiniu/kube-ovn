@@ -99,12 +99,13 @@ type Controller struct {
 	// the subnet tunnel key was synced (or before this code existed) keep a
 	// missing annotation forever because the allocation path never re-patches
 	// already-allocated pods. The queue is fed by the init flow on controller
-	// start (see enqueuePodTunnelKeyRepair, called from InitIPAM), keeping the
-	// repair out of the main pod reconcile path and out of the subnet
-	// reconcile path. Cilium (native-vpc mode) keys pod identities by this
-	// annotation, so the intended upgrade sequence is: restart
-	// kube-ovn-controller first (this queue backfills the annotations), then
-	// restart cilium, which picks them up.
+	// start and by the pod reconcile path (see enqueuePodTunnelKeyRepair),
+	// both annotation-driven so the enqueue cannot be skipped by a network
+	// resolution failure; the handler runs on dedicated workers, serialized
+	// with the pod reconcile path via podKeyMutex. Cilium (native-vpc mode)
+	// keys pod identities by this annotation, so the intended upgrade
+	// sequence is: restart kube-ovn-controller first (this queue backfills
+	// the annotations), then restart cilium, which picks them up.
 	repairTunnelKeyQueue   workqueue.TypedRateLimitingInterface[string]
 	deletingPodObjMap      *xsync.Map[string, *corev1.Pod]
 	deletingNodeObjMap     *xsync.Map[string, *corev1.Node]
@@ -564,10 +565,14 @@ func Run(ctx context.Context, config *Configuration) {
 		providerNetworksLister: providerNetworkInformer.Lister(),
 		providerNetworkSynced:  providerNetworkInformer.Informer().HasSynced,
 
-		podsLister:           podInformer.Lister(),
-		podsSynced:           podInformer.Informer().HasSynced,
-		addOrUpdatePodQueue:  newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil),
-		repairTunnelKeyQueue: newTypedRateLimitingQueue[string]("RepairTunnelKey", nil),
+		podsLister:          podInformer.Lister(),
+		podsSynced:          podInformer.Informer().HasSynced,
+		addOrUpdatePodQueue: newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil),
+		// Repair retries start at 1s instead of the default 5ms: a subnet
+		// whose tunnel key stays 0 makes the queued pods requeue in a tight
+		// loop, and a 5ms base would hammer the shared podKeyMutex buckets.
+		repairTunnelKeyQueue: newTypedRateLimitingQueue[string]("RepairTunnelKey",
+			workqueue.NewTypedItemExponentialFailureRateLimiter[string](time.Second, time.Minute)),
 		deletePodQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{
@@ -1466,11 +1471,6 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(func() {
 		c.resyncVpcNatConfig()
 	}, time.Second, ctx.Done())
-
-	// Periodic safety net for the tunnel_key guarantee: re-enqueues repairs
-	// for pods the InitIPAM startup sweep missed (see resyncPodTunnelKey).
-	// Single instance, bounded to the post-start backfill window.
-	go c.resyncPodTunnelKey(ctx)
 
 	if c.config.GCInterval != 0 {
 		go wait.Until(func() {

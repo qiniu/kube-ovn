@@ -20,15 +20,8 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-// readGauge/readCounter read a metric value without pulling the prometheus
-// testutil package (and its extra dependencies) into the test dependency tree.
-func readGauge(t *testing.T, g prometheus.Gauge) float64 {
-	t.Helper()
-	var m dto.Metric
-	require.NoError(t, g.Write(&m))
-	return m.GetGauge().GetValue()
-}
-
+// readCounter reads a metric value without pulling the prometheus testutil
+// package (and its extra dependencies) into the test dependency tree.
 func readCounter(t *testing.T, c prometheus.Counter) float64 {
 	t.Helper()
 	var m dto.Metric
@@ -1099,170 +1092,61 @@ func TestHandleRepairTunnelKeyMultiNIC(t *testing.T) {
 }
 
 func TestEnqueuePodTunnelKeyRepair(t *testing.T) {
-	ovnNet := func(tunnelKey int) []*kubeovnNet {
-		return []*kubeovnNet{{
-			Type:         providerTypeOriginal,
-			ProviderName: util.OvnProvider,
-			Subnet: &kubeovnv1.Subnet{
-				ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
-				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
-				Status:     kubeovnv1.SubnetStatus{TunnelKey: tunnelKey},
+	podWith := func(name string, annos map[string]string, phase corev1.PodPhase, hostNetwork, sts bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        name,
+				Namespace:   "default",
+				Annotations: annos,
 			},
-			IsDefault: true,
-		}}
+			Spec:   corev1.PodSpec{HostNetwork: hostNetwork},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+		if sts {
+			p.OwnerReferences = []metav1.OwnerReference{{
+				Kind:       util.KindStatefulSet,
+				Name:       "sts",
+				APIVersion: appsv1.SchemeGroupVersion.String(),
+			}}
+		}
+		return p
 	}
-
-	missing := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "missing",
-			Namespace: "default",
-			Annotations: map[string]string{
-				util.AllocatedAnnotation: "true",
-			},
-		},
-	}
-	has := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "has",
-			Namespace: "default",
-			Annotations: map[string]string{
-				util.AllocatedAnnotation: "true",
-				util.TunnelKeyAnnotation: "1234",
-			},
-		},
-	}
-	notAllocated := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "not-allocated",
-			Namespace: "default",
-		},
+	ovnAnnotations := func(extra map[string]string) map[string]string {
+		annos := map[string]string{
+			util.AllocatedAnnotation:     "true",
+			util.LogicalSwitchAnnotation: "ovn-subnet",
+		}
+		for k, v := range extra {
+			annos[k] = v
+		}
+		return annos
 	}
 
 	fc, err := newFakeControllerWithOptions(t, nil)
 	require.NoError(t, err)
 	c := fc.fakeController
 
-	// Only the allocated OVN pod missing the annotation must be enqueued.
-	c.enqueuePodTunnelKeyRepair(missing, ovnNet(1234))
-	c.enqueuePodTunnelKeyRepair(has, ovnNet(1234))
-	c.enqueuePodTunnelKeyRepair(notAllocated, ovnNet(1234))
+	// allocated OVN pod missing tunnel_key: must be enqueued
+	c.enqueuePodTunnelKeyRepair(podWith("missing", ovnAnnotations(nil), corev1.PodRunning, false, false))
+	// already annotated: must not be enqueued
+	c.enqueuePodTunnelKeyRepair(podWith("has", ovnAnnotations(map[string]string{util.TunnelKeyAnnotation: "1234"}), corev1.PodRunning, false, false))
+	// not allocated: must not be enqueued
+	c.enqueuePodTunnelKeyRepair(podWith("not-allocated", map[string]string{util.LogicalSwitchAnnotation: "ovn-subnet"}, corev1.PodRunning, false, false))
+	// non-OVN NIC (allocated but no logical_switch): must not be enqueued
+	c.enqueuePodTunnelKeyRepair(podWith("non-ovn", map[string]string{util.AllocatedAnnotation: "true"}, corev1.PodRunning, false, false))
+	// hostNetwork: must not be enqueued
+	c.enqueuePodTunnelKeyRepair(podWith("host-network", ovnAnnotations(nil), corev1.PodRunning, true, false))
+	// terminated non-STS pod: must not be enqueued
+	c.enqueuePodTunnelKeyRepair(podWith("dead", ovnAnnotations(nil), corev1.PodSucceeded, false, false))
+	// non-alive StatefulSet pod: must be enqueued (matches InitIPAM's filter)
+	c.enqueuePodTunnelKeyRepair(podWith("sts-0", ovnAnnotations(nil), corev1.PodSucceeded, false, true))
 
-	require.Equal(t, 1, c.repairTunnelKeyQueue.Len(), "only the pod missing tunnel_key must be enqueued")
-	key, _ := c.repairTunnelKeyQueue.Get()
-	c.repairTunnelKeyQueue.Done(key)
-	require.Equal(t, "default/missing", key)
-
-	// A pod whose subnet key is still 0 at init time must be enqueued too:
-	// the repair handler requeues with backoff until the key is synced by the
-	// subnet worker, so the init-before-subnet-sync ordering does not lose it.
-	c.enqueuePodTunnelKeyRepair(missing, ovnNet(0))
-	require.Equal(t, 1, c.repairTunnelKeyQueue.Len(), "enqueue must be independent of the subnet key state")
-
-	// A non-alive StatefulSet pod must still be enqueued (it holds its
-	// allocated IP and will be re-scheduled), matching InitIPAM's filter;
-	// a non-alive regular pod must not.
-	stsPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "sts-0",
-			Namespace: "default",
-			Annotations: map[string]string{
-				util.AllocatedAnnotation: "true",
-			},
-			OwnerReferences: []metav1.OwnerReference{{
-				Kind:       util.KindStatefulSet,
-				Name:       "sts",
-				APIVersion: appsv1.SchemeGroupVersion.String(),
-			}},
-		},
-		Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodSucceeded,
-		},
-	}
-	c.enqueuePodTunnelKeyRepair(stsPod, ovnNet(1234))
-	c.enqueuePodTunnelKeyRepair(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "dead",
-			Namespace: "default",
-			Annotations: map[string]string{
-				util.AllocatedAnnotation: "true",
-			},
-		},
-		Spec:   corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
-		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
-	}, ovnNet(1234))
-	require.Equal(t, 2, c.repairTunnelKeyQueue.Len(), "non-alive STS pod must be enqueued, non-alive regular pod must not")
-	for range 2 {
-		key, _ := c.repairTunnelKeyQueue.Get()
-		c.repairTunnelKeyQueue.Done(key)
-	}
-}
-
-func TestResyncPodTunnelKeyOnce(t *testing.T) {
-	subnet := &kubeovnv1.Subnet{
-		ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
-		Spec: kubeovnv1.SubnetSpec{
-			CIDRBlock: "10.0.1.0/24",
-			Protocol:  kubeovnv1.ProtocolIPv4,
-			Provider:  util.OvnProvider,
-		},
-		Status: kubeovnv1.SubnetStatus{TunnelKey: 1234},
-	}
-	podWith := func(name string, annos map[string]string, phase corev1.PodPhase, hostNetwork bool) *corev1.Pod {
-		if annos == nil {
-			annos = map[string]string{}
-		}
-		annos[util.LogicalSwitchAnnotation] = subnet.Name
-		annos[util.AllocatedAnnotation] = "true"
-		return &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        name,
-				Namespace:   "default",
-				Annotations: annos,
-			},
-			Spec: corev1.PodSpec{HostNetwork: hostNetwork},
-			Status: corev1.PodStatus{
-				Phase: phase,
-			},
-		}
-	}
-
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
-		Subnets:    []*kubeovnv1.Subnet{subnet},
-		Pods: []*corev1.Pod{
-			// allocated, missing tunnel_key: must be enqueued
-			podWith("needs-repair", nil, corev1.PodRunning, false),
-			// allocated, already annotated: must be skipped
-			podWith("has-key", map[string]string{util.TunnelKeyAnnotation: "1234"}, corev1.PodRunning, false),
-			// hostNetwork: must be skipped
-			podWith("host-network", nil, corev1.PodRunning, true),
-			// terminated: must be skipped
-			podWith("terminated", nil, corev1.PodSucceeded, false),
-			// non-alive StatefulSet pod: must be enqueued (matches InitIPAM)
-			func() *corev1.Pod {
-				p := podWith("sts-0", nil, corev1.PodSucceeded, false)
-				p.OwnerReferences = []metav1.OwnerReference{{
-					Kind:       util.KindStatefulSet,
-					Name:       "sts",
-					APIVersion: appsv1.SchemeGroupVersion.String(),
-				}}
-				return p
-			}(),
-		},
-	})
-	require.NoError(t, err)
-	c := fc.fakeController
-
-	metricPodTunnelKeyMissing.Set(0)
-	require.NoError(t, c.resyncPodTunnelKeyOnce())
-	require.Equal(t, float64(2), readGauge(t, metricPodTunnelKeyMissing), "gauge must report the two pods missing tunnel_key")
-	require.Equal(t, 2, c.repairTunnelKeyQueue.Len(), "only the allocated OVN pods missing tunnel_key must be enqueued")
+	require.Equal(t, 2, c.repairTunnelKeyQueue.Len(), "only allocated OVN pods missing tunnel_key must be enqueued")
 	keys := []string{}
 	for range c.repairTunnelKeyQueue.Len() {
 		key, _ := c.repairTunnelKeyQueue.Get()
 		c.repairTunnelKeyQueue.Done(key)
 		keys = append(keys, key)
 	}
-	require.ElementsMatch(t, []string{"default/needs-repair", "default/sts-0"}, keys)
+	require.ElementsMatch(t, []string{"default/missing", "default/sts-0"}, keys)
 }

@@ -42,12 +42,11 @@ flow 2 repairs.
   retrying with unbounded backoff until the key becomes available (subnet
   reconcile may still be syncing it).
 
-Enqueue is not one-shot: the pod reconcile path (`handleAddOrUpdatePod`)
-and a post-start resync (`resyncPodTunnelKey`, bounded to a backfill
-window of `tunnelKeyResyncWindow`) also enqueue repairs, so a pod the
-startup sweep missed (e.g. its NAD or default subnet could not be resolved
-at that moment) heals on the next pod update event, or on a resync tick
-within the window, instead of requiring another controller restart.
+Enqueue is not one-shot: the enqueue is annotation-driven
+(`podProvidersMissingTunnelKey`), so the startup sweep cannot skip a pod
+because its NAD or default subnet could not be resolved at that moment; the
+pod reconcile path (`handleAddOrUpdatePod`) re-enqueues on any later update
+event.
 
 Repair is multi-NIC aware and driven purely by the per-provider annotations
 the allocation wrote (`allocated` + `logical_switch`): every OVN subnet has
@@ -75,10 +74,12 @@ corrected by the ordered cilium restart.
 
 ## Known gaps (documented, not closed by code)
 
-- Repair progress is observable via `pod_tunnel_key_missing` (gap size at
-  the last resync during the post-start backfill window),
-  `pod_tunnel_key_repair_total` and `pod_tunnel_key_repair_skipped_total`
-  (see pkg/controller/tunnel_key_metrics.go).
+- Repair progress is observable via `pod_tunnel_key_repair_patch_total`
+  (annotation patches that wrote one or more tunnel_key annotations; a
+  multi-NIC pod can be patched more than once) and
+  `pod_tunnel_key_repair_skipped_total` (repairs skipped because the
+  logical_switch subnet no longer exists) - see
+  pkg/controller/tunnel_key_metrics.go.
 - Repair keying is per `podNet.ProviderName` (the `*.kubernetes.io/*`
   annotation templates). Cilium currently only recognizes the primary NIC
   (default provider, `ovn.kubernetes.io/*` annotations), so a mismatch on
