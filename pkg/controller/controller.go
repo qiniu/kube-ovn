@@ -1469,7 +1469,7 @@ func (c *Controller) startWorkers(ctx context.Context) {
 
 	// Periodic safety net for the tunnel_key guarantee: re-enqueues repairs
 	// for pods the InitIPAM startup sweep missed (see resyncPodTunnelKey).
-	// Single instance: the full-pod scan must not be multiplied by WorkerNum.
+	// Single instance, bounded to the post-start backfill window.
 	go c.resyncPodTunnelKey(ctx)
 
 	if c.config.GCInterval != 0 {

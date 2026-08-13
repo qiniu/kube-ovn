@@ -8,12 +8,12 @@ import (
 var (
 	// metricPodTunnelKeyMissing is the current number of allocated OVN pods
 	// missing the tunnel_key (VNI) annotation, as measured by the periodic
-	// resync (resyncPodTunnelKeyOnce). A non-zero value means Cilium would
-	// fall back to the non-VPC endpoint scheme for those pods until the repair
-	// worker patches them.
+	// resync (resyncPodTunnelKeyOnce) during the post-start backfill window.
+	// A non-zero value means Cilium would fall back to the non-VPC endpoint
+	// scheme for those pods until the repair worker patches them.
 	metricPodTunnelKeyMissing = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "pod_tunnel_key_missing",
-		Help: "Number of allocated OVN pods missing the tunnel_key (VNI) annotation, measured by the periodic tunnel_key resync.",
+		Help: "Number of allocated OVN pods missing the tunnel_key (VNI) annotation, measured by the periodic tunnel_key resync during the post-start backfill window.",
 	})
 
 	// metricPodTunnelKeyRepaired counts successful tunnel_key annotation

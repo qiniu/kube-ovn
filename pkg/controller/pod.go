@@ -591,9 +591,10 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 //     syncing it). A CNI ADD racing ahead of the repair is retried by the
 //     kubelet once the annotation is in place.
 //     Enqueue is not one-shot: the pod reconcile path (handleAddOrUpdatePod)
-//     and a periodic resync (resyncPodTunnelKey) also enqueue repairs, so a
-//     pod the startup sweep missed (e.g. its NAD or default subnet could not
-//     be resolved at that moment) heals on the next pod update or resync tick
+//     and a post-start resync (resyncPodTunnelKey, bounded to the backfill
+//     window) also enqueue repairs, so a pod the startup sweep missed (e.g.
+//     its NAD or default subnet could not be resolved at that moment) heals on
+//     the next pod update event, or on a resync tick within the window,
 //     instead of requiring another controller restart.
 //
 // Intended upgrade sequence: restart kube-ovn-controller first (this flow
@@ -611,8 +612,9 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 //
 // Known gaps (documented, not closed by code):
 //   - Repair progress is observable via pod_tunnel_key_missing (gap size at
-//     the last resync), pod_tunnel_key_repair_total and
-//     pod_tunnel_key_repair_skipped_total (see tunnel_key_metrics.go).
+//     the last resync during the post-start backfill window),
+//     pod_tunnel_key_repair_total and pod_tunnel_key_repair_skipped_total
+//     (see tunnel_key_metrics.go).
 //   - Repair keying is by podNet.ProviderName (AllocatedAnnotationTemplate /
 //     TunnelKeyAnnotationTemplate). Cilium currently only recognizes the
 //     primary NIC (default provider, ovn.kubernetes.io/* annotations), so a
@@ -751,12 +753,18 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 }
 
 // tunnelKeyResyncInterval is how often resyncPodTunnelKey re-scans all pods
-// for missing tunnel_key annotations. The startup sweep (InitIPAM) can miss a
-// pod when its network cannot be resolved at that moment (e.g. the NAD or the
-// default subnet is not yet available); the periodic resync heals those pods
-// without requiring a controller restart, and also covers pods that lose the
-// annotation at runtime.
-const tunnelKeyResyncInterval = 5 * time.Minute
+// for missing tunnel_key annotations during the post-start backfill window.
+const tunnelKeyResyncInterval = time.Minute
+
+// tunnelKeyResyncWindow bounds the periodic resync to the backfill phase right
+// after controller start. New pods cannot reach the missing-annotation state
+// (flow 1: allocation gate + atomic patch + CNI wait) and nothing removes the
+// annotation at runtime, so once the legacy-pod backfill settles there is
+// nothing left to scan for; the pod reconcile path (handleAddOrUpdatePod)
+// keeps repairing stragglers on their next update event. The cap also stops
+// the scan when a subnet tunnel key stays 0 and the repair queue keeps
+// retrying the same pods.
+const tunnelKeyResyncWindow = 10 * time.Minute
 
 // resyncPodTunnelKeyOnce is one tick of the periodic tunnel_key resync: it
 // lists all pods and enqueues the ones missing the annotation. The enqueue and
@@ -797,16 +805,24 @@ func (c *Controller) resyncPodTunnelKeyOnce() error {
 	return nil
 }
 
-// resyncPodTunnelKey periodically re-scans all pods and enqueues tunnel_key
-// repairs for any that are missing the annotation (see the Guarantee comment
-// on tunnelKeyNotReady). Started alongside the workers so the repair queue
-// keeps closing the gap even for pods the InitIPAM sweep missed.
+// resyncPodTunnelKey re-scans all pods and enqueues tunnel_key repairs for any
+// that are missing the annotation (see the Guarantee comment on
+// tunnelKeyNotReady), for a bounded window after controller start. Started
+// alongside the workers so the repair queue closes the gap even for pods the
+// InitIPAM sweep missed (e.g. their network was not resolvable at that
+// moment); it exits once the window expires so the full-pod scan does not run
+// forever.
 func (c *Controller) resyncPodTunnelKey(ctx context.Context) {
 	ticker := time.NewTicker(tunnelKeyResyncInterval)
 	defer ticker.Stop()
+	window := time.NewTimer(tunnelKeyResyncWindow)
+	defer window.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-window.C:
+			klog.Info("tunnel_key resync window expired, stopping periodic scans")
 			return
 		case <-ticker.C:
 			if err := c.resyncPodTunnelKeyOnce(); err != nil {
