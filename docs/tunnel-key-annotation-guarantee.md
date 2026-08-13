@@ -53,11 +53,16 @@ Repair is multi-NIC aware and driven purely by the per-provider annotations
 the allocation wrote (`allocated` + `logical_switch`): every OVN subnet has
 its own `tunnel_key` annotation. A provider is repaired only if it is
 marked allocated and its `logical_switch` annotation resolves to an OVN
-subnet; the subnet is never guessed from namespace/default fallbacks,
-because writing a wrong VNI is worse than a missing one (nothing would
-correct it afterwards). Progress is not all-or-nothing: ready providers are
-patched in one call even when another provider's subnet key is still 0 (the
-handler then returns an error to requeue for the remainder).
+subnet. An allocated provider with an empty `logical_switch` is a non-OVN
+NIC (Vlan/underlay) and is skipped silently - the OVN allocation path
+always writes `logical_switch`, so the empty case reliably means non-OVN.
+The subnet is never guessed from namespace/default fallbacks, because
+writing a wrong VNI is worse than a missing one (nothing would correct it
+afterwards); a `logical_switch` that does not resolve is counted by
+`pod_tunnel_key_repair_skipped_total` as the anomaly it is. Progress is
+not all-or-nothing: ready providers are patched in one call even when
+another provider's subnet key is still 0 (the handler then returns an
+error to requeue for the remainder).
 
 ## Intended upgrade sequence
 

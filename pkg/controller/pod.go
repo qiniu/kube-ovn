@@ -684,10 +684,11 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 		}
 		lsName := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)]
 		if lsName == "" {
-			// Never guess the subnet (namespace default fallback): a wrong VNI
-			// is worse than a missing one, so leave it and count the skip.
-			metricPodTunnelKeySkipped.Inc()
-			klog.Warningf("pod %s/%s provider %s has no logical_switch annotation, skip tunnel_key repair", namespace, name, provider)
+			// An OVN NIC always has its logical_switch annotation (allocation
+			// writes it for every OVN subnet), so allocated + empty
+			// logical_switch reliably means a non-OVN NIC (Vlan/underlay), which
+			// needs no tunnel_key: skip silently. Only a logical_switch that
+			// fails to resolve is the anomaly worth counting below.
 			continue
 		}
 		subnet, err := c.subnetsLister.Get(lsName)

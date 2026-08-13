@@ -1060,10 +1060,13 @@ func TestHandleRepairTunnelKeyMultiNIC(t *testing.T) {
 				// NIC 2: allocated on ovn-b whose key is not synced -> requeued, not patched
 				"net1.ovn.kubernetes.io/allocated":      "true",
 				"net1.ovn.kubernetes.io/logical_switch": "ovn-b",
-				// NIC 3: allocated but no logical_switch annotation -> skipped, never guessed
-				"net2.ovn.kubernetes.io/allocated": "true",
-				// NIC 4: has logical_switch but is NOT allocated -> skipped
-				"net3.ovn.kubernetes.io/logical_switch": "ovn-a",
+				// NIC 3: allocated non-OVN NIC with no logical_switch -> silent skip, not counted
+				"net2.kubernetes.io/allocated": "true",
+				// NIC 4: logical_switch points to a subnet that does not exist -> skipped and counted
+				"net3.ovn.kubernetes.io/allocated":      "true",
+				"net3.ovn.kubernetes.io/logical_switch": "ovn-c",
+				// NIC 5: has logical_switch but is NOT allocated -> skipped
+				"net4.ovn.kubernetes.io/logical_switch": "ovn-a",
 			},
 		},
 	}
@@ -1087,10 +1090,11 @@ func TestHandleRepairTunnelKeyMultiNIC(t *testing.T) {
 	// NIC 2 must not be patched with a stale zero key.
 	_, ok := updated.Annotations["net1.ovn.kubernetes.io/tunnel_key"]
 	require.False(t, ok)
-	// NIC 4 (not allocated) must not be patched.
-	_, ok = updated.Annotations["net3.ovn.kubernetes.io/tunnel_key"]
+	// NIC 5 (not allocated) must not be patched.
+	_, ok = updated.Annotations["net4.ovn.kubernetes.io/tunnel_key"]
 	require.False(t, ok)
-	// NIC 3 (no logical_switch annotation) must be skipped and counted.
+	// Only the unresolvable logical_switch (NIC 4) counts as skipped; the
+	// non-OVN NIC 3 with no logical_switch must be silent.
 	require.Equal(t, float64(1), readCounter(t, metricPodTunnelKeySkipped)-skippedBefore)
 }
 
