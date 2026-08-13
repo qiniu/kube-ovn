@@ -568,11 +568,15 @@ func Run(ctx context.Context, config *Configuration) {
 		podsLister:          podInformer.Lister(),
 		podsSynced:          podInformer.Informer().HasSynced,
 		addOrUpdatePodQueue: newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil),
-		// Repair retries start at 1s instead of the default 5ms: a subnet
-		// whose tunnel key stays 0 makes the queued pods requeue in a tight
-		// loop, and a 5ms base would hammer the shared podKeyMutex buckets.
+		// Repair retries start at 1s instead of the default 5ms, and a global
+		// token bucket caps the aggregate requeue rate: a subnet whose tunnel
+		// key stays 0 makes the queued pods requeue in a loop, and a 5ms base
+		// with no bucket would hammer the shared podKeyMutex buckets.
 		repairTunnelKeyQueue: newTypedRateLimitingQueue[string]("RepairTunnelKey",
-			workqueue.NewTypedItemExponentialFailureRateLimiter[string](time.Second, time.Minute)),
+			workqueue.NewTypedMaxOfRateLimiter[string](
+				workqueue.NewTypedItemExponentialFailureRateLimiter[string](time.Second, time.Minute),
+				&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+			)),
 		deletePodQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{

@@ -507,6 +507,15 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 		klog.Error(err)
 		return err
 	}
+
+	// Re-enqueue the tunnel_key repair for already-allocated OVN pods missing
+	// the annotation (idempotent, normally a no-op). Complements the InitIPAM
+	// startup sweep: a pod that appears or changes after startup heals on its
+	// next update event. Annotation-driven, so it must run before the early
+	// returns below (network validation / resolution): a legacy pod whose NAD
+	// or default subnet has broken since startup must still be repaired.
+	c.enqueuePodTunnelKeyRepair(pod)
+
 	if err := util.ValidatePodNetwork(pod.Annotations); err != nil {
 		klog.Errorf("validate pod %s/%s failed: %v", namespace, name, err)
 		c.recorder.Eventf(pod, v1.EventTypeWarning, "ValidatePodNetworkFailed", err.Error())
@@ -518,13 +527,6 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 		klog.Errorf("failed to get pod nets %v", err)
 		return err
 	}
-
-	// Re-enqueue the tunnel_key repair for already-allocated OVN pods missing
-	// the annotation (idempotent, normally a no-op). Complements the InitIPAM
-	// startup sweep: a pod that appears or changes after startup heals on its
-	// next update event. Annotation-driven, so it does not depend on the
-	// network resolution above having succeeded.
-	c.enqueuePodTunnelKeyRepair(pod)
 
 	// check and do hotnoplug nic
 	if pod, err = c.syncKubeOvnNet(pod, podNets); err != nil {
@@ -586,10 +588,11 @@ func (c *Controller) tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 // podProvidersMissingTunnelKey returns the providers of an allocated pod that
 // are missing their tunnel_key (VNI) annotation and carry a logical_switch
 // annotation. The OVN allocation path always writes logical_switch for OVN
-// subnets and removes it for non-OVN NICs (Vlan/underlay or IPAM-only multus
-// attachments), so an empty logical_switch reliably means no tunnel_key is
-// needed. The predicate is shared by enqueuePodTunnelKeyRepair and
-// handleRepairTunnelKey so the enqueue and the repair cannot drift apart.
+// subnets (provider "ovn", including vlan/underlay subnets) and removes it
+// for subnets whose provider is not ovn (kube-ovn acts as IPAM only, another
+// CNI configures the NIC), so an empty logical_switch reliably means the NIC
+// never gets a tunnel_key. The predicate is shared by enqueuePodTunnelKeyRepair
+// and handleRepairTunnelKey so the enqueue and the repair cannot drift apart.
 func (c *Controller) podProvidersMissingTunnelKey(pod *v1.Pod) []string {
 	var providers []string
 	for annotKey, v := range pod.Annotations {
@@ -619,10 +622,10 @@ func (c *Controller) podProvidersMissingTunnelKey(pod *v1.Pod) []string {
 // pod is enqueued whenever its own annotations say it is missing the key. The
 // enqueue is independent of the subnet key state: the repair handler retries
 // until the key becomes available, so a pod whose subnet key is still 0 at
-// init time is not lost. It reports whether the pod was enqueued.
-func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) bool {
+// init time is not lost.
+func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 	if pod.Spec.HostNetwork {
-		return false
+		return
 	}
 	if !isPodAlive(pod) {
 		// Match InitIPAM's pod-level filtering: a non-alive StatefulSet pod
@@ -631,16 +634,15 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) bool {
 		// time it is re-scheduled and goes through CNI ADD.
 		isStsPod, _, _ := isStatefulSetPod(pod)
 		if !isStsPod {
-			return false
+			return
 		}
 	}
 	if len(c.podProvidersMissingTunnelKey(pod)) == 0 {
-		return false
+		return
 	}
 	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 	c.repairTunnelKeyQueue.Add(key)
 	klog.V(3).Infof("enqueued tunnel_key repair for pod %s", key)
-	return true
 }
 
 // handleRepairTunnelKey patches the tunnel_key (VNI) annotation onto pods that

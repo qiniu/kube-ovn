@@ -52,9 +52,13 @@ Repair is multi-NIC aware and driven purely by the per-provider annotations
 the allocation wrote (`allocated` + `logical_switch`): every OVN subnet has
 its own `tunnel_key` annotation. A provider is repaired only if it is
 marked allocated and its `logical_switch` annotation resolves to an OVN
-subnet. An allocated provider with an empty `logical_switch` is a non-OVN
-NIC (Vlan/underlay) and is skipped silently - the OVN allocation path
-always writes `logical_switch`, so the empty case reliably means non-OVN.
+subnet. An allocated provider with an empty `logical_switch` is a NIC whose
+subnet provider is not ovn (kube-ovn acts as IPAM only, another CNI
+configures the NIC) and is skipped silently - the OVN allocation path
+always writes `logical_switch`, so the empty case reliably means no
+tunnel_key is ever written. Note that vlan/underlay subnets keep provider
+`ovn`: they are part of this mechanism (the allocation gate also applies,
+so underlay pods wait for the tunnel key before IP allocation).
 The subnet is never guessed from namespace/default fallbacks, because
 writing a wrong VNI is worse than a missing one (nothing would correct it
 afterwards); a `logical_switch` that does not resolve is counted by
@@ -80,11 +84,17 @@ corrected by the ordered cilium restart.
   `pod_tunnel_key_repair_skipped_total` (repairs skipped because the
   logical_switch subnet no longer exists) - see
   pkg/controller/tunnel_key_metrics.go.
-- Repair keying is per `podNet.ProviderName` (the `*.kubernetes.io/*`
-  annotation templates). Cilium currently only recognizes the primary NIC
+- Repair keying is per provider parsed from the `*.kubernetes.io/allocated`
+  annotation suffix (the same `*.kubernetes.io/*` templates as the
+  allocation path). Cilium currently only recognizes the primary NIC
   (default provider, `ovn.kubernetes.io/*` annotations), so a mismatch on
   a multus secondary NIC would be harmless today; it only matters if
   Cilium starts keying secondary NICs.
+- A pod whose `logical_switch` subnet no longer exists is skipped (counted
+  by `pod_tunnel_key_repair_skipped_total`) and not retried: the repair
+  queue forgets it, and there is no periodic resync. It is re-enqueued on
+  the next pod update event or the next controller restart - acceptable
+  because the pod usually cannot survive its subnet's deletion anyway.
 - The upgrade sequence above is operator discipline, not enforced by code:
   restarting cilium before the backfill completes leaves already-created
   endpoints on the non-VPC scheme until the next cilium restart.

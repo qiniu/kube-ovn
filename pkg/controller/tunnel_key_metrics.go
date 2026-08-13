@@ -17,8 +17,9 @@ var (
 
 	// metricPodTunnelKeySkipped counts pods the tunnel_key repair could not
 	// process because the subnet named by their logical_switch annotation no
-	// longer exists. Non-OVN NICs (no logical_switch) are not counted: they
-	// legitimately never get a tunnel_key.
+	// longer exists. Providers without a logical_switch annotation (subnets
+	// whose provider is not ovn, i.e. kube-ovn as IPAM only) are not counted:
+	// they legitimately never get a tunnel_key.
 	metricPodTunnelKeySkipped = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "pod_tunnel_key_repair_skipped_total",
 		Help: "Total number of tunnel_key repairs skipped because the logical_switch subnet no longer exists.",
