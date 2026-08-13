@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	prometheusTestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -1174,7 +1175,9 @@ func TestResyncPodTunnelKeyOnce(t *testing.T) {
 	require.NoError(t, err)
 	c := fc.fakeController
 
+	metricPodTunnelKeyMissing.Set(0)
 	require.NoError(t, c.resyncPodTunnelKeyOnce())
+	require.Equal(t, float64(2), prometheusTestutil.ToFloat64(metricPodTunnelKeyMissing), "gauge must report the two pods missing tunnel_key")
 	require.Equal(t, 2, c.repairTunnelKeyQueue.Len(), "only the allocated OVN pods missing tunnel_key must be enqueued")
 	keys := []string{}
 	for range c.repairTunnelKeyQueue.Len() {

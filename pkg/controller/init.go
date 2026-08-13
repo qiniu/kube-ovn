@@ -444,6 +444,10 @@ func (c *Controller) InitIPAM() error {
 		podNets, err := c.getPodKubeovnNets(pod)
 		if err != nil {
 			klog.Errorf("failed to get pod kubeovn nets %s.%s address %s: %v", pod.Name, pod.Namespace, pod.Annotations[util.IPAddressAnnotation], err)
+			// The pod is skipped for IPAM and for the tunnel_key repair sweep;
+			// observable via metricPodTunnelKeySkipped, healed by the periodic
+			// resync or the pod reconcile path once the network resolves.
+			metricPodTunnelKeySkipped.Inc()
 			continue
 		}
 

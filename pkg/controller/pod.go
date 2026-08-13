@@ -610,12 +610,14 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 // is exactly the population flow 2 repairs.
 //
 // Known gaps (documented, not closed by code):
-//   - No metric counts pods missing the annotation or repairs skipped by the
-//     startup sweep (see TODO(metrics) in resyncPodTunnelKeyOnce).
+//   - Repair progress is observable via pod_tunnel_key_missing (gap size at
+//     the last resync), pod_tunnel_key_repair_total and
+//     pod_tunnel_key_repair_skipped_total (see tunnel_key_metrics.go).
 //   - Repair keying is by podNet.ProviderName (AllocatedAnnotationTemplate /
-//     TunnelKeyAnnotationTemplate); a mismatch with the key Cilium actually
-//     reads for a multus secondary NIC would write an annotation that is not
-//     honored (TODO: confirm the provider-name contract with Cilium).
+//     TunnelKeyAnnotationTemplate). Cilium currently only recognizes the
+//     primary NIC (default provider, ovn.kubernetes.io/* annotations), so a
+//     mismatch on a multus secondary NIC would be harmless today; it only
+//     matters if Cilium starts keying secondary NICs.
 //   - The upgrade sequence above is operator discipline, not enforced by code:
 //     restarting cilium before the backfill completes leaves already-created
 //     endpoints on the non-VPC scheme until the next cilium restart.
@@ -644,7 +646,8 @@ func (c *Controller) tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 // reusing the already-resolved podNets. The enqueue is independent of the
 // subnet key state: the repair handler retries until the key becomes
 // available, so a pod whose subnet key is still 0 at init time is not lost.
-func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod, podNets []*kubeovnNet) {
+// It reports whether the pod was enqueued.
+func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod, podNets []*kubeovnNet) bool {
 	if !isPodAlive(pod) {
 		// Match InitIPAM's pod-level filtering: a non-alive StatefulSet pod
 		// still holds its allocated IP and annotations (restored from the IP
@@ -652,7 +655,7 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod, podNets []*kubeovnNe
 		// time it is re-scheduled and goes through CNI ADD.
 		isStsPod, _, _ := isStatefulSetPod(pod)
 		if !isStsPod {
-			return
+			return false
 		}
 	}
 	for _, podNet := range podNets {
@@ -668,8 +671,9 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod, podNets []*kubeovnNe
 		key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 		c.repairTunnelKeyQueue.Add(key)
 		klog.Infof("enqueued tunnel_key repair for pod %s", key)
-		return
+		return true
 	}
+	return false
 }
 
 // handleRepairTunnelKey patches the tunnel_key (VNI) annotation onto pods that
@@ -741,6 +745,7 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 		klog.Errorf("failed to patch tunnel key annotation for pod %s/%s: %v", namespace, name, err)
 		return err
 	}
+	metricPodTunnelKeyRepaired.Inc()
 	klog.Infof("repaired tunnel key annotation for pod %s/%s", namespace, name)
 	return nil
 }
@@ -755,18 +760,19 @@ const tunnelKeyResyncInterval = 5 * time.Minute
 
 // resyncPodTunnelKeyOnce is one tick of the periodic tunnel_key resync: it
 // lists all pods and enqueues the ones missing the annotation. The enqueue and
-// the repair handler are both idempotent, so repeated ticks are cheap.
+// the repair handler are both idempotent, so repeated ticks are cheap. It also
+// refreshes metricPodTunnelKeyMissing, the observable size of the gap.
 //
 // This is a defensive safety net: new pods cannot reach the missing-annotation
 // state (the allocation gate + atomic patch + CNI wait guarantee it, see the
 // Guarantee comment on tunnelKeyNotReady), so this only covers legacy pods the
-// startup sweep skipped. TODO(metrics): increment a counter here (and on the
-// getPodKubeovnNets error path) so silently skipped repairs are observable.
+// startup sweep skipped.
 func (c *Controller) resyncPodTunnelKeyOnce() error {
 	pods, err := c.podsLister.List(labels.Everything())
 	if err != nil {
 		return fmt.Errorf("failed to list pods for tunnel_key resync: %w", err)
 	}
+	missing := 0
 	for _, pod := range pods {
 		if pod.Spec.HostNetwork || !isPodAlive(pod) {
 			// Same filtering as InitIPAM and enqueuePodTunnelKeyRepair:
@@ -779,11 +785,15 @@ func (c *Controller) resyncPodTunnelKeyOnce() error {
 		podNets, err := c.getPodKubeovnNets(pod)
 		if err != nil {
 			// Transient resolution failures are retried on the next tick.
+			metricPodTunnelKeySkipped.Inc()
 			klog.Errorf("failed to get pod nets for %s/%s during tunnel_key resync: %v", pod.Namespace, pod.Name, err)
 			continue
 		}
-		c.enqueuePodTunnelKeyRepair(pod, podNets)
+		if c.enqueuePodTunnelKeyRepair(pod, podNets) {
+			missing++
+		}
 	}
+	metricPodTunnelKeyMissing.Set(float64(missing))
 	return nil
 }
 
