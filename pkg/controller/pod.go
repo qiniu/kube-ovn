@@ -646,7 +646,14 @@ func (c *Controller) tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 // available, so a pod whose subnet key is still 0 at init time is not lost.
 func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod, podNets []*kubeovnNet) {
 	if !isPodAlive(pod) {
-		return
+		// Match InitIPAM's pod-level filtering: a non-alive StatefulSet pod
+		// still holds its allocated IP and annotations (restored from the IP
+		// CR at startup) and is repaired too, so it has the annotation by the
+		// time it is re-scheduled and goes through CNI ADD.
+		isStsPod, _, _ := isStatefulSetPod(pod)
+		if !isStsPod {
+			return
+		}
 	}
 	for _, podNet := range podNets {
 		if !isOvnSubnet(podNet.Subnet) {
@@ -762,7 +769,12 @@ func (c *Controller) resyncPodTunnelKeyOnce() error {
 	}
 	for _, pod := range pods {
 		if pod.Spec.HostNetwork || !isPodAlive(pod) {
-			continue
+			// Same filtering as InitIPAM and enqueuePodTunnelKeyRepair:
+			// non-alive StatefulSet pods are repaired too.
+			isStsPod, _, _ := isStatefulSetPod(pod)
+			if !isStsPod {
+				continue
+			}
 		}
 		podNets, err := c.getPodKubeovnNets(pod)
 		if err != nil {

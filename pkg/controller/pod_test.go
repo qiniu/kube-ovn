@@ -1077,6 +1077,45 @@ func TestEnqueuePodTunnelKeyRepair(t *testing.T) {
 	// subnet worker, so the init-before-subnet-sync ordering does not lose it.
 	c.enqueuePodTunnelKeyRepair(missing, ovnNet(0))
 	require.Equal(t, 1, c.repairTunnelKeyQueue.Len(), "enqueue must be independent of the subnet key state")
+
+	// A non-alive StatefulSet pod must still be enqueued (it holds its
+	// allocated IP and will be re-scheduled), matching InitIPAM's filter;
+	// a non-alive regular pod must not.
+	stsPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sts-0",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.AllocatedAnnotation: "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind:       util.KindStatefulSet,
+				Name:       "sts",
+				APIVersion: appsv1.SchemeGroupVersion.String(),
+			}},
+		},
+		Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+		},
+	}
+	c.enqueuePodTunnelKeyRepair(stsPod, ovnNet(1234))
+	c.enqueuePodTunnelKeyRepair(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dead",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.AllocatedAnnotation: "true",
+			},
+		},
+		Spec:   corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}, ovnNet(1234))
+	require.Equal(t, 2, c.repairTunnelKeyQueue.Len(), "non-alive STS pod must be enqueued, non-alive regular pod must not")
+	for range 2 {
+		key, _ := c.repairTunnelKeyQueue.Get()
+		c.repairTunnelKeyQueue.Done(key)
+	}
 }
 
 func TestResyncPodTunnelKeyOnce(t *testing.T) {
@@ -1120,14 +1159,28 @@ func TestResyncPodTunnelKeyOnce(t *testing.T) {
 			podWith("host-network", nil, corev1.PodRunning, true),
 			// terminated: must be skipped
 			podWith("terminated", nil, corev1.PodSucceeded, false),
+			// non-alive StatefulSet pod: must be enqueued (matches InitIPAM)
+			func() *corev1.Pod {
+				p := podWith("sts-0", nil, corev1.PodSucceeded, false)
+				p.OwnerReferences = []metav1.OwnerReference{{
+					Kind:       util.KindStatefulSet,
+					Name:       "sts",
+					APIVersion: appsv1.SchemeGroupVersion.String(),
+				}}
+				return p
+			}(),
 		},
 	})
 	require.NoError(t, err)
 	c := fc.fakeController
 
 	require.NoError(t, c.resyncPodTunnelKeyOnce())
-	require.Equal(t, 1, c.repairTunnelKeyQueue.Len(), "only the allocated OVN pod missing tunnel_key must be enqueued")
-	key, _ := c.repairTunnelKeyQueue.Get()
-	c.repairTunnelKeyQueue.Done(key)
-	require.Equal(t, "default/needs-repair", key)
+	require.Equal(t, 2, c.repairTunnelKeyQueue.Len(), "only the allocated OVN pods missing tunnel_key must be enqueued")
+	keys := []string{}
+	for range c.repairTunnelKeyQueue.Len() {
+		key, _ := c.repairTunnelKeyQueue.Get()
+		c.repairTunnelKeyQueue.Done(key)
+		keys = append(keys, key)
+	}
+	require.ElementsMatch(t, []string{"default/needs-repair", "default/sts-0"}, keys)
 }

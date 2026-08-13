@@ -1425,9 +1425,6 @@ func (c *Controller) startWorkers(ctx context.Context) {
 		// processed by one worker at a time), which keeps the startup backfill
 		// fast on large clusters.
 		go wait.Until(runWorker("repair tunnel key", c.repairTunnelKeyQueue, c.handleRepairTunnelKey), time.Second, ctx.Done())
-		// Periodic safety net for the tunnel_key guarantee: re-enqueues repairs
-		// for pods the InitIPAM startup sweep missed (see resyncPodTunnelKey).
-		go c.resyncPodTunnelKey(ctx)
 
 		go wait.Until(runWorker("delete subnet", c.deleteSubnetQueue, c.handleDeleteSubnet), time.Second, ctx.Done())
 		go wait.Until(runWorker("delete ippool", c.deleteIPPoolQueue, c.handleDeleteIPPool), time.Second, ctx.Done())
@@ -1469,6 +1466,11 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(func() {
 		c.resyncVpcNatConfig()
 	}, time.Second, ctx.Done())
+
+	// Periodic safety net for the tunnel_key guarantee: re-enqueues repairs
+	// for pods the InitIPAM startup sweep missed (see resyncPodTunnelKey).
+	// Single instance: the full-pod scan must not be multiplied by WorkerNum.
+	go c.resyncPodTunnelKey(ctx)
 
 	if c.config.GCInterval != 0 {
 		go wait.Until(func() {
