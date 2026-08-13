@@ -94,8 +94,8 @@ type Controller struct {
 	deletePodQueue      workqueue.TypedRateLimitingInterface[string]
 	// repairTunnelKeyQueue is a dedicated queue for patching the tunnel_key
 	// (VNI) annotation onto pods that are missing it, closing the
-	// "must-have tunnel_key" guarantee after a controller restart (see the
-	// Guarantee comment on tunnelKeyNotReady in pod.go): pods allocated before
+	// "must-have tunnel_key" guarantee after a controller restart (see
+	// docs/tunnel-key-annotation-guarantee.md): pods allocated before
 	// the subnet tunnel key was synced (or before this code existed) keep a
 	// missing annotation forever because the allocation path never re-patches
 	// already-allocated pods. The queue is fed by the init flow on controller

@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
-	prometheusTestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -18,6 +19,22 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/ipam"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
+
+// readGauge/readCounter read a metric value without pulling the prometheus
+// testutil package (and its extra dependencies) into the test dependency tree.
+func readGauge(t *testing.T, g prometheus.Gauge) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, g.Write(&m))
+	return m.GetGauge().GetValue()
+}
+
+func readCounter(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	return m.GetCounter().GetValue()
+}
 
 func TestCheckIsPodVpcNatGw(t *testing.T) {
 	tests := []struct {
@@ -1019,6 +1036,64 @@ func TestHandleRepairTunnelKey(t *testing.T) {
 	})
 }
 
+func TestHandleRepairTunnelKeyMultiNIC(t *testing.T) {
+	subnets := []*kubeovnv1.Subnet{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ovn-a"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+			Status:     kubeovnv1.SubnetStatus{TunnelKey: 1234},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ovn-b"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+			Status:     kubeovnv1.SubnetStatus{TunnelKey: 0},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "multi-nic",
+			Namespace: "default",
+			Annotations: map[string]string{
+				// NIC 1: allocated on ovn-a, missing tunnel_key -> patched
+				util.AllocatedAnnotation:     "true",
+				util.LogicalSwitchAnnotation: "ovn-a",
+				// NIC 2: allocated on ovn-b whose key is not synced -> requeued, not patched
+				"net1.ovn.kubernetes.io/allocated":      "true",
+				"net1.ovn.kubernetes.io/logical_switch": "ovn-b",
+				// NIC 3: allocated but no logical_switch annotation -> skipped, never guessed
+				"net2.ovn.kubernetes.io/allocated": "true",
+				// NIC 4: has logical_switch but is NOT allocated -> skipped
+				"net3.ovn.kubernetes.io/logical_switch": "ovn-a",
+			},
+		},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:    subnets,
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	skippedBefore := readCounter(t, metricPodTunnelKeySkipped)
+	err = c.handleRepairTunnelKey("default/multi-nic")
+	require.Error(t, err, "must requeue while any allocated subnet key is not synced yet")
+
+	updated, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), "multi-nic", metav1.GetOptions{})
+	require.NoError(t, err)
+	// NIC 1 must be patched even though NIC 2 is not ready (partial progress lands).
+	require.Equal(t, "1234", updated.Annotations[util.TunnelKeyAnnotation])
+	// NIC 2 must not be patched with a stale zero key.
+	_, ok := updated.Annotations["net1.ovn.kubernetes.io/tunnel_key"]
+	require.False(t, ok)
+	// NIC 4 (not allocated) must not be patched.
+	_, ok = updated.Annotations["net3.ovn.kubernetes.io/tunnel_key"]
+	require.False(t, ok)
+	// NIC 3 (no logical_switch annotation) must be skipped and counted.
+	require.Equal(t, float64(1), readCounter(t, metricPodTunnelKeySkipped)-skippedBefore)
+}
+
 func TestEnqueuePodTunnelKeyRepair(t *testing.T) {
 	ovnNet := func(tunnelKey int) []*kubeovnNet {
 		return []*kubeovnNet{{
@@ -1177,7 +1252,7 @@ func TestResyncPodTunnelKeyOnce(t *testing.T) {
 
 	metricPodTunnelKeyMissing.Set(0)
 	require.NoError(t, c.resyncPodTunnelKeyOnce())
-	require.Equal(t, float64(2), prometheusTestutil.ToFloat64(metricPodTunnelKeyMissing), "gauge must report the two pods missing tunnel_key")
+	require.Equal(t, float64(2), readGauge(t, metricPodTunnelKeyMissing), "gauge must report the two pods missing tunnel_key")
 	require.Equal(t, 2, c.repairTunnelKeyQueue.Len(), "only the allocated OVN pods missing tunnel_key must be enqueued")
 	keys := []string{}
 	for range c.repairTunnelKeyQueue.Len() {
