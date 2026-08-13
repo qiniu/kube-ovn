@@ -15,8 +15,8 @@ var (
 		Help: "Total number of annotation patches that wrote one or more tunnel_key (VNI) annotations; a pod with several OVN NICs can be patched more than once.",
 	})
 
-	// metricPodTunnelKeySkipped counts pods the tunnel_key repair could not
-	// process because the subnet named by their logical_switch annotation no
+	// metricPodTunnelKeySkipped counts provider repairs that could not
+	// proceed because the subnet named by their logical_switch annotation no
 	// longer exists. Providers without a logical_switch annotation (subnets
 	// whose provider is not ovn, i.e. kube-ovn as IPAM only) are not counted:
 	// they legitimately never get a tunnel_key.

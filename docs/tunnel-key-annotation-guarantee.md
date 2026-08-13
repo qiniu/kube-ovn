@@ -40,11 +40,13 @@ the population flow 2 repairs.
   allocation path and is unrelated to restarts).
 - Pods that already carry the annotation keep it (persisted in etcd).
 - Legacy pods allocated before the subnet tunnel key was synced (or before
-  this code existed) are missing the annotation. On startup `InitIPAM`
-  enqueues them into the dedicated `repairTunnelKeyQueue`
-  (`enqueuePodTunnelKeyRepair`); the repair worker
+  this code existed) can have a missing, non-numeric or out-of-range
+  annotation (valid OVN tunnel keys are `1..16777215`). On startup
+  `InitIPAM` enqueues them into the dedicated
+  `repairTunnelKeyQueue` (`enqueuePodTunnelKeyRepair`); the repair worker
   (`handleRepairTunnelKey`) patches them from `subnet.Status.TunnelKey`,
-  retrying with unbounded backoff until the key becomes available (subnet
+  retrying indefinitely with exponential backoff capped at one minute and
+  an aggregate 10-qps token bucket until the key becomes available (subnet
   reconcile may still be syncing it).
 
 Enqueue is not one-shot: the enqueue is annotation-driven
@@ -55,9 +57,9 @@ event.
 
 Repair is multi-NIC aware and driven purely by the per-provider annotations
 the allocation wrote (`allocated` + `logical_switch`): every OVN subnet has
-its own `tunnel_key` annotation. A provider is repaired only if it is
-marked allocated and its `logical_switch` annotation resolves to an OVN
-subnet. An allocated provider with an empty `logical_switch` is a NIC whose
+its own valid `tunnel_key` annotation. A provider is repaired if its key is
+missing, non-numeric or outside `1..16777215`, and only if it is marked
+allocated and its `logical_switch` annotation resolves to an OVN subnet. An allocated provider with an empty `logical_switch` is a NIC whose
 subnet provider is not ovn (kube-ovn acts as IPAM only, another CNI
 configures the NIC) and is skipped silently - the OVN allocation path
 always writes `logical_switch`, so the empty case reliably means no

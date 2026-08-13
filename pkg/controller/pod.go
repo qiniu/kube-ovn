@@ -572,23 +572,32 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 // allocation gate + atomic patch for new pods, and the startup backfill via
 // repairTunnelKeyQueue for legacy pods) plus the upgrade sequence and known
 // gaps are documented in docs/tunnel-key-annotation-guarantee.md.
-//
+
+// OVN Datapath_Binding.tunnel_key is a 24-bit value with zero reserved.
+const maxTunnelKey = 1<<24 - 1
+
+func isValidTunnelKey(key int) bool {
+	return key > 0 && key <= maxTunnelKey
+}
+
 // tunnelKeyNotReady reports whether an IP must not be allocated from the given subnet yet
-// because its tunnel key (VNI) has not been synced from OVN SB (still 0).
+// because its tunnel key (VNI) has not been synced from OVN SB or is outside the valid range.
 //
 // The pod allocation path does NOT wait for subnet.Status.Ready: once the subnet is registered
 // in IPAM during subnet reconciliation, pod workers can start allocating IPs from it, possibly
-// before the tunnel key has been synced from OVN SB. Allocating in that window would record a
-// stale tunnel_key=0 in the pod annotation and make Cilium fall back to the non-VPC endpoint
+// before the tunnel key has been synced from OVN SB. Allocating in that window would record an
+// invalid tunnel_key in the pod annotation and make Cilium fall back to the non-VPC endpoint
 // scheme. reconcileAllocateSubnets checks this on the resolved subnet before it persists a pod.
-func (c *Controller) tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
-	return isOvnSubnet(subnet) && subnet.Status.TunnelKey == 0
+func tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
+	return isOvnSubnet(subnet) && !isValidTunnelKey(subnet.Status.TunnelKey)
 }
 
 // podProvidersMissingTunnelKey returns the providers of an allocated pod that
-// are missing their tunnel_key (VNI) annotation and carry a logical_switch
-// annotation. The OVN allocation path always writes logical_switch for OVN
-// subnets (provider "ovn", including vlan/underlay subnets) and removes it
+// lack a valid tunnel_key (VNI) annotation and carry a logical_switch
+// annotation. Missing, non-numeric or values outside OVN's 24-bit range
+// [1, 16777215] all need repair. The OVN allocation path always writes
+// logical_switch for OVN subnets (provider "ovn", including vlan/underlay
+// subnets) and removes it
 // for subnets whose provider is not ovn (kube-ovn acts as IPAM only, another
 // CNI configures the NIC), so an empty logical_switch reliably means the NIC
 // never gets a tunnel_key. The predicate is shared by enqueuePodTunnelKeyRepair
@@ -600,7 +609,8 @@ func (c *Controller) podProvidersMissingTunnelKey(pod *v1.Pod) []string {
 			continue
 		}
 		provider := strings.TrimSuffix(annotKey, util.AllocatedAnnotationSuffix)
-		if _, ok := pod.Annotations[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)]; ok {
+		tunnelKey, err := strconv.Atoi(pod.Annotations[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)])
+		if err == nil && isValidTunnelKey(tunnelKey) {
 			continue
 		}
 		if pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)] == "" {
@@ -779,7 +789,7 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		}
 		patch[fmt.Sprintf(util.CidrAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.CIDRBlock
 		patch[fmt.Sprintf(util.GatewayAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.Gateway
-		if isOvnSubnet(podNet.Subnet) {
+		if isOvnSubnet(subnet) {
 			// Gate: never persist pod annotations for an OVN subnet whose tunnel key (VNI) has not
 			// been synced from OVN SB yet, otherwise Cilium falls back to the non-VPC endpoint scheme.
 			// This checks the resolved subnet (which may differ from podNet.Subnet for a static IP in a
@@ -787,7 +797,7 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 			// earlier loop iterations may already have created idempotent LSP/IP CR state, but CNI-visible
 			// annotations remain all-or-nothing and the retry safely reconciles those objects again.
 			// A non-OVN resolved subnet has no tunnel key and is left as-is.
-			if c.tunnelKeyNotReady(subnet) {
+			if tunnelKeyNotReady(subnet) {
 				err := fmt.Errorf("subnet %s tunnel key not observed on allocation, requeuing", subnet.Name)
 				c.recorder.Eventf(pod, v1.EventTypeWarning, "AcquireAddressFailed", err.Error())
 				klog.Error(err)
@@ -797,10 +807,8 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 			if pod.Annotations[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] == "" {
 				patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = c.config.PodNicType
 			}
-			// Record the tunnel key (VNI) so Cilium can recognize this as a VPC pod during CNI add.
-			if subnet.Status.TunnelKey != 0 {
-				patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = strconv.Itoa(subnet.Status.TunnelKey)
-			}
+			// The gate above guarantees a valid value for every resolved OVN subnet.
+			patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = strconv.Itoa(subnet.Status.TunnelKey)
 		} else {
 			patch[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, podNet.ProviderName)] = nil
 			patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = nil
