@@ -707,7 +707,7 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 
 	// Sync tunnel_key from OVN SB into subnet status before any path that can mark the subnet
 	// Ready. reconcileSubnet below sets Ready for centralized-gateway subnets, so the sync must
-	// run first to guarantee that Ready implies a non-zero TunnelKey. The SB Datapath_Binding that
+	// run first to guarantee that Ready implies a valid TunnelKey. The SB Datapath_Binding that
 	// carries the tunnel key is created by northd once the NB logical switch exists, so this must
 	// run after CreateLogicalSwitch above.
 	//
@@ -720,7 +720,7 @@ func (c *Controller) handleAddOrUpdateSubnet(key string) error {
 	// Known limitation: if the Datapath_Binding never appears (a genuine NB/SB desync, which the
 	// mandatory-VNI invariant says should not happen), the subnet stays NotReady and requeues,
 	// logging the sync error each cycle. That per-cycle error log is the diagnosis signal.
-	if isOvnSubnet(subnet) && subnet.Status.TunnelKey == 0 {
+	if isOvnSubnet(subnet) && !isValidTunnelKey(subnet.Status.TunnelKey) {
 		if err := c.syncSubnetTunnelKey(subnet); err != nil {
 			klog.Errorf("failed to sync tunnel key for subnet %s: %v", subnet.Name, err)
 			return err
@@ -3290,6 +3290,11 @@ func (c *Controller) syncSubnetTunnelKey(subnet *kubeovnv1.Subnet) error {
 	tunnelKey, err := c.OVNSbClient.GetLogicalSwitchTunnelKey(subnet.Name)
 	if err != nil {
 		err = fmt.Errorf("failed to get tunnel key for logical switch %s: %w", subnet.Name, err)
+		klog.Error(err)
+		return err
+	}
+	if !isValidTunnelKey(tunnelKey) {
+		err := fmt.Errorf("invalid tunnel key %d for logical switch %s", tunnelKey, subnet.Name)
 		klog.Error(err)
 		return err
 	}

@@ -93,8 +93,9 @@ Check the subnet status with:
 kubectl get subnet <name> -o jsonpath='{.status.tunnelKey}'
 ```
 
-A value of `0` means the key has not been synchronized. Check OVN SB
-reachability and whether the logical switch has a `Datapath_Binding` in SB.
+A value outside `1..16777215` is invalid and triggers fail-closed
+re-synchronization. Check OVN SB reachability and whether the logical switch
+has a `Datapath_Binding` in SB.
 Underlay/vlan subnets also use OVN logical switches and are subject to this
 gate.
 

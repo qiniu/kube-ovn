@@ -699,6 +699,17 @@ func Test_syncSubnetTunnelKey(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "sb unavailable")
 	})
+
+	for _, tunnelKey := range []int{0, -1, maxTunnelKey + 1} {
+		t.Run(fmt.Sprintf("rejects invalid tunnel key %d", tunnelKey), func(t *testing.T) {
+			fc.mockOvnSbClient.EXPECT().GetLogicalSwitchTunnelKey("test-ovn-subnet").
+				Return(tunnelKey, nil)
+
+			err := ctrl.syncSubnetTunnelKey(subnet)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "invalid tunnel key")
+		})
+	}
 }
 
 func Test_isOvnSubnet(t *testing.T) {

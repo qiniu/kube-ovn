@@ -1024,6 +1024,28 @@ func TestHandleRepairTunnelKey(t *testing.T) {
 		}
 	}
 
+	ovnPod := func(tunnelKey *string) *corev1.Pod {
+		annotations := map[string]string{
+			util.LogicalSwitchAnnotation: "ovn-subnet",
+			util.AllocatedAnnotation:     "true",
+		}
+		if tunnelKey != nil {
+			annotations[util.TunnelKeyAnnotation] = *tunnelKey
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "test-pod",
+				Namespace:   "default",
+				Annotations: annotations,
+			},
+		}
+	}
+
+	deletingPod := ovnPod(nil)
+	deletingPod.DeletionTimestamp = ptr.To(metav1.Now())
+	hostNetworkPod := ovnPod(nil)
+	hostNetworkPod.Spec.HostNetwork = true
+
 	tests := []struct {
 		name          string
 		pod           *corev1.Pod
@@ -1033,102 +1055,50 @@ func TestHandleRepairTunnelKey(t *testing.T) {
 		wantValue     string
 	}{
 		{
-			name: "patches missing tunnel_key from subnet status",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-						util.AllocatedAnnotation:     "true",
-					},
-				},
-			},
+			name:          "patches missing tunnel_key from subnet status",
+			pod:           ovnPod(nil),
 			subnet:        ovnSubnet(1234),
 			wantAnnotated: true,
 			wantValue:     "1234",
 		},
 		{
-			name: "leaves existing positive annotation untouched",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-						util.AllocatedAnnotation:     "true",
-						util.TunnelKeyAnnotation:     "999",
-					},
-				},
-			},
+			name:          "leaves existing positive annotation untouched",
+			pod:           ovnPod(ptr.To("999")),
 			subnet:        ovnSubnet(1234),
 			wantAnnotated: true,
 			wantValue:     "999",
 		},
 		{
-			name: "repairs zero annotation",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-						util.AllocatedAnnotation:     "true",
-						util.TunnelKeyAnnotation:     "0",
-					},
-				},
-			},
+			name:          "repairs zero annotation",
+			pod:           ovnPod(ptr.To("0")),
 			subnet:        ovnSubnet(1234),
 			wantAnnotated: true,
 			wantValue:     "1234",
 		},
 		{
-			name: "repairs non-numeric annotation",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-						util.AllocatedAnnotation:     "true",
-						util.TunnelKeyAnnotation:     "invalid",
-					},
-				},
-			},
+			name:          "repairs non-numeric annotation",
+			pod:           ovnPod(ptr.To("invalid")),
 			subnet:        ovnSubnet(1234),
 			wantAnnotated: true,
 			wantValue:     "1234",
 		},
 		{
-			name: "repairs out-of-range annotation",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-						util.AllocatedAnnotation:     "true",
-						util.TunnelKeyAnnotation:     strconv.Itoa(maxTunnelKey + 1),
-					},
-				},
-			},
+			name:          "repairs out-of-range annotation",
+			pod:           ovnPod(ptr.To(strconv.Itoa(maxTunnelKey + 1))),
 			subnet:        ovnSubnet(1234),
 			wantAnnotated: true,
 			wantValue:     "1234",
 		},
 		{
-			name: "requeues when subnet tunnel key not synced yet",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-						util.AllocatedAnnotation:     "true",
-					},
-				},
-			},
+			name:    "requeues when subnet tunnel key not synced yet",
+			pod:     ovnPod(nil),
 			subnet:  ovnSubnet(0),
+			wantErr: true,
+		},
+		{
+			name:    "requeues when subnet tunnel key is out of range",
+			pod:     ovnPod(nil),
+			subnet:  ovnSubnet(maxTunnelKey + 1),
 			wantErr: true,
 		},
 		{
@@ -1149,35 +1119,8 @@ func TestHandleRepairTunnelKey(t *testing.T) {
 				Status:     kubeovnv1.SubnetStatus{TunnelKey: 7},
 			},
 		},
-		{
-			name: "skips deleting pod",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:              "test-pod",
-					Namespace:         "default",
-					DeletionTimestamp: ptr.To(metav1.Now()),
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-						util.AllocatedAnnotation:     "true",
-					},
-				},
-			},
-			subnet: ovnSubnet(1234),
-		},
-		{
-			name: "skips hostNetwork pod",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-pod",
-					Namespace: "default",
-					Annotations: map[string]string{
-						util.LogicalSwitchAnnotation: "ovn-subnet",
-					},
-				},
-				Spec: corev1.PodSpec{HostNetwork: true},
-			},
-			subnet: ovnSubnet(1234),
-		},
+		{name: "skips deleting pod", pod: deletingPod, subnet: ovnSubnet(1234)},
+		{name: "skips hostNetwork pod", pod: hostNetworkPod, subnet: ovnSubnet(1234)},
 	}
 
 	for _, tt := range tests {
@@ -1193,6 +1136,10 @@ func TestHandleRepairTunnelKey(t *testing.T) {
 			err = c.handleRepairTunnelKey("default/test-pod")
 			if tt.wantErr {
 				require.Error(t, err)
+				updated, getErr := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), "test-pod", metav1.GetOptions{})
+				require.NoError(t, getErr)
+				_, ok := updated.Annotations[util.TunnelKeyAnnotation]
+				require.False(t, ok, "invalid subnet tunnel key must never be patched")
 				return
 			}
 			require.NoError(t, err)

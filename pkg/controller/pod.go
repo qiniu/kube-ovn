@@ -663,10 +663,10 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 // The handler is fed by the dedicated repairTunnelKeyQueue, which is populated
 // by enqueuePodTunnelKeyRepair during InitIPAM on controller start (the
 // allocation path never re-patches already-allocated pods). It is idempotent:
-// pods that already carry the annotation are left untouched, and a subnet whose
-// tunnel key has not been synced yet (Status.TunnelKey == 0) is never used to
-// record a stale zero value - the handler returns an error instead so the
-// rate-limited queue retries until the key becomes available.
+// pods that already carry a valid annotation are left untouched, and a subnet
+// whose tunnel key is missing or outside OVN's valid range is never used to
+// record an invalid value - the handler returns an error instead so the
+// rate-limited queue retries until a valid key becomes available.
 //
 // Repair is multi-NIC aware and driven purely by the per-provider annotations
 // the allocation wrote (allocated + logical_switch): every OVN subnet has its
@@ -726,8 +726,8 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 		if !isOvnSubnet(subnet) {
 			continue
 		}
-		if subnet.Status.TunnelKey == 0 {
-			// Never record a stale zero key; requeue until the key syncs.
+		if !isValidTunnelKey(subnet.Status.TunnelKey) {
+			// Never record an invalid key; requeue until the key syncs.
 			keyNotReady = true
 			continue
 		}
