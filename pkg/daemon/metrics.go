@@ -26,6 +26,14 @@ var (
 		[]string{"node_name"},
 	)
 
+	cniWaitTunnelKeyResult = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cni_wait_tunnel_key_seconds_total",
+			Help: "Latency that CNI waits for the VPC tunnel_key annotation",
+		},
+		[]string{"node_name"},
+	)
+
 	cniWaitRouteResult = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "cni_wait_route_seconds_total",
@@ -143,6 +151,7 @@ func InitMetrics() {
 	registerSystemParameterMetrics()
 	metrics.Registry.MustRegister(cniOperationHistogram)
 	metrics.Registry.MustRegister(cniWaitAddressResult)
+	metrics.Registry.MustRegister(cniWaitTunnelKeyResult)
 	metrics.Registry.MustRegister(cniConnectivityResult)
 }
 

@@ -19,10 +19,11 @@ The guarantee is upheld by two flows:
 allocation (requeues, persisting no pod annotations) while the resolved
 subnet's tunnel key has not been synced from OVN SB
 (`Status.TunnelKey == 0`), and writes the tunnel_key annotation in the same
-atomic patch as `allocated=true`. The kube-ovn CNI server blocks until
-`allocated=true`, and Cilium (chained after kube-ovn, the primary CNI) only
-runs once kube-ovn's CNI ADD has succeeded, so by the time Cilium reads the
-pod, the annotation is present and non-zero.
+atomic patch as `allocated=true`. For a non-vlan OVN VPC subnet, the
+kube-ovn CNI server blocks until `allocated=true` and the pod annotation is
+a valid value equal to `Subnet.Status.TunnelKey`. Cilium (chained after
+kube-ovn, the primary CNI) only runs once kube-ovn's CNI ADD has succeeded,
+so by the time Cilium reads the pod, the annotation is correct.
 
 For a multi-NIC pod, an earlier loop iteration may already have created
 idempotent LSP/IP CR state before a later NIC hits the gate. This does not
@@ -32,9 +33,9 @@ the earlier objects again.
 
 Why flow 1 cannot produce a missing annotation: `reconcileAllocateSubnets`
 returns an error without persisting pod annotations while any requested
-OVN VPC subnet's tunnel key is not ready; `tunnel_key` and `allocated=true` are
-written in the same atomic patch; and the CNI server blocks on
-`allocated=true`. So under the current code a pod either carries the
+OVN VPC subnet's tunnel key is not ready; `tunnel_key` and `allocated=true`
+are written in the same atomic patch; and the CNI server verifies both before
+returning success. So under the current code a pod either carries the correct
 annotation or is still waiting at CNI ADD - a missing annotation therefore
 implies a legacy pod created before this guarantee existed, which is exactly
 the population flow 2 repairs.
@@ -103,17 +104,18 @@ TunnelKey value.
 ## Intended upgrade sequence
 
 Restart kube-ovn-controller first (flow 2 backfills the annotations), then
-restart cilium so it re-reads them for already-created endpoints. Note the
-CNI server only waits for `allocated=true`, so a CNI ADD for a legacy pod
-racing ahead of the repair proceeds without the annotation; if the ADD
-succeeds there is no kubelet retry, and the stale Cilium endpoint is
-corrected by the ordered cilium restart.
+restart cilium so it re-reads them for already-created endpoints. For every
+new CNI ADD on a non-vlan OVN VPC subnet, the CNI server waits for both
+`allocated=true` and a valid annotation equal to `Subnet.Status.TunnelKey`;
+if backfill has not completed within the wait loop, ADD fails and kubelet
+retries. The cilium restart is still required for endpoints created before
+the backfill logic existed.
 
 ## Known gaps (documented, not closed by code)
 
 - Repair progress is observable via `pod_tunnel_key_repair_patch_total`
-  (annotation patches that wrote one or more tunnel_key annotations; a
-  multi-NIC pod can be patched more than once) and
+  (annotation patches that added, corrected or removed one or more tunnel_key
+  annotations; a multi-NIC pod can be patched more than once) and
   `pod_tunnel_key_repair_skipped_total` (repairs skipped because the
   logical_switch subnet no longer exists) - see
   pkg/controller/tunnel_key_metrics.go.
@@ -130,8 +132,5 @@ corrected by the ordered cilium restart.
   because the pod usually cannot survive its subnet's deletion anyway.
 - The upgrade sequence above is operator discipline, not enforced by code:
   restarting cilium before the backfill completes leaves already-created
-  endpoints on the non-VPC scheme until the next cilium restart.
-- A CNI ADD racing the repair for a legacy pod is not closed by the CNI
-  server (it only waits for `allocated=true`) nor by a kubelet retry when
-  the ADD succeeds; the stale Cilium endpoint is corrected by the ordered
-  cilium restart in the upgrade sequence above.
+  endpoints on the non-VPC scheme until the next cilium restart. This affects
+  only endpoints that already exist; CNI ADD itself is fail-closed on the key.

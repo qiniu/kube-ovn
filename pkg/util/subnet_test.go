@@ -2,7 +2,87 @@ package util
 
 import (
 	"testing"
+
+	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 )
+
+func TestIsValidTunnelKey(t *testing.T) {
+	tests := []struct {
+		key  int
+		want bool
+	}{
+		{key: -1, want: false},
+		{key: 0, want: false},
+		{key: 1, want: true},
+		{key: MaxTunnelKey, want: true},
+		{key: MaxTunnelKey + 1, want: false},
+	}
+	for _, tt := range tests {
+		if got := IsValidTunnelKey(tt.key); got != tt.want {
+			t.Errorf("IsValidTunnelKey(%d) = %v, want %v", tt.key, got, tt.want)
+		}
+	}
+}
+
+func TestIsOvnVpcSubnet(t *testing.T) {
+	tests := []struct {
+		name   string
+		subnet *kubeovnv1.Subnet
+		want   bool
+	}{
+		{name: "nil", subnet: nil, want: false},
+		{
+			name: "implicit default VPC non-vlan subnet",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: ""},
+			},
+			want: true,
+		},
+		{
+			name: "default cluster router VPC non-vlan subnet",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: OvnProvider, Vpc: DefaultVpc},
+			},
+			want: true,
+		},
+		{
+			name: "custom VPC non-vlan subnet",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: OvnProvider, Vpc: "custom-vpc"},
+			},
+			want: true,
+		},
+		{
+			name: "default VPC vlan underlay subnet",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: OvnProvider, Vpc: DefaultVpc, Vlan: "vlan-a"},
+			},
+			want: false,
+		},
+		{
+			name: "custom VPC vlan underlay subnet",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: OvnProvider, Vpc: "custom-vpc", Vlan: "vlan-a"},
+			},
+			want: false,
+		},
+		{
+			name: "non-OVN provider",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: "external.provider"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsOvnVpcSubnet(tt.subnet); got != tt.want {
+				t.Errorf("IsOvnVpcSubnet() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestIsOvnProvider(t *testing.T) {
 	testCases := []struct {

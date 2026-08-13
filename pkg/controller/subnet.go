@@ -1977,13 +1977,6 @@ func isOvnSubnet(subnet *kubeovnv1.Subnet) bool {
 	return subnet != nil && util.IsOvnProvider(subnet.Spec.Provider)
 }
 
-// isOvnVpcSubnet reports whether the subnet participates in the VPC tunnel-key
-// guarantee. It includes default and custom VPCs; Vlan is the only VPC/underlay
-// discriminator after the OVN-provider check.
-func isOvnVpcSubnet(subnet *kubeovnv1.Subnet) bool {
-	return isOvnSubnet(subnet) && subnet.Spec.Vlan == ""
-}
-
 func formatExcludeIPRanges(subnet *kubeovnv1.Subnet) {
 	var excludeIPs []string
 	mapIPs := make(map[string]*ipam.IPRange, len(subnet.Spec.ExcludeIps))
@@ -3294,8 +3287,8 @@ func (c *Controller) syncNadMacvlanMasterAnnotation(subnet *kubeovnv1.Subnet) er
 }
 
 func (c *Controller) reconcileSubnetTunnelKey(subnet *kubeovnv1.Subnet) error {
-	if isOvnVpcSubnet(subnet) {
-		if isValidTunnelKey(subnet.Status.TunnelKey) {
+	if util.IsOvnVpcSubnet(subnet) {
+		if util.IsValidTunnelKey(subnet.Status.TunnelKey) {
 			return nil
 		}
 		return c.syncSubnetTunnelKey(subnet)
@@ -3313,7 +3306,7 @@ func (c *Controller) syncSubnetTunnelKey(subnet *kubeovnv1.Subnet) error {
 		klog.Error(err)
 		return err
 	}
-	if !isValidTunnelKey(tunnelKey) {
+	if !util.IsValidTunnelKey(tunnelKey) {
 		err := fmt.Errorf("invalid tunnel key %d for logical switch %s", tunnelKey, subnet.Name)
 		klog.Error(err)
 		return err

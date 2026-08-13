@@ -573,13 +573,6 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 // repairTunnelKeyQueue for legacy pods) plus the upgrade sequence and known
 // gaps are documented in docs/tunnel-key-annotation-guarantee.md.
 
-// OVN Datapath_Binding.tunnel_key is a 24-bit value with zero reserved.
-const maxTunnelKey = 1<<24 - 1
-
-func isValidTunnelKey(key int) bool {
-	return key > 0 && key <= maxTunnelKey
-}
-
 // tunnelKeyNotReady reports whether an IP must not be allocated from the given subnet yet
 // because its tunnel key (VNI) has not been synced from OVN SB or is outside the valid range.
 //
@@ -589,7 +582,7 @@ func isValidTunnelKey(key int) bool {
 // invalid tunnel_key in the pod annotation and make Cilium fall back to the non-VPC endpoint
 // scheme. reconcileAllocateSubnets checks this on the resolved subnet before it persists a pod.
 func tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
-	return isOvnVpcSubnet(subnet) && !isValidTunnelKey(subnet.Status.TunnelKey)
+	return util.IsOvnVpcSubnet(subnet) && !util.IsValidTunnelKey(subnet.Status.TunnelKey)
 }
 
 // podProvidersNeedingTunnelKeyRepair returns allocated providers whose pod
@@ -622,15 +615,15 @@ func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 			providers = append(providers, provider)
 			continue
 		}
-		if !isOvnVpcSubnet(subnet) {
+		if !util.IsOvnVpcSubnet(subnet) {
 			if hasTunnelKey {
 				providers = append(providers, provider)
 			}
 			continue
 		}
 		tunnelKey, err := strconv.Atoi(tunnelKeyValue)
-		if !hasTunnelKey || err != nil || !isValidTunnelKey(tunnelKey) ||
-			!isValidTunnelKey(subnet.Status.TunnelKey) || tunnelKey != subnet.Status.TunnelKey {
+		if !hasTunnelKey || err != nil || !util.IsValidTunnelKey(tunnelKey) ||
+			!util.IsValidTunnelKey(subnet.Status.TunnelKey) || tunnelKey != subnet.Status.TunnelKey {
 			providers = append(providers, provider)
 		}
 	}
@@ -734,11 +727,11 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 			klog.Errorf("failed to get subnet %s for pod %s/%s: %v", lsName, namespace, name, err)
 			return err
 		}
-		if !isOvnVpcSubnet(subnet) {
+		if !util.IsOvnVpcSubnet(subnet) {
 			patch[tunnelKeyAnnot] = nil
 			continue
 		}
-		if !isValidTunnelKey(subnet.Status.TunnelKey) {
+		if !util.IsValidTunnelKey(subnet.Status.TunnelKey) {
 			// Never record an invalid key; requeue until the key syncs.
 			keyNotReady = true
 			continue
@@ -807,7 +800,7 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 				patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = c.config.PodNicType
 			}
 
-			if isOvnVpcSubnet(subnet) {
+			if util.IsOvnVpcSubnet(subnet) {
 				// Gate: never persist pod annotations for an OVN VPC subnet whose tunnel key (VNI)
 				// has not been synced from OVN SB yet, otherwise Cilium falls back to the non-VPC
 				// endpoint scheme. This checks the resolved subnet (which may differ from

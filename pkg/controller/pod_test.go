@@ -1056,9 +1056,9 @@ func TestTunnelKeyNotReady(t *testing.T) {
 	}{
 		{"ovn subnet, zero tunnel key is not ready", ovnSubnet(0), true},
 		{"ovn subnet, negative tunnel key is invalid", ovnSubnet(-1), true},
-		{"ovn subnet, out-of-range tunnel key is invalid", ovnSubnet(maxTunnelKey + 1), true},
+		{"ovn subnet, out-of-range tunnel key is invalid", ovnSubnet(util.MaxTunnelKey + 1), true},
 		{"ovn subnet, tunnel key ready", ovnSubnet(5), false},
-		{"ovn subnet, maximum tunnel key is valid", ovnSubnet(maxTunnelKey), false},
+		{"ovn subnet, maximum tunnel key is valid", ovnSubnet(util.MaxTunnelKey), false},
 		{"ovn vlan subnet keeps default tunnel key", vlanSubnet, false},
 		{"non-ovn subnet is ignored", nonOvnSubnet, false},
 		{"nil subnet is nil-safe", nil, false},
@@ -1151,7 +1151,7 @@ func TestHandleRepairTunnelKey(t *testing.T) {
 		},
 		{
 			name:          "repairs out-of-range annotation",
-			pod:           ovnPod(ptr.To(strconv.Itoa(maxTunnelKey + 1))),
+			pod:           ovnPod(ptr.To(strconv.Itoa(util.MaxTunnelKey + 1))),
 			subnet:        ovnSubnet(1234),
 			wantAnnotated: true,
 			wantValue:     "1234",
@@ -1165,7 +1165,7 @@ func TestHandleRepairTunnelKey(t *testing.T) {
 		{
 			name:    "requeues when subnet tunnel key is out of range",
 			pod:     ovnPod(nil),
-			subnet:  ovnSubnet(maxTunnelKey + 1),
+			subnet:  ovnSubnet(util.MaxTunnelKey + 1),
 			wantErr: true,
 		},
 		{

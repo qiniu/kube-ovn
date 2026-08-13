@@ -701,7 +701,7 @@ func Test_syncSubnetTunnelKey(t *testing.T) {
 		require.Contains(t, err.Error(), "sb unavailable")
 	})
 
-	for _, tunnelKey := range []int{0, -1, maxTunnelKey + 1} {
+	for _, tunnelKey := range []int{0, -1, util.MaxTunnelKey + 1} {
 		t.Run(fmt.Sprintf("rejects invalid tunnel key %d", tunnelKey), func(t *testing.T) {
 			fc.mockOvnSbClient.EXPECT().GetLogicalSwitchTunnelKey("test-ovn-subnet").
 				Return(tunnelKey, nil)
@@ -777,66 +777,6 @@ func Test_reconcileSubnetTunnelKey(t *testing.T) {
 				context.Background(), tt.subnet.Name, metav1.GetOptions{})
 			require.NoError(t, err)
 			require.Equal(t, tt.wantStatus, updated.Status.TunnelKey)
-		})
-	}
-}
-
-func Test_isOvnVpcSubnet(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		subnet *kubeovnv1.Subnet
-		want   bool
-	}{
-		{name: "nil", subnet: nil, want: false},
-		{
-			name: "implicit default VPC non-vlan subnet",
-			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: ""},
-			},
-			want: true,
-		},
-		{
-			name: "default cluster router VPC non-vlan subnet",
-			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: util.DefaultVpc},
-			},
-			want: true,
-		},
-		{
-			name: "custom VPC non-vlan subnet",
-			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "custom-vpc"},
-			},
-			want: true,
-		},
-		{
-			name: "default VPC vlan underlay subnet",
-			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: util.DefaultVpc, Vlan: "vlan-a"},
-			},
-			want: false,
-		},
-		{
-			name: "custom VPC vlan underlay subnet",
-			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "custom-vpc", Vlan: "vlan-a"},
-			},
-			want: false,
-		},
-		{
-			name: "non-OVN provider",
-			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: "external.provider"},
-			},
-			want: false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, isOvnVpcSubnet(tc.subnet))
 		})
 	}
 }
