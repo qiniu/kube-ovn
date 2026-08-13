@@ -791,23 +791,37 @@ func Test_isOvnVpcSubnet(t *testing.T) {
 	}{
 		{name: "nil", subnet: nil, want: false},
 		{
-			name: "default provider non-vlan subnet",
+			name: "implicit default VPC non-vlan subnet",
 			subnet: &kubeovnv1.Subnet{
 				Spec: kubeovnv1.SubnetSpec{Provider: ""},
 			},
 			want: true,
 		},
 		{
-			name: "explicit OVN non-vlan subnet",
+			name: "default cluster router VPC non-vlan subnet",
 			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: util.DefaultVpc},
 			},
 			want: true,
 		},
 		{
-			name: "OVN vlan underlay subnet",
+			name: "custom VPC non-vlan subnet",
 			subnet: &kubeovnv1.Subnet{
-				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a"},
+				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "custom-vpc"},
+			},
+			want: true,
+		},
+		{
+			name: "default VPC vlan underlay subnet",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: util.DefaultVpc, Vlan: "vlan-a"},
+			},
+			want: false,
+		},
+		{
+			name: "custom VPC vlan underlay subnet",
+			subnet: &kubeovnv1.Subnet{
+				Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "custom-vpc", Vlan: "vlan-a"},
 			},
 			want: false,
 		},

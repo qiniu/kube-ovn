@@ -2,7 +2,10 @@
 
 Every non-hostNetwork pod on a non-vlan OVN VPC subnet carries a valid
 `ovn.kubernetes.io/tunnel_key` (VNI) annotation by the time its network is
-configured (CNI ADD). VLAN/underlay and non-OVN subnets keep the default
+configured (CNI ADD). This includes both the default cluster-router VPC and
+custom VPCs. The exact scope predicate is
+`isOvnSubnet(subnet) && subnet.Spec.Vlan == ""`. VLAN/underlay and non-OVN
+subnets keep the default
 `status.tunnelKey=0` and do not carry the pod annotation. Cilium
 (native-vpc mode) keys pod identities by this annotation, so a missing
 annotation makes the pod fall back to the non-VPC scheme and collide with

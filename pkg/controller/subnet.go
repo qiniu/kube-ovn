@@ -1978,8 +1978,8 @@ func isOvnSubnet(subnet *kubeovnv1.Subnet) bool {
 }
 
 // isOvnVpcSubnet reports whether the subnet participates in the VPC tunnel-key
-// guarantee. OVN vlan/underlay subnets still use OVN logical switches, but they
-// are not VPC overlay subnets and keep the default TunnelKey value.
+// guarantee. It includes default and custom VPCs; Vlan is the only VPC/underlay
+// discriminator after the OVN-provider check.
 func isOvnVpcSubnet(subnet *kubeovnv1.Subnet) bool {
 	return isOvnSubnet(subnet) && subnet.Spec.Vlan == ""
 }
