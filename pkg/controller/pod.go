@@ -519,6 +519,13 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 		return err
 	}
 
+	// Re-enqueue the tunnel_key repair for already-allocated OVN pods missing
+	// the annotation (idempotent, normally a no-op). Complements the InitIPAM
+	// startup sweep: a pod the sweep skipped because its network could not be
+	// resolved at that moment heals on its next update event instead of
+	// waiting for a controller restart.
+	c.enqueuePodTunnelKeyRepair(pod, podNets)
+
 	// check and do hotnoplug nic
 	if pod, err = c.syncKubeOvnNet(pod, podNets); err != nil {
 		klog.Errorf("failed to sync pod nets %v", err)
@@ -583,10 +590,38 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 //     until the key becomes available (subnet reconcile may still be
 //     syncing it). A CNI ADD racing ahead of the repair is retried by the
 //     kubelet once the annotation is in place.
+//     Enqueue is not one-shot: the pod reconcile path (handleAddOrUpdatePod)
+//     and a periodic resync (resyncPodTunnelKey) also enqueue repairs, so a
+//     pod the startup sweep missed (e.g. its NAD or default subnet could not
+//     be resolved at that moment) heals on the next pod update or resync tick
+//     instead of requiring another controller restart.
 //
 // Intended upgrade sequence: restart kube-ovn-controller first (this flow
 // backfills the annotations), then restart cilium so it re-reads them for
 // already-created endpoints.
+//
+// Why flow 1 cannot produce a missing annotation: the pod NIC (LSP) is created
+// at a single point, reconcileAllocateSubnets, and that path returns an error
+// (persisting nothing) while tunnelKeyNotReady; tunnel_key and allocated=true
+// are written in the same atomic patch; and the CNI server blocks on
+// allocated=true before any NIC exists. So under the current code a pod either
+// carries the annotation or is still waiting at CNI ADD - a missing annotation
+// therefore implies a legacy pod created before this guarantee existed, which
+// is exactly the population flow 2 repairs.
+//
+// Known gaps (documented, not closed by code):
+//   - No metric counts pods missing the annotation or repairs skipped by the
+//     startup sweep (see TODO(metrics) in resyncPodTunnelKeyOnce).
+//   - Repair keying is by podNet.ProviderName (AllocatedAnnotationTemplate /
+//     TunnelKeyAnnotationTemplate); a mismatch with the key Cilium actually
+//     reads for a multus secondary NIC would write an annotation that is not
+//     honored (TODO: confirm the provider-name contract with Cilium).
+//   - The upgrade sequence above is operator discipline, not enforced by code:
+//     restarting cilium before the backfill completes leaves already-created
+//     endpoints on the non-VPC scheme until the next cilium restart.
+//   - A CNI ADD racing the repair for a legacy pod relies on the kubelet
+//     retrying once the annotation lands; Cilium itself may keep the stale
+//     endpoint until restarted (see the upgrade sequence).
 //
 // tunnelKeyNotReady reports whether an IP must not be allocated from the given subnet yet
 // because its tunnel key (VNI) has not been synced from OVN SB (still 0).
@@ -604,12 +639,15 @@ func (c *Controller) tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 // tunnel_key (VNI) annotation into the dedicated repair queue, so that
 // handleRepairTunnelKey patches it shortly after controller start.
 //
-// It is called from InitIPAM's pod loop, reusing its pod-level filtering
-// (hostNetwork, alive) and the already-resolved podNets. The enqueue is
-// independent of the subnet key state: the repair handler retries until the
-// key becomes available, so a pod whose subnet key is still 0 at init time is
-// not lost.
+// It is called from InitIPAM's pod loop, from the pod reconcile path
+// (handleAddOrUpdatePod) and from a periodic resync (resyncPodTunnelKeyOnce),
+// reusing the already-resolved podNets. The enqueue is independent of the
+// subnet key state: the repair handler retries until the key becomes
+// available, so a pod whose subnet key is still 0 at init time is not lost.
 func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod, podNets []*kubeovnNet) {
+	if !isPodAlive(pod) {
+		return
+	}
 	for _, podNet := range podNets {
 		if !isOvnSubnet(podNet.Subnet) {
 			continue
@@ -664,7 +702,7 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 		return err
 	}
 
-	var patch = util.KVPatch{}
+	patch := util.KVPatch{}
 	keyNotReady := false
 	for _, podNet := range podNets {
 		subnet := podNet.Subnet
@@ -698,6 +736,62 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 	}
 	klog.Infof("repaired tunnel key annotation for pod %s/%s", namespace, name)
 	return nil
+}
+
+// tunnelKeyResyncInterval is how often resyncPodTunnelKey re-scans all pods
+// for missing tunnel_key annotations. The startup sweep (InitIPAM) can miss a
+// pod when its network cannot be resolved at that moment (e.g. the NAD or the
+// default subnet is not yet available); the periodic resync heals those pods
+// without requiring a controller restart, and also covers pods that lose the
+// annotation at runtime.
+const tunnelKeyResyncInterval = 5 * time.Minute
+
+// resyncPodTunnelKeyOnce is one tick of the periodic tunnel_key resync: it
+// lists all pods and enqueues the ones missing the annotation. The enqueue and
+// the repair handler are both idempotent, so repeated ticks are cheap.
+//
+// This is a defensive safety net: new pods cannot reach the missing-annotation
+// state (the allocation gate + atomic patch + CNI wait guarantee it, see the
+// Guarantee comment on tunnelKeyNotReady), so this only covers legacy pods the
+// startup sweep skipped. TODO(metrics): increment a counter here (and on the
+// getPodKubeovnNets error path) so silently skipped repairs are observable.
+func (c *Controller) resyncPodTunnelKeyOnce() error {
+	pods, err := c.podsLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("failed to list pods for tunnel_key resync: %w", err)
+	}
+	for _, pod := range pods {
+		if pod.Spec.HostNetwork || !isPodAlive(pod) {
+			continue
+		}
+		podNets, err := c.getPodKubeovnNets(pod)
+		if err != nil {
+			// Transient resolution failures are retried on the next tick.
+			klog.Errorf("failed to get pod nets for %s/%s during tunnel_key resync: %v", pod.Namespace, pod.Name, err)
+			continue
+		}
+		c.enqueuePodTunnelKeyRepair(pod, podNets)
+	}
+	return nil
+}
+
+// resyncPodTunnelKey periodically re-scans all pods and enqueues tunnel_key
+// repairs for any that are missing the annotation (see the Guarantee comment
+// on tunnelKeyNotReady). Started alongside the workers so the repair queue
+// keeps closing the gap even for pods the InitIPAM sweep missed.
+func (c *Controller) resyncPodTunnelKey(ctx context.Context) {
+	ticker := time.NewTicker(tunnelKeyResyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.resyncPodTunnelKeyOnce(); err != nil {
+				klog.Errorf("tunnel_key resync failed: %v", err)
+			}
+		}
+	}
 }
 
 // do the same thing as add pod
