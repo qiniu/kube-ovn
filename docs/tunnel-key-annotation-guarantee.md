@@ -10,24 +10,29 @@ The guarantee is upheld by two flows:
 
 ## Flow 1: normal pod creation
 
-`reconcileAllocateSubnets` (pkg/controller/pod.go) refuses to allocate
-(requeues, persisting nothing) while the resolved subnet's tunnel key has
-not been synced from OVN SB (`Status.TunnelKey == 0`), and writes the
-tunnel_key annotation in the same atomic patch as `allocated=true`. The
-kube-ovn CNI server blocks until `allocated=true`, and Cilium (chained
-after kube-ovn, the primary CNI) only runs once kube-ovn's CNI ADD has
-succeeded, so by the time Cilium reads the pod, the annotation is present
-and non-zero.
+`reconcileAllocateSubnets` (pkg/controller/pod.go) refuses to complete the
+allocation (requeues, persisting no pod annotations) while the resolved
+subnet's tunnel key has not been synced from OVN SB
+(`Status.TunnelKey == 0`), and writes the tunnel_key annotation in the same
+atomic patch as `allocated=true`. The kube-ovn CNI server blocks until
+`allocated=true`, and Cilium (chained after kube-ovn, the primary CNI) only
+runs once kube-ovn's CNI ADD has succeeded, so by the time Cilium reads the
+pod, the annotation is present and non-zero.
 
-Why flow 1 cannot produce a missing annotation: the pod NIC (LSP) is
-created at a single point, `reconcileAllocateSubnets`, and that path
-returns an error (persisting nothing) while the tunnel key is not ready;
-`tunnel_key` and `allocated=true` are written in the same atomic patch;
-and the CNI server blocks on `allocated=true` before any NIC exists. So
-under the current code a pod either carries the annotation or is still
-waiting at CNI ADD - a missing annotation therefore implies a legacy pod
-created before this guarantee existed, which is exactly the population
-flow 2 repairs.
+For a multi-NIC pod, an earlier loop iteration may already have created
+idempotent LSP/IP CR state before a later NIC hits the gate. This does not
+weaken the CNI-visible guarantee: the pod annotation patch is committed only
+after every requested OVN NIC passes the gate, and retries safely reconcile
+the earlier objects again.
+
+Why flow 1 cannot produce a missing annotation: `reconcileAllocateSubnets`
+returns an error without persisting pod annotations while any requested
+OVN subnet's tunnel key is not ready; `tunnel_key` and `allocated=true` are
+written in the same atomic patch; and the CNI server blocks on
+`allocated=true`. So under the current code a pod either carries the
+annotation or is still waiting at CNI ADD - a missing annotation therefore
+implies a legacy pod created before this guarantee existed, which is exactly
+the population flow 2 repairs.
 
 ## Flow 2: kube-ovn-controller restart / legacy pods
 
@@ -66,6 +71,30 @@ afterwards); a `logical_switch` that does not resolve is counted by
 not all-or-nothing: ready providers are patched in one call even when
 another provider's subnet key is still 0 (the handler then returns an
 error to requeue for the remainder).
+
+## Failure mode and diagnosis
+
+The allocation gate is intentionally fail-closed. If an OVN subnet's tunnel
+key cannot be observed (for example, OVN SB is unreachable or northd has not
+created the logical switch's `Datapath_Binding`), new pods on that subnet are
+not allocated with a guessed or zero VNI:
+
+- the pod remains in `ContainerCreating`;
+- kube-ovn CNI waits for `allocated=true`, fails after its wait loop, and the
+  kubelet retries CNI ADD;
+- the pod receives an `AcquireAddressFailed` event containing
+  `subnet <name> tunnel key not observed on allocation`.
+
+Check the subnet status with:
+
+```bash
+kubectl get subnet <name> -o jsonpath='{.status.tunnelKey}'
+```
+
+A value of `0` means the key has not been synchronized. Check OVN SB
+reachability and whether the logical switch has a `Datapath_Binding` in SB.
+Underlay/vlan subnets also use OVN logical switches and are subject to this
+gate.
 
 ## Intended upgrade sequence
 

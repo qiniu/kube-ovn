@@ -788,6 +788,59 @@ func TestReconcileAllocateSubnets_allowedWhenTunnelKeySynced(t *testing.T) {
 	require.Equal(t, "1234", allocated.Annotations[tunnelKeyKey])
 }
 
+func TestReconcileAllocateSubnetsClearsStaleTunnelKeyForNonOVNProvider(t *testing.T) {
+	const provider = "net1.default"
+	logicalSwitchKey := fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)
+	podNicKey := fmt.Sprintf(util.PodNicAnnotationTemplate, provider)
+	tunnelKeyKey := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)
+	allocatedKey := fmt.Sprintf(util.AllocatedAnnotationTemplate, provider)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				logicalSwitchKey: "old-ovn-subnet",
+				podNicKey:        util.VethType,
+				tunnelKeyKey:     "1234",
+			},
+		},
+	}
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ipam-only-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.2.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  provider,
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:    []*kubeovnv1.Subnet{subnet},
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.ipam = newIPAMForTest([]*kubeovnv1.Subnet{subnet})
+
+	allocated, err := c.reconcileAllocateSubnets(pod, []*kubeovnNet{{
+		Type:         providerTypeIPAM,
+		ProviderName: provider,
+		Subnet:       subnet,
+	}})
+	require.NoError(t, err)
+	require.NotNil(t, allocated)
+	require.Equal(t, "true", allocated.Annotations[allocatedKey])
+	_, ok := allocated.Annotations[logicalSwitchKey]
+	require.False(t, ok, "non-OVN provider must not keep a stale logical_switch")
+	_, ok = allocated.Annotations[podNicKey]
+	require.False(t, ok, "non-OVN provider must not keep a stale pod_nic")
+	_, ok = allocated.Annotations[tunnelKeyKey]
+	require.False(t, ok, "non-OVN provider must not keep a stale tunnel_key")
+}
+
 func TestGetNamedPortByNsReturnsCopy(t *testing.T) {
 	np := NewNamedPort()
 	pod := &corev1.Pod{

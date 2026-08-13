@@ -780,11 +780,13 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		patch[fmt.Sprintf(util.CidrAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.CIDRBlock
 		patch[fmt.Sprintf(util.GatewayAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.Gateway
 		if isOvnSubnet(podNet.Subnet) {
-			// Gate: never persist an OVN pod whose subnet tunnel key (VNI) has not been synced from
-			// OVN SB yet, otherwise Cilium falls back to the non-VPC endpoint scheme. This runs on the
-			// resolved subnet (which may differ from podNet.Subnet for a static IP in a multi-subnet
-			// namespace) before any LSP or annotation is persisted, so the pod is simply requeued
-			// until the key is ready. A non-OVN resolved subnet has no tunnel key and is left as-is.
+			// Gate: never persist pod annotations for an OVN subnet whose tunnel key (VNI) has not
+			// been synced from OVN SB yet, otherwise Cilium falls back to the non-VPC endpoint scheme.
+			// This checks the resolved subnet (which may differ from podNet.Subnet for a static IP in a
+			// multi-subnet namespace) before the annotation patch is committed. In a multi-NIC pod,
+			// earlier loop iterations may already have created idempotent LSP/IP CR state, but CNI-visible
+			// annotations remain all-or-nothing and the retry safely reconciles those objects again.
+			// A non-OVN resolved subnet has no tunnel key and is left as-is.
 			if c.tunnelKeyNotReady(subnet) {
 				err := fmt.Errorf("subnet %s tunnel key not observed on allocation, requeuing", subnet.Name)
 				c.recorder.Eventf(pod, v1.EventTypeWarning, "AcquireAddressFailed", err.Error())
@@ -802,6 +804,9 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		} else {
 			patch[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, podNet.ProviderName)] = nil
 			patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = nil
+			// Preserve the annotation invariant used by podProvidersMissingTunnelKey:
+			// a provider without logical_switch never carries a stale tunnel_key.
+			patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = nil
 		}
 		patch[fmt.Sprintf(util.AllocatedAnnotationTemplate, podNet.ProviderName)] = "true"
 		if vmKey != "" {
