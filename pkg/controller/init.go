@@ -472,6 +472,15 @@ func (c *Controller) InitIPAM() error {
 				// Append ExternalIds is added in v1.7, used for upgrading from v1.6.3. It should be deleted now since v1.7 is not used anymore.
 			}
 		}
+
+		// Enqueue OVN pods missing the tunnel_key (VNI) annotation into the
+		// dedicated repair queue. Cilium (native-vpc mode) keys pod identities
+		// by this annotation; pods allocated before the subnet tunnel key was
+		// synced from OVN SB (or before this code existed) keep a missing
+		// annotation forever. Reuses the pod-level filtering (hostNetwork,
+		// alive) done above. The repair handler retries until the subnet key
+		// becomes available, so pods are enqueued even if it is still 0.
+		c.enqueuePodTunnelKeyRepair(pod, podNets)
 	}
 
 	klog.Infof("Init IPAM from vip CR")

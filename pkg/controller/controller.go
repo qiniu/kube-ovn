@@ -88,10 +88,24 @@ type Controller struct {
 	// ExternalGatewayType define external gateway type, centralized
 	ExternalGatewayType string
 
-	podsLister             v1.PodLister
-	podsSynced             cache.InformerSynced
-	addOrUpdatePodQueue    workqueue.TypedRateLimitingInterface[string]
-	deletePodQueue         workqueue.TypedRateLimitingInterface[string]
+	podsLister          v1.PodLister
+	podsSynced          cache.InformerSynced
+	addOrUpdatePodQueue workqueue.TypedRateLimitingInterface[string]
+	deletePodQueue      workqueue.TypedRateLimitingInterface[string]
+	// repairTunnelKeyQueue is a dedicated queue for patching the tunnel_key
+	// (VNI) annotation onto pods that are missing it, closing the
+	// "must-have tunnel_key" guarantee after a controller restart (see the
+	// Guarantee comment on tunnelKeyNotReady in pod.go): pods allocated before
+	// the subnet tunnel key was synced (or before this code existed) keep a
+	// missing annotation forever because the allocation path never re-patches
+	// already-allocated pods. The queue is fed by the init flow on controller
+	// start (see enqueuePodTunnelKeyRepair, called from InitIPAM), keeping the
+	// repair out of the main pod reconcile path and out of the subnet
+	// reconcile path. Cilium (native-vpc mode) keys pod identities by this
+	// annotation, so the intended upgrade sequence is: restart
+	// kube-ovn-controller first (this queue backfills the annotations), then
+	// restart cilium, which picks them up.
+	repairTunnelKeyQueue   workqueue.TypedRateLimitingInterface[string]
 	deletingPodObjMap      *xsync.Map[string, *corev1.Pod]
 	deletingNodeObjMap     *xsync.Map[string, *corev1.Node]
 	updatePodSecurityQueue workqueue.TypedRateLimitingInterface[string]
@@ -550,9 +564,10 @@ func Run(ctx context.Context, config *Configuration) {
 		providerNetworksLister: providerNetworkInformer.Lister(),
 		providerNetworkSynced:  providerNetworkInformer.Informer().HasSynced,
 
-		podsLister:          podInformer.Lister(),
-		podsSynced:          podInformer.Informer().HasSynced,
-		addOrUpdatePodQueue: newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil),
+		podsLister:           podInformer.Lister(),
+		podsSynced:           podInformer.Informer().HasSynced,
+		addOrUpdatePodQueue:  newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil),
+		repairTunnelKeyQueue: newTypedRateLimitingQueue[string]("RepairTunnelKey", nil),
 		deletePodQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{
@@ -1180,6 +1195,7 @@ func (c *Controller) shutdown() {
 
 	c.addOrUpdatePodQueue.ShutDown()
 	c.deletePodQueue.ShutDown()
+	c.repairTunnelKeyQueue.ShutDown()
 	c.updatePodSecurityQueue.ShutDown()
 
 	c.addNamespaceQueue.ShutDown()
@@ -1404,6 +1420,11 @@ func (c *Controller) startWorkers(ctx context.Context) {
 		go wait.Until(runWorker("delete pod", c.deletePodQueue, c.handleDeletePod), time.Second, ctx.Done())
 		go wait.Until(runWorker("add/update pod", c.addOrUpdatePodQueue, c.handleAddOrUpdatePod), time.Second, ctx.Done())
 		go wait.Until(runWorker("update pod security", c.updatePodSecurityQueue, c.handleUpdatePodSecurity), time.Second, ctx.Done())
+		// tunnel_key repairs are idempotent merge-patches; multiple workers only
+		// parallelize across different pods (workqueue guarantees a key is
+		// processed by one worker at a time), which keeps the startup backfill
+		// fast on large clusters.
+		go wait.Until(runWorker("repair tunnel key", c.repairTunnelKeyQueue, c.handleRepairTunnelKey), time.Second, ctx.Done())
 
 		go wait.Until(runWorker("delete subnet", c.deleteSubnetQueue, c.handleDeleteSubnet), time.Second, ctx.Done())
 		go wait.Until(runWorker("delete ippool", c.deleteIPPoolQueue, c.handleDeleteIPPool), time.Second, ctx.Done())

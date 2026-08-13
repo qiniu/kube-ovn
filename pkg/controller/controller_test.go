@@ -200,6 +200,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		recorder:                record.NewFakeRecorder(100),
 		subnetKeyMutex:          keymutex.NewHashed(0),
 		addOrUpdateSubnetQueue:  newTypedRateLimitingQueue[string]("AddOrUpdateSubnet", nil),
+		repairTunnelKeyQueue:    newTypedRateLimitingQueue[string]("RepairTunnelKey", nil),
 		syncVirtualPortsQueue:   newTypedRateLimitingQueue[string]("SyncVirtualPort", nil),
 		updateSubnetStatusQueue: newTypedRateLimitingQueue[string]("UpdateSubnetStatus", nil),
 	}

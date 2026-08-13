@@ -553,6 +553,41 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 	return c.reconcileRouteSubnets(pod, needRouteSubnets(pod, podNets))
 }
 
+// Guarantee: must-have tunnel_key.
+//
+// Every non-hostNetwork pod on an OVN subnet carries a non-zero
+// "ovn.kubernetes.io/tunnel_key" (VNI) annotation by the time its network is
+// configured (CNI ADD). Cilium (native-vpc mode) keys pod identities by this
+// annotation, so a missing annotation would make the pod fall back to the
+// non-VPC scheme and collide with overlapping VPC subnets. The guarantee holds
+// in both flows below:
+//
+//  1. Normal pod creation flow.
+//     reconcileAllocateSubnets refuses to allocate (requeues, persisting
+//     nothing) while the resolved subnet's tunnel key has not been synced from
+//     OVN SB (Status.TunnelKey == 0), and writes the tunnel_key annotation in
+//     the same atomic patch as allocated=true. The kube-ovn CNI server blocks
+//     until allocated=true, and Cilium (chained after kube-ovn, the primary
+//     CNI) only runs once kube-ovn's CNI ADD has succeeded, so by the time
+//     Cilium reads the pod, the annotation is present and non-zero.
+//
+//  2. kube-ovn-controller restart flow.
+//     - Pods created after the restart follow flow 1 (the gate lives in the
+//     allocation path and is unrelated to restarts).
+//     - Pods that already carry the annotation keep it (persisted in etcd).
+//     - Legacy pods allocated before the subnet tunnel key was synced (or
+//     before this code existed) are missing the annotation. On startup
+//     InitIPAM enqueues them into repairTunnelKeyQueue
+//     (enqueuePodTunnelKeyRepair); the repair worker patches them from
+//     subnet.Status.TunnelKey shortly after startup, retrying with backoff
+//     until the key becomes available (subnet reconcile may still be
+//     syncing it). A CNI ADD racing ahead of the repair is retried by the
+//     kubelet once the annotation is in place.
+//
+// Intended upgrade sequence: restart kube-ovn-controller first (this flow
+// backfills the annotations), then restart cilium so it re-reads them for
+// already-created endpoints.
+//
 // tunnelKeyNotReady reports whether an IP must not be allocated from the given subnet yet
 // because its tunnel key (VNI) has not been synced from OVN SB (still 0).
 //
@@ -563,6 +598,106 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 // scheme. reconcileAllocateSubnets checks this on the resolved subnet before it persists a pod.
 func (c *Controller) tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 	return isOvnSubnet(subnet) && subnet.Status.TunnelKey == 0
+}
+
+// enqueuePodTunnelKeyRepair enqueues an allocated OVN pod that is missing the
+// tunnel_key (VNI) annotation into the dedicated repair queue, so that
+// handleRepairTunnelKey patches it shortly after controller start.
+//
+// It is called from InitIPAM's pod loop, reusing its pod-level filtering
+// (hostNetwork, alive) and the already-resolved podNets. The enqueue is
+// independent of the subnet key state: the repair handler retries until the
+// key becomes available, so a pod whose subnet key is still 0 at init time is
+// not lost.
+func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod, podNets []*kubeovnNet) {
+	for _, podNet := range podNets {
+		if !isOvnSubnet(podNet.Subnet) {
+			continue
+		}
+		if pod.Annotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, podNet.ProviderName)] != "true" {
+			continue
+		}
+		if _, ok := pod.Annotations[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)]; ok {
+			continue
+		}
+		key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+		c.repairTunnelKeyQueue.Add(key)
+		klog.Infof("enqueued tunnel_key repair for pod %s", key)
+		return
+	}
+}
+
+// handleRepairTunnelKey patches the tunnel_key (VNI) annotation onto pods that
+// are missing it. Cilium (native-vpc mode) keys pod identities by this
+// annotation, so a missing annotation makes the pod fall back to the non-VPC
+// scheme.
+//
+// The handler is fed by the dedicated repairTunnelKeyQueue, which is populated
+// by enqueuePodTunnelKeyRepair during InitIPAM on controller start (the
+// allocation path never re-patches already-allocated pods). It is idempotent:
+// pods that already carry the annotation are left untouched, and a subnet whose
+// tunnel key has not been synced yet (Status.TunnelKey == 0) is never used to
+// record a stale zero value - the handler returns an error instead so the
+// rate-limited queue retries until the key becomes available.
+func (c *Controller) handleRepairTunnelKey(key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		return nil
+	}
+
+	pod, err := c.podsLister.Pods(namespace).Get(name)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to get pod %s/%s: %v", namespace, name, err)
+		return err
+	}
+	if pod.Spec.HostNetwork {
+		return nil
+	}
+
+	podNets, err := c.getPodKubeovnNets(pod)
+	if err != nil {
+		klog.Errorf("failed to get pod nets for %s/%s: %v", namespace, name, err)
+		return err
+	}
+
+	var patch = util.KVPatch{}
+	keyNotReady := false
+	for _, podNet := range podNets {
+		subnet := podNet.Subnet
+		if !isOvnSubnet(subnet) {
+			continue
+		}
+		annotKey := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)
+		if _, ok := pod.Annotations[annotKey]; ok {
+			continue
+		}
+		if subnet.Status.TunnelKey == 0 {
+			// Never record a stale zero key; requeue until the key syncs.
+			keyNotReady = true
+			continue
+		}
+		patch[annotKey] = strconv.Itoa(subnet.Status.TunnelKey)
+	}
+	if keyNotReady {
+		return fmt.Errorf("tunnel key not observed for pod %s/%s, requeuing", namespace, name)
+	}
+	if len(patch) == 0 {
+		return nil
+	}
+
+	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(namespace), name, patch); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to patch tunnel key annotation for pod %s/%s: %v", namespace, name, err)
+		return err
+	}
+	klog.Infof("repaired tunnel key annotation for pod %s/%s", namespace, name)
+	return nil
 }
 
 // do the same thing as add pod
