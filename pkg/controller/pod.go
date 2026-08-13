@@ -564,7 +564,7 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 
 // Guarantee: must-have tunnel_key.
 //
-// Every non-hostNetwork pod on an OVN subnet carries a non-zero
+// Every non-hostNetwork pod on a non-vlan OVN VPC subnet carries a valid
 // "ovn.kubernetes.io/tunnel_key" (VNI) annotation by the time its network is
 // configured (CNI ADD); Cilium (native-vpc mode) keys pod identities by it, so
 // a missing annotation would make the pod fall back to the non-VPC scheme and
@@ -589,47 +589,62 @@ func isValidTunnelKey(key int) bool {
 // invalid tunnel_key in the pod annotation and make Cilium fall back to the non-VPC endpoint
 // scheme. reconcileAllocateSubnets checks this on the resolved subnet before it persists a pod.
 func tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
-	return isOvnSubnet(subnet) && !isValidTunnelKey(subnet.Status.TunnelKey)
+	return isOvnVpcSubnet(subnet) && !isValidTunnelKey(subnet.Status.TunnelKey)
 }
 
-// podProvidersMissingTunnelKey returns the providers of an allocated pod that
-// lack a valid tunnel_key (VNI) annotation and carry a logical_switch
-// annotation. Missing, non-numeric or values outside OVN's 24-bit range
-// [1, 16777215] all need repair. The OVN allocation path always writes
-// logical_switch for OVN subnets (provider "ovn", including vlan/underlay
-// subnets) and removes it
-// for subnets whose provider is not ovn (kube-ovn acts as IPAM only, another
-// CNI configures the NIC), so an empty logical_switch reliably means the NIC
-// never gets a tunnel_key. The predicate is shared by enqueuePodTunnelKeyRepair
-// and handleRepairTunnelKey so the enqueue and the repair cannot drift apart.
-func (c *Controller) podProvidersMissingTunnelKey(pod *v1.Pod) []string {
+// podProvidersNeedingTunnelKeyRepair returns allocated providers whose pod
+// annotation does not match the subnet policy: non-vlan OVN VPC subnets need
+// the exact valid key from subnet status, while every other subnet type needs
+// no key.
+// The predicate is shared by enqueuePodTunnelKeyRepair and
+// handleRepairTunnelKey so enqueue and repair cannot drift apart.
+func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 	var providers []string
 	for annotKey, v := range pod.Annotations {
 		if v != "true" || !strings.HasSuffix(annotKey, util.AllocatedAnnotationSuffix) {
 			continue
 		}
 		provider := strings.TrimSuffix(annotKey, util.AllocatedAnnotationSuffix)
-		tunnelKey, err := strconv.Atoi(pod.Annotations[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)])
-		if err == nil && isValidTunnelKey(tunnelKey) {
+		tunnelKeyAnnotation := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)
+		tunnelKeyValue, hasTunnelKey := pod.Annotations[tunnelKeyAnnotation]
+		lsName := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)]
+		if lsName == "" {
+			if hasTunnelKey {
+				providers = append(providers, provider)
+			}
 			continue
 		}
-		if pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)] == "" {
-			// Non-OVN NIC: nothing to repair.
+
+		subnet, err := c.subnetsLister.Get(lsName)
+		if err != nil {
+			// Keep unresolved subnets in the result so the handler records the
+			// anomaly. It re-reads the lister while holding podKeyMutex.
+			providers = append(providers, provider)
 			continue
 		}
-		providers = append(providers, provider)
+		if !isOvnVpcSubnet(subnet) {
+			if hasTunnelKey {
+				providers = append(providers, provider)
+			}
+			continue
+		}
+		tunnelKey, err := strconv.Atoi(tunnelKeyValue)
+		if !hasTunnelKey || err != nil || !isValidTunnelKey(tunnelKey) ||
+			!isValidTunnelKey(subnet.Status.TunnelKey) || tunnelKey != subnet.Status.TunnelKey {
+			providers = append(providers, provider)
+		}
 	}
 	return providers
 }
 
-// enqueuePodTunnelKeyRepair enqueues an allocated OVN pod that is missing the
-// tunnel_key (VNI) annotation into the dedicated repair queue, so that
-// handleRepairTunnelKey patches it shortly after controller start.
+// enqueuePodTunnelKeyRepair enqueues an allocated pod whose tunnel_key (VNI)
+// annotations do not match subnet policy, so handleRepairTunnelKey can add a
+// VPC key or remove a stale key.
 //
 // It is called from InitIPAM's pod loop and from the pod reconcile path
-// (handleAddOrUpdatePod). It is annotation-driven (podProvidersMissingTunnelKey),
+// (handleAddOrUpdatePod). It is driven by podProvidersNeedingTunnelKeyRepair,
 // so it cannot be skipped by a transient NAD/namespace resolution failure - a
-// pod is enqueued whenever its own annotations say it is missing the key. The
+// pod is enqueued whenever its annotations need reconciliation. The
 // enqueue is independent of the subnet key state: the repair handler retries
 // until the key becomes available, so a pod whose subnet key is still 0 at
 // init time is not lost.
@@ -647,7 +662,7 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 			return
 		}
 	}
-	if len(c.podProvidersMissingTunnelKey(pod)) == 0 {
+	if len(c.podProvidersNeedingTunnelKeyRepair(pod)) == 0 {
 		return
 	}
 	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
@@ -655,28 +670,20 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 	klog.V(3).Infof("enqueued tunnel_key repair for pod %s", key)
 }
 
-// handleRepairTunnelKey patches the tunnel_key (VNI) annotation onto pods that
-// are missing it. Cilium (native-vpc mode) keys pod identities by this
-// annotation, so a missing annotation makes the pod fall back to the non-VPC
-// scheme.
+// handleRepairTunnelKey reconciles per-provider tunnel_key (VNI) annotations:
+// non-vlan OVN VPC subnets get their valid key, while every other subnet type
+// has a stale key removed. Cilium (native-vpc mode) keys VPC pod identities by
+// this annotation, so a missing or stale annotation selects the wrong scheme.
 //
 // The handler is fed by the dedicated repairTunnelKeyQueue, which is populated
-// by enqueuePodTunnelKeyRepair during InitIPAM on controller start (the
-// allocation path never re-patches already-allocated pods). It is idempotent:
-// pods that already carry a valid annotation are left untouched, and a subnet
-// whose tunnel key is missing or outside OVN's valid range is never used to
-// record an invalid value - the handler returns an error instead so the
-// rate-limited queue retries until a valid key becomes available.
+// by enqueuePodTunnelKeyRepair during InitIPAM and pod updates. It is
+// idempotent: providers already matching their subnet policy are untouched;
+// invalid VPC subnet status is never written and instead triggers a retry.
 //
-// Repair is multi-NIC aware and driven purely by the per-provider annotations
-// the allocation wrote (allocated + logical_switch): every OVN subnet has its
-// own tunnel_key annotation. A provider is repaired only if it is marked
-// allocated and its logical_switch annotation resolves to an OVN subnet; the
-// subnet is never guessed from namespace/default fallbacks, because writing a
-// wrong VNI is worse than a missing one (nothing would correct it afterwards).
+// Reconciliation is multi-NIC aware and driven by allocated + logical_switch
+// annotations. The subnet is never guessed from namespace/default fallbacks.
 // Progress is not all-or-nothing: ready providers are patched in one call even
-// when another provider's subnet key is still 0 (the error then requeues for
-// the remainder).
+// when another VPC provider's key is not ready (the error requeues the rest).
 func (c *Controller) handleRepairTunnelKey(key string) error {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -708,9 +715,13 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 
 	patch := util.KVPatch{}
 	keyNotReady := false
-	for _, provider := range c.podProvidersMissingTunnelKey(pod) {
+	for _, provider := range c.podProvidersNeedingTunnelKeyRepair(pod) {
 		tunnelKeyAnnot := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)
 		lsName := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)]
+		if lsName == "" {
+			patch[tunnelKeyAnnot] = nil
+			continue
+		}
 		subnet, err := c.subnetsLister.Get(lsName)
 		if err != nil {
 			if k8serrors.IsNotFound(err) {
@@ -723,7 +734,8 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 			klog.Errorf("failed to get subnet %s for pod %s/%s: %v", lsName, namespace, name, err)
 			return err
 		}
-		if !isOvnSubnet(subnet) {
+		if !isOvnVpcSubnet(subnet) {
+			patch[tunnelKeyAnnot] = nil
 			continue
 		}
 		if !isValidTunnelKey(subnet.Status.TunnelKey) {
@@ -745,7 +757,7 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 			return err
 		}
 		metricPodTunnelKeyRepairPatches.Inc()
-		klog.Infof("repaired tunnel key annotation for pod %s/%s", namespace, name)
+		klog.Infof("reconciled tunnel key annotation for pod %s/%s", namespace, name)
 	}
 	if keyNotReady {
 		return fmt.Errorf("tunnel key not observed for pod %s/%s, requeuing", namespace, name)
@@ -790,30 +802,33 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		patch[fmt.Sprintf(util.CidrAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.CIDRBlock
 		patch[fmt.Sprintf(util.GatewayAnnotationTemplate, podNet.ProviderName)] = subnet.Spec.Gateway
 		if isOvnSubnet(subnet) {
-			// Gate: never persist pod annotations for an OVN subnet whose tunnel key (VNI) has not
-			// been synced from OVN SB yet, otherwise Cilium falls back to the non-VPC endpoint scheme.
-			// This checks the resolved subnet (which may differ from podNet.Subnet for a static IP in a
-			// multi-subnet namespace) before the annotation patch is committed. In a multi-NIC pod,
-			// earlier loop iterations may already have created idempotent LSP/IP CR state, but CNI-visible
-			// annotations remain all-or-nothing and the retry safely reconciles those objects again.
-			// A non-OVN resolved subnet has no tunnel key and is left as-is.
-			if tunnelKeyNotReady(subnet) {
-				err := fmt.Errorf("subnet %s tunnel key not observed on allocation, requeuing", subnet.Name)
-				c.recorder.Eventf(pod, v1.EventTypeWarning, "AcquireAddressFailed", err.Error())
-				klog.Error(err)
-				return nil, err
-			}
 			patch[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, podNet.ProviderName)] = subnet.Name
 			if pod.Annotations[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] == "" {
 				patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = c.config.PodNicType
 			}
-			// The gate above guarantees a valid value for every resolved OVN subnet.
-			patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = strconv.Itoa(subnet.Status.TunnelKey)
+
+			if isOvnVpcSubnet(subnet) {
+				// Gate: never persist pod annotations for an OVN VPC subnet whose tunnel key (VNI)
+				// has not been synced from OVN SB yet, otherwise Cilium falls back to the non-VPC
+				// endpoint scheme. This checks the resolved subnet (which may differ from
+				// podNet.Subnet for a static IP in a multi-subnet namespace) before the annotation
+				// patch is committed. In a multi-NIC pod, earlier loop iterations may already have
+				// created idempotent LSP/IP CR state, but CNI-visible annotations remain all-or-
+				// nothing and the retry safely reconciles those objects again.
+				if tunnelKeyNotReady(subnet) {
+					err := fmt.Errorf("subnet %s tunnel key not observed on allocation, requeuing", subnet.Name)
+					c.recorder.Eventf(pod, v1.EventTypeWarning, "AcquireAddressFailed", err.Error())
+					klog.Error(err)
+					return nil, err
+				}
+				patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = strconv.Itoa(subnet.Status.TunnelKey)
+			} else {
+				// OVN vlan/underlay subnets keep their OVN NIC annotations but never carry tunnel_key.
+				patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = nil
+			}
 		} else {
 			patch[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, podNet.ProviderName)] = nil
 			patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = nil
-			// Preserve the annotation invariant used by podProvidersMissingTunnelKey:
-			// a provider without logical_switch never carries a stale tunnel_key.
 			patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = nil
 		}
 		patch[fmt.Sprintf(util.AllocatedAnnotationTemplate, podNet.ProviderName)] = "true"

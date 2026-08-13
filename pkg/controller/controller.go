@@ -92,20 +92,10 @@ type Controller struct {
 	podsSynced          cache.InformerSynced
 	addOrUpdatePodQueue workqueue.TypedRateLimitingInterface[string]
 	deletePodQueue      workqueue.TypedRateLimitingInterface[string]
-	// repairTunnelKeyQueue is a dedicated queue for patching the tunnel_key
-	// (VNI) annotation onto pods that are missing it, closing the
-	// "must-have tunnel_key" guarantee after a controller restart (see
-	// docs/tunnel-key-annotation-guarantee.md): pods allocated before
-	// the subnet tunnel key was synced (or before this code existed) keep a
-	// missing annotation forever because the allocation path never re-patches
-	// already-allocated pods. The queue is fed by the init flow on controller
-	// start and by the pod reconcile path (see enqueuePodTunnelKeyRepair),
-	// both annotation-driven so the enqueue cannot be skipped by a network
-	// resolution failure; the handler runs on dedicated workers, serialized
-	// with the pod reconcile path via podKeyMutex. Cilium (native-vpc mode)
-	// keys pod identities by this annotation, so the intended upgrade
-	// sequence is: restart kube-ovn-controller first (this queue backfills
-	// the annotations), then restart cilium, which picks them up.
+	// repairTunnelKeyQueue reconciles per-provider tunnel_key annotations. It
+	// is fed by InitIPAM and pod updates using only persisted annotations; its
+	// workers serialize with normal pod reconciliation through podKeyMutex.
+	// See docs/tunnel-key-annotation-guarantee.md for the full invariant.
 	repairTunnelKeyQueue   workqueue.TypedRateLimitingInterface[string]
 	deletingPodObjMap      *xsync.Map[string, *corev1.Pod]
 	deletingNodeObjMap     *xsync.Map[string, *corev1.Node]

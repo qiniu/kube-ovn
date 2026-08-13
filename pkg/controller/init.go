@@ -441,12 +441,10 @@ func (c *Controller) InitIPAM() error {
 			continue
 		}
 
-		// Enqueue OVN pods missing the tunnel_key (VNI) annotation into the
-		// dedicated repair queue. Cilium (native-vpc mode) keys pod identities
-		// by this annotation; pods allocated before the subnet tunnel key was
-		// synced from OVN SB (or before this code existed) keep a missing
-		// annotation forever. The enqueue is annotation-driven
-		// (podProvidersMissingTunnelKey), so it runs before the network
+		// Enqueue pods whose tunnel_key (VNI) annotation needs reconciliation into the
+		// dedicated repair queue. It restores missing/invalid OVN VPC keys and
+		// removes stale keys from vlan/underlay or non-OVN providers. The enqueue is annotation-driven
+		// (podProvidersNeedingTunnelKeyRepair), so it runs before the network
 		// resolution below and cannot be skipped by a transient NAD/namespace
 		// resolution failure - no periodic resync is needed. The repair handler
 		// retries until the subnet key becomes available, so pods are enqueued

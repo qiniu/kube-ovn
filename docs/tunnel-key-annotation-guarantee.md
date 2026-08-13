@@ -1,10 +1,12 @@
 # tunnel_key (VNI) annotation guarantee
 
-Every non-hostNetwork pod on an OVN subnet carries a non-zero
+Every non-hostNetwork pod on a non-vlan OVN VPC subnet carries a valid
 `ovn.kubernetes.io/tunnel_key` (VNI) annotation by the time its network is
-configured (CNI ADD). Cilium (native-vpc mode) keys pod identities by this
-annotation, so a missing annotation makes the pod fall back to the non-VPC
-scheme and collide with overlapping VPC subnets.
+configured (CNI ADD). VLAN/underlay and non-OVN subnets keep the default
+`status.tunnelKey=0` and do not carry the pod annotation. Cilium
+(native-vpc mode) keys pod identities by this annotation, so a missing
+annotation makes the pod fall back to the non-VPC scheme and collide with
+overlapping VPC subnets.
 
 The guarantee is upheld by two flows:
 
@@ -22,12 +24,12 @@ pod, the annotation is present and non-zero.
 For a multi-NIC pod, an earlier loop iteration may already have created
 idempotent LSP/IP CR state before a later NIC hits the gate. This does not
 weaken the CNI-visible guarantee: the pod annotation patch is committed only
-after every requested OVN NIC passes the gate, and retries safely reconcile
+after every requested OVN VPC NIC passes the gate, and retries safely reconcile
 the earlier objects again.
 
 Why flow 1 cannot produce a missing annotation: `reconcileAllocateSubnets`
 returns an error without persisting pod annotations while any requested
-OVN subnet's tunnel key is not ready; `tunnel_key` and `allocated=true` are
+OVN VPC subnet's tunnel key is not ready; `tunnel_key` and `allocated=true` are
 written in the same atomic patch; and the CNI server blocks on
 `allocated=true`. So under the current code a pod either carries the
 annotation or is still waiting at CNI ADD - a missing annotation therefore
@@ -49,23 +51,19 @@ the population flow 2 repairs.
   an aggregate 10-qps token bucket until the key becomes available (subnet
   reconcile may still be syncing it).
 
-Enqueue is not one-shot: the enqueue is annotation-driven
-(`podProvidersMissingTunnelKey`), so the startup sweep cannot skip a pod
+Enqueue is not one-shot: reconciliation is annotation-driven
+(`podProvidersNeedingTunnelKeyRepair`), so the startup sweep cannot skip a pod
 because its NAD or default subnet could not be resolved at that moment; the
 pod reconcile path (`handleAddOrUpdatePod`) re-enqueues on any later update
 event.
 
-Repair is multi-NIC aware and driven purely by the per-provider annotations
-the allocation wrote (`allocated` + `logical_switch`): every OVN subnet has
-its own valid `tunnel_key` annotation. A provider is repaired if its key is
-missing, non-numeric or outside `1..16777215`, and only if it is marked
-allocated and its `logical_switch` annotation resolves to an OVN subnet. An allocated provider with an empty `logical_switch` is a NIC whose
-subnet provider is not ovn (kube-ovn acts as IPAM only, another CNI
-configures the NIC) and is skipped silently - the OVN allocation path
-always writes `logical_switch`, so the empty case reliably means no
-tunnel_key is ever written. Note that vlan/underlay subnets keep provider
-`ovn`: they are part of this mechanism (the allocation gate also applies,
-so underlay pods wait for the tunnel key before IP allocation).
+Repair is multi-NIC aware and driven by the per-provider annotations the
+allocation wrote (`allocated` + `logical_switch`). A provider is repaired
+only when its logical switch resolves to a non-vlan OVN VPC subnet and its
+key is missing, invalid or different from `subnet.Status.TunnelKey`.
+Providers managed by another CNI have no `logical_switch`; OVN vlan/underlay subnets have one but
+are filtered by `isOvnVpcSubnet`. Both keep no pod tunnel_key annotation;
+startup repair removes stale keys written by older controller versions.
 The subnet is never guessed from namespace/default fallbacks, because
 writing a wrong VNI is worse than a missing one (nothing would correct it
 afterwards); a `logical_switch` that does not resolve is counted by
@@ -76,10 +74,10 @@ error to requeue for the remainder).
 
 ## Failure mode and diagnosis
 
-The allocation gate is intentionally fail-closed. If an OVN subnet's tunnel
-key cannot be observed (for example, OVN SB is unreachable or northd has not
-created the logical switch's `Datapath_Binding`), new pods on that subnet are
-not allocated with a guessed or zero VNI:
+The allocation gate is intentionally fail-closed. If a non-vlan OVN VPC
+subnet's tunnel key cannot be observed (for example, OVN SB is unreachable
+or northd has not created the logical switch's `Datapath_Binding`), new
+pods on that subnet are not allocated with a guessed or zero VNI:
 
 - the pod remains in `ContainerCreating`;
 - kube-ovn CNI waits for `allocated=true`, fails after its wait loop, and the
@@ -96,8 +94,8 @@ kubectl get subnet <name> -o jsonpath='{.status.tunnelKey}'
 A value outside `1..16777215` is invalid and triggers fail-closed
 re-synchronization. Check OVN SB reachability and whether the logical switch
 has a `Datapath_Binding` in SB.
-Underlay/vlan subnets also use OVN logical switches and are subject to this
-gate.
+VLAN/underlay subnets are not subject to this gate and keep the default
+TunnelKey value.
 
 ## Intended upgrade sequence
 
