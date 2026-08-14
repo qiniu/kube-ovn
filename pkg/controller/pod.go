@@ -577,10 +577,10 @@ func tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 	return util.IsOvnVpcSubnet(subnet) && !util.IsValidTunnelKey(subnet.Status.TunnelKey)
 }
 
-// podDefaultTunnelKeyPolicySatisfied is the O(1) fast path for the common
-// single-network pod. Multus/custom-default pods fall back to the complete
-// per-provider scan below.
-func (c *Controller) podDefaultTunnelKeyPolicySatisfied(pod *v1.Pod) bool {
+// canSkipDefaultTunnelKeyRepair is the O(1) fast path for the common
+// single-network pod. It returns true only when startup repair has no work;
+// Multus/custom-default pods fall back to the complete per-provider scan.
+func (c *Controller) canSkipDefaultTunnelKeyRepair(pod *v1.Pod) bool {
 	annotations := pod.Annotations
 	if strings.TrimSpace(annotations[nadv1.NetworkAttachmentAnnot]) != "" ||
 		strings.TrimSpace(annotations[nadv1.NetworkStatusAnnot]) != "" ||
@@ -588,9 +588,14 @@ func (c *Controller) podDefaultTunnelKeyPolicySatisfied(pod *v1.Pod) bool {
 		return false
 	}
 	if annotations[util.AllocatedAnnotation] != "true" {
+		// Unallocated pods belong to the normal allocation path, which writes
+		// IP/network, tunnel_key and allocated=true atomically. Startup repair
+		// must not preempt that path.
 		return true
 	}
 
+	// Presence alone is insufficient: a VPC key must also be valid and equal
+	// to the key of the pod's persisted logical_switch.
 	tunnelKeyValue, hasTunnelKey := annotations[util.TunnelKeyAnnotation]
 	lsName := annotations[util.LogicalSwitchAnnotation]
 	if lsName == "" {
@@ -614,7 +619,7 @@ func (c *Controller) podDefaultTunnelKeyPolicySatisfied(pod *v1.Pod) bool {
 // no key. The predicate is shared by repairPodTunnelKeyOnStartup and
 // handleRepairTunnelKey so detection and reconciliation cannot drift apart.
 func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
-	if c.podDefaultTunnelKeyPolicySatisfied(pod) {
+	if c.canSkipDefaultTunnelKeyRepair(pod) {
 		return nil
 	}
 

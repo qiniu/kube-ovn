@@ -1344,7 +1344,7 @@ func TestHandleRepairTunnelKeyMultiNIC(t *testing.T) {
 	require.Equal(t, float64(1), readCounter(t, metricPodTunnelKeySkipped)-skippedBefore)
 }
 
-func TestPodDefaultTunnelKeyPolicySatisfied(t *testing.T) {
+func TestCanSkipDefaultTunnelKeyRepair(t *testing.T) {
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 		Subnets: []*kubeovnv1.Subnet{
 			{
@@ -1377,7 +1377,7 @@ func TestPodDefaultTunnelKeyPolicySatisfied(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
-			require.Equal(t, tt.want, c.podDefaultTunnelKeyPolicySatisfied(pod))
+			require.Equal(t, tt.want, c.canSkipDefaultTunnelKeyRepair(pod))
 		})
 	}
 }
