@@ -153,6 +153,26 @@ provider naming.
 
 ## Known gaps (documented, not closed by code)
 
+- `Subnet.Status.TunnelKey` is not periodically compared with OVN SB. This is
+  intentional because a `Datapath_Binding` key is stable during the normal
+  lifecycle. After a destructive SB rebuild or an inconsistent DR restore,
+  northd may assign a different key while the persisted status still contains
+  an otherwise valid old value; `reconcileSubnetTunnelKey` will not re-read SB
+  until that status is invalidated. Recover every affected subnet as follows:
+
+  1. Clear its persisted key:
+
+     ```bash
+     kubectl patch subnet <name> --subresource=status --type=merge \
+       -p '{"status":{"tunnelKey":0}}'
+     ```
+
+  2. Restart kube-ovn-controller. InitIPAM detects affected pods; after subnet
+     workers re-read the new SB key, the deferred repair queue updates their
+     annotations. Wait for the startup repair Warning logs to complete.
+  3. Restart Cilium so existing endpoints reload the new VNI.
+
+  A controller restart without first invalidating status is insufficient.
 - Repair progress is observable via `pod_tunnel_key_repair_patch_total`
   (annotation patches that added, corrected or removed one or more tunnel_key
   annotations; a multi-NIC pod can be patched more than once) and
