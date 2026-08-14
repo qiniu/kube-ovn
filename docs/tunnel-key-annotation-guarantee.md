@@ -121,6 +121,35 @@ if backfill has not completed within the wait loop, ADD fails and kubelet
 retries. The cilium restart is still required for endpoints created before
 the backfill logic existed.
 
+## Compatibility and rolling upgrade
+
+The Subnet API is unchanged: `status.tunnelKey` remains an optional integer,
+and pod annotation keys keep their existing provider-based format. Normal
+non-vlan OVN VPC allocation remains compatible with controllers that already
+wrote the annotation atomically.
+
+Two behavior changes are intentional:
+
+- VLAN/underlay and non-OVN subnets now converge to
+  `status.tunnelKey=0` and no pod tunnel_key annotation. Older controller
+  versions may have populated those values even though native-vpc identity
+  does not consume them; startup reconciliation removes those stale values.
+- The new daemon fails CNI ADD for an OVN VPC provider until logical_switch,
+  `allocated=true`, and the matching tunnel_key are visible. This converts a
+  previously possible legacy race into a retryable CNI failure.
+
+For rolling upgrades, restart/upgrade kube-ovn-controller first, wait for the
+startup repair warnings to complete, then restart/upgrade kube-ovn-daemon and
+Cilium. An old daemon does not enforce the new CNI key gate; a new daemon is
+compatible with a controller that already performs the atomic VPC annotation
+patch. Rollback is safe: an older controller may repopulate VLAN tunnel-key
+status, and a subsequent new-controller startup cleans it again.
+
+Non-primary-CNI remains compatible: non-vlan OVN attachment providers use the
+same per-provider annotation contract. IPAM-only attachments remain compatible
+when they use a non-OVN provider as designed; such providers legitimately have
+no OVN logical_switch and bypass the VPC key gate.
+
 ## Known gaps (documented, not closed by code)
 
 - Repair progress is observable via `pod_tunnel_key_repair_patch_total`
