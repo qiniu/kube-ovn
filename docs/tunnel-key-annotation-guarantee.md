@@ -47,27 +47,27 @@ the population flow 2 repairs.
 - Pods that already carry the annotation keep it (persisted in etcd).
 - Legacy pods allocated before the subnet tunnel key was synced (or before
   this code existed) can have a missing, non-numeric or out-of-range
-  annotation (valid OVN tunnel keys are `1..16777215`). On startup
-  `InitIPAM` enqueues them into the dedicated
-  `repairTunnelKeyQueue` (`enqueuePodTunnelKeyRepair`); the repair worker
-  (`handleRepairTunnelKey`) patches them from `subnet.Status.TunnelKey`,
-  retrying indefinitely with exponential backoff capped at one minute and
-  an aggregate 10-qps token bucket until the key becomes available (subnet
-  reconcile may still be syncing it).
+  annotation (valid OVN tunnel keys are `1..16777215`). On startup,
+  `InitIPAM` calls `repairPodTunnelKeyOnStartup`, which invokes
+  `handleRepairTunnelKey` synchronously using `subnet.Status.TunnelKey`.
+  If it cannot finish, the dedicated queue retries indefinitely with
+  exponential backoff capped at one minute and an aggregate 10-qps token
+  bucket (subnet reconcile may still be syncing the key).
 
-The repair enqueue runs only during the InitIPAM startup sweep. It is driven
-by persisted pod annotations (`podProvidersNeedingTunnelKeyRepair`) before
-NAD/default-subnet resolution, so every eligible legacy pod is enqueued once
-without a periodic task or a pod-update fallback. The queue is necessarily
-asynchronous because InitIPAM runs before `startWorkers`; a missing subnet key
-may require the subnet worker, so waiting synchronously in InitIPAM would
-block the worker that produces it. Repair workers start afterward and retry
-with rate limiting. Detection and successful repair are logged at Warning
-level, including the instruction to restart Cilium after backfill so
-already-created endpoints reload the corrected VNI.
+InitIPAM first attempts every eligible repair synchronously, using persisted
+pod annotations (`podProvidersNeedingTunnelKeyRepair`) before NAD/default-
+subnet resolution. If subnet status is already valid, the pod is fixed before
+InitIPAM continues. Only an unavailable key or transient API error is queued.
+That asynchronous fallback is necessary because InitIPAM runs before
+`startWorkers`; a missing key may require the subnet worker, so waiting for it
+inside InitIPAM would block the worker that produces it. Deferred repairs run
+with rate limiting after workers start. There is no periodic task or pod-update
+fallback. Detection and successful repair are logged at Warning level,
+including the instruction to restart Cilium after backfill so already-created
+endpoints reload the corrected VNI.
 
-This asynchronous repair is fallback recovery only; it is not part of normal
-pod allocation. Normal allocation writes IP/network, tunnel_key and
+The deferred asynchronous repair is fallback recovery only; it is not part of
+normal pod allocation. Normal allocation writes IP/network, tunnel_key and
 `allocated=true` in one pod annotation patch.
 
 Repair is multi-NIC aware and driven by the per-provider annotations the

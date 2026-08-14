@@ -581,8 +581,8 @@ func tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 // annotation does not match the subnet policy: non-vlan OVN VPC subnets need
 // the exact valid key from subnet status, while every other subnet type needs
 // no key.
-// The predicate is shared by enqueuePodTunnelKeyRepair and
-// handleRepairTunnelKey so enqueue and repair cannot drift apart.
+// The predicate is shared by repairPodTunnelKeyOnStartup and
+// handleRepairTunnelKey so detection and reconciliation cannot drift apart.
 func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 	var providers []string
 	for annotKey, v := range pod.Annotations {
@@ -622,15 +622,10 @@ func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 	return providers
 }
 
-// enqueuePodTunnelKeyRepair enqueues an allocated pod whose tunnel_key (VNI)
-// annotations do not match subnet policy, so handleRepairTunnelKey can add a
-// VPC key or remove a stale key.
-//
-// It is called only from InitIPAM's startup pod sweep. It is driven by
-// podProvidersNeedingTunnelKeyRepair, so it cannot be skipped by a transient
-// NAD/namespace resolution failure. The enqueue is independent of subnet key
-// state: the repair handler retries until the key becomes available.
-func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
+// repairPodTunnelKeyOnStartup synchronously repairs persisted annotations
+// during InitIPAM whenever possible. Only repairs that need a future subnet
+// sync or hit a transient error are deferred to repairTunnelKeyQueue.
+func (c *Controller) repairPodTunnelKeyOnStartup(pod *v1.Pod) {
 	if pod.Spec.HostNetwork {
 		return
 	}
@@ -653,8 +648,14 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 	// warning visible so operators know this cluster contained legacy/stale
 	// tunnel_key data and must restart Cilium after the backfill, allowing
 	// already-created endpoints to reload the corrected VNI.
-	klog.Warningf("detected pod %s with inconsistent tunnel_key annotations for providers %v; enqueuing startup repair, restart Cilium after the backfill completes", key, providers)
-	c.repairTunnelKeyQueue.Add(key)
+	klog.Warningf("detected pod %s with inconsistent tunnel_key annotations for providers %v; attempting synchronous startup repair, restart Cilium after the backfill completes", key, providers)
+	if err := c.handleRepairTunnelKey(key); err != nil {
+		// InitIPAM runs before subnet/repair workers. Deferral is necessary only
+		// when those workers must first produce the key or retry a transient
+		// error; blocking here would prevent them from starting.
+		klog.Warningf("synchronous startup tunnel_key repair for pod %s is not complete: %v; deferring to the rate-limited repair queue", key, err)
+		c.repairTunnelKeyQueue.Add(key)
+	}
 }
 
 // handleRepairTunnelKey reconciles per-provider tunnel_key (VNI) annotations:
@@ -662,9 +663,9 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 // has a stale key removed. Cilium (native-vpc mode) keys VPC pod identities by
 // this annotation, so a missing or stale annotation selects the wrong scheme.
 //
-// The handler is fed by repairTunnelKeyQueue, populated once by InitIPAM at
-// controller startup. It is idempotent: providers already matching their
-// subnet policy are untouched;
+// The handler is first called synchronously by InitIPAM. If it cannot finish,
+// repairTunnelKeyQueue retries it after workers start. It is idempotent:
+// providers already matching their subnet policy are untouched;
 // invalid VPC subnet status is never written and instead triggers a retry.
 //
 // Reconciliation is multi-NIC aware and driven by allocated + logical_switch

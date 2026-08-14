@@ -442,19 +442,17 @@ func (c *Controller) InitIPAM() error {
 		}
 
 		// Startup fallback only: normal allocation atomically writes IP/network,
-		// tunnel_key and allocated annotations. The queue is necessarily
-		// asynchronous because InitIPAM runs before startWorkers: a subnet key
-		// may still need the subnet worker, so synchronously waiting here would
-		// block the worker that produces it. The rate-limited repair worker starts
-		// afterward and retries until the key is available. Detection logs a
-		// Warning requiring a Cilium restart for already-created endpoints.
-		c.enqueuePodTunnelKeyRepair(pod)
+		// tunnel_key and allocated annotations. Repair synchronously when status
+		// is ready; only an unavailable key or transient failure is queued because
+		// InitIPAM runs before the subnet/repair workers needed to finish it.
+		// Detection logs a Warning requiring a Cilium restart for existing endpoints.
+		c.repairPodTunnelKeyOnStartup(pod)
 
 		podNets, err := c.getPodKubeovnNets(pod)
 		if err != nil {
 			klog.Errorf("failed to get pod kubeovn nets %s.%s address %s: %v", pod.Name, pod.Namespace, pod.Annotations[util.IPAddressAnnotation], err)
 			// The pod is skipped for IPAM restoration only; its tunnel_key
-			// repair was already enqueued above.
+			// startup repair was already attempted above.
 			continue
 		}
 
