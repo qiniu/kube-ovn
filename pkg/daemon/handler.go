@@ -49,20 +49,16 @@ func createCniServerHandler(config *Configuration, controller *Controller) *cniS
 func (csh cniServerHandler) podTunnelKeyReady(pod *v1.Pod, provider string) (bool, error) {
 	lsName := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)]
 	if lsName == "" {
-		// An allocated OVN provider must identify its logical switch before CNI
-		// can decide whether the VPC key is required. Non-OVN/IPAM-only
-		// providers legitimately have no logical_switch and bypass this gate.
-		return !util.IsOvnProvider(provider), nil
+		// Without a persisted logical_switch this provider is not identifiable
+		// as a VPC subnet, so no tunnel_key is required. Normal OVN VPC
+		// allocation always writes logical_switch atomically with allocated.
+		return true, nil
 	}
 	subnet, err := csh.Controller.subnetsLister.Get(lsName)
 	if err != nil {
 		return false, fmt.Errorf("failed to get subnet %s: %w", lsName, err)
 	}
-	if !util.IsOvnVpcSubnet(subnet) {
-		return true, nil
-	}
-	tunnelKey, err := strconv.Atoi(pod.Annotations[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)])
-	return err == nil && util.IsValidTunnelKey(tunnelKey) && tunnelKey == subnet.Status.TunnelKey, nil
+	return util.IsTunnelKeyAnnotationValidForSubnet(pod.Annotations, provider, subnet), nil
 }
 
 func (csh cniServerHandler) providerExists(provider string) (*kubeovnv1.Subnet, bool) {

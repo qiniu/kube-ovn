@@ -1344,44 +1344,6 @@ func TestHandleRepairTunnelKeyMultiNIC(t *testing.T) {
 	require.Equal(t, float64(1), readCounter(t, metricPodTunnelKeySkipped)-skippedBefore)
 }
 
-func TestCanSkipDefaultTunnelKeyRepair(t *testing.T) {
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-		Subnets: []*kubeovnv1.Subnet{
-			{
-				ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
-				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
-				Status:     kubeovnv1.SubnetStatus{TunnelKey: 1234},
-			},
-			{ObjectMeta: metav1.ObjectMeta{Name: "vlan-subnet"}, Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a"}},
-		},
-	})
-	require.NoError(t, err)
-	c := fc.fakeController
-
-	tests := []struct {
-		name        string
-		annotations map[string]string
-		want        bool
-	}{
-		{name: "unallocated pod", annotations: map[string]string{}, want: true},
-		{name: "matching VPC key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "1234"}, want: true},
-		{name: "missing VPC key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet"}},
-		{name: "stale VPC key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "999"}},
-		{name: "vlan without key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "vlan-subnet"}, want: true},
-		{name: "vlan stale key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "vlan-subnet", util.TunnelKeyAnnotation: "1234"}},
-		{name: "multus pod uses full scan", annotations: map[string]string{nadv1.NetworkAttachmentAnnot: "default/net1", util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "1234"}},
-		{name: "network status uses full scan", annotations: map[string]string{nadv1.NetworkStatusAnnot: `[{"name":"default/net1"}]`, util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "1234"}},
-		{name: "custom default network uses full scan", annotations: map[string]string{util.DefaultNetworkAnnotation: "default/net1", util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "1234"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
-			require.Equal(t, tt.want, c.canSkipDefaultTunnelKeyRepair(pod))
-		})
-	}
-}
-
 func TestPodProvidersNeedingTunnelKeyRepair(t *testing.T) {
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 		Subnets: []*kubeovnv1.Subnet{

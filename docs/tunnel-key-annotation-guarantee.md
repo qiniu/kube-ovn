@@ -113,12 +113,11 @@ TunnelKey value.
 ## Intended upgrade sequence
 
 Restart kube-ovn-controller first (flow 2 backfills the annotations), then
-restart cilium so it re-reads them for already-created endpoints. For every
-new CNI ADD on a non-vlan OVN VPC subnet, the CNI server waits for an OVN
-logical_switch, `allocated=true`, and a valid annotation equal to
-`Subnet.Status.TunnelKey`;
-if backfill has not completed within the wait loop, ADD fails and kubelet
-retries. The cilium restart is still required for endpoints created before
+restart cilium so it re-reads them for already-created endpoints. Every CNI
+ADD waits for `allocated=true`; when the persisted logical_switch resolves to
+a non-vlan OVN VPC subnet, it additionally waits for a valid annotation equal
+to `Subnet.Status.TunnelKey`. If backfill has not completed within the wait
+loop, ADD fails and kubelet retries. The cilium restart is still required for endpoints created before
 the backfill logic existed.
 
 ## Compatibility and rolling upgrade
@@ -134,9 +133,11 @@ Two behavior changes are intentional:
   `status.tunnelKey=0` and no pod tunnel_key annotation. Older controller
   versions may have populated those values even though native-vpc identity
   does not consume them; startup reconciliation removes those stale values.
-- The new daemon fails CNI ADD for an OVN VPC provider until logical_switch,
-  `allocated=true`, and the matching tunnel_key are visible. This converts a
-  previously possible legacy race into a retryable CNI failure.
+- The new daemon fails CNI ADD for a provider whose logical_switch resolves
+  to an OVN VPC subnet until `allocated=true` and the matching tunnel_key are
+  visible. This converts a previously possible legacy race into a retryable
+  CNI failure. A provider without logical_switch is not classified as VPC and
+  keeps the old no-key behavior (required by NoDefaultEIP/IPAM-only networks).
 
 For rolling upgrades, restart/upgrade kube-ovn-controller first, wait for the
 startup repair warnings to complete, then restart/upgrade kube-ovn-daemon and
@@ -146,9 +147,9 @@ patch. Rollback is safe: an older controller may repopulate VLAN tunnel-key
 status, and a subsequent new-controller startup cleans it again.
 
 Non-primary-CNI remains compatible: non-vlan OVN attachment providers use the
-same per-provider annotation contract. IPAM-only attachments remain compatible
-when they use a non-OVN provider as designed; such providers legitimately have
-no OVN logical_switch and bypass the VPC key gate.
+same per-provider annotation contract. IPAM-only and NoDefaultEIP attachments
+without a persisted logical_switch bypass the VPC key gate, including legacy
+provider naming.
 
 ## Known gaps (documented, not closed by code)
 

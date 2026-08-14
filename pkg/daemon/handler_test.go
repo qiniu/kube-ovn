@@ -55,7 +55,7 @@ func TestPodTunnelKeyReady(t *testing.T) {
 		want     bool
 		wantErr  bool
 	}{
-		{name: "OVN provider without logical switch", pod: pod(util.OvnProvider, "", ""), provider: util.OvnProvider, want: false},
+		{name: "OVN provider without logical switch needs no VPC key", pod: pod(util.OvnProvider, "", ""), provider: util.OvnProvider, want: true},
 		{name: "non-OVN provider without logical switch", pod: pod("net1.default", "", ""), provider: "net1.default", want: true},
 		{name: "VPC key matches subnet status", pod: pod(util.OvnProvider, "vpc-subnet", "1234"), provider: util.OvnProvider, want: true},
 		{name: "custom OVN provider key matches", pod: pod("net1.default.ovn", "vpc-subnet", "1234"), provider: "net1.default.ovn", want: true},

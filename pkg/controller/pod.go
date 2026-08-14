@@ -577,52 +577,12 @@ func tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 	return util.IsOvnVpcSubnet(subnet) && !util.IsValidTunnelKey(subnet.Status.TunnelKey)
 }
 
-// canSkipDefaultTunnelKeyRepair is the O(1) fast path for the common
-// single-network pod. It returns true only when startup repair has no work;
-// Multus/custom-default pods fall back to the complete per-provider scan.
-func (c *Controller) canSkipDefaultTunnelKeyRepair(pod *v1.Pod) bool {
-	annotations := pod.Annotations
-	if strings.TrimSpace(annotations[nadv1.NetworkAttachmentAnnot]) != "" ||
-		strings.TrimSpace(annotations[nadv1.NetworkStatusAnnot]) != "" ||
-		annotations[util.DefaultNetworkAnnotation] != "" {
-		return false
-	}
-	if annotations[util.AllocatedAnnotation] != "true" {
-		// Unallocated pods belong to the normal allocation path, which writes
-		// IP/network, tunnel_key and allocated=true atomically. Startup repair
-		// must not preempt that path.
-		return true
-	}
-
-	// Presence alone is insufficient: a VPC key must also be valid and equal
-	// to the key of the pod's persisted logical_switch.
-	tunnelKeyValue, hasTunnelKey := annotations[util.TunnelKeyAnnotation]
-	lsName := annotations[util.LogicalSwitchAnnotation]
-	if lsName == "" {
-		return !hasTunnelKey
-	}
-	subnet, err := c.subnetsLister.Get(lsName)
-	if err != nil {
-		return false
-	}
-	if !util.IsOvnVpcSubnet(subnet) {
-		return !hasTunnelKey
-	}
-	tunnelKey, err := strconv.Atoi(tunnelKeyValue)
-	return hasTunnelKey && err == nil && util.IsValidTunnelKey(tunnelKey) &&
-		util.IsValidTunnelKey(subnet.Status.TunnelKey) && tunnelKey == subnet.Status.TunnelKey
-}
-
 // podProvidersNeedingTunnelKeyRepair returns allocated providers whose pod
 // annotation does not match the subnet policy: non-vlan OVN VPC subnets need
 // the exact valid key from subnet status, while every other subnet type needs
 // no key. The predicate is shared by repairPodTunnelKeyOnStartup and
 // handleRepairTunnelKey so detection and reconciliation cannot drift apart.
 func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
-	if c.canSkipDefaultTunnelKeyRepair(pod) {
-		return nil
-	}
-
 	var providers []string
 	for annotKey, v := range pod.Annotations {
 		if v != "true" || !strings.HasSuffix(annotKey, util.AllocatedAnnotationSuffix) {
@@ -630,7 +590,7 @@ func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 		}
 		provider := strings.TrimSuffix(annotKey, util.AllocatedAnnotationSuffix)
 		tunnelKeyAnnotation := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)
-		tunnelKeyValue, hasTunnelKey := pod.Annotations[tunnelKeyAnnotation]
+		_, hasTunnelKey := pod.Annotations[tunnelKeyAnnotation]
 		lsName := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)]
 		if lsName == "" {
 			if hasTunnelKey {
@@ -652,9 +612,7 @@ func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 			}
 			continue
 		}
-		tunnelKey, err := strconv.Atoi(tunnelKeyValue)
-		if !hasTunnelKey || err != nil || !util.IsValidTunnelKey(tunnelKey) ||
-			!util.IsValidTunnelKey(subnet.Status.TunnelKey) || tunnelKey != subnet.Status.TunnelKey {
+		if !util.IsTunnelKeyAnnotationValidForSubnet(pod.Annotations, provider, subnet) {
 			providers = append(providers, provider)
 		}
 	}
