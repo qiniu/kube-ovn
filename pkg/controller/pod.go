@@ -622,27 +622,10 @@ func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 	return providers
 }
 
-// repairPodTunnelKeyOnStartup synchronously repairs persisted annotations
-// during InitIPAM whenever possible. Only repairs that need a future subnet
-// sync or hit a transient error are deferred to repairTunnelKeyQueue.
-func (c *Controller) repairPodTunnelKeyOnStartup(pod *v1.Pod) {
-	if pod.Spec.HostNetwork {
-		return
-	}
-	if !isPodAlive(pod) {
-		// Match InitIPAM's pod-level filtering: a non-alive StatefulSet pod
-		// still holds its allocated IP and annotations (restored from the IP
-		// CR at startup) and is repaired too, so it has the annotation by the
-		// time it is re-scheduled and goes through CNI ADD.
-		isStsPod, _, _ := isStatefulSetPod(pod)
-		if !isStsPod {
-			return
-		}
-	}
-	providers := c.podProvidersNeedingTunnelKeyRepair(pod)
-	if len(providers) == 0 {
-		return
-	}
+// repairPodTunnelKeyOnStartup synchronously repairs the providers selected by
+// InitIPAM. Only repairs that need a future subnet sync or hit a transient
+// error are deferred to repairTunnelKeyQueue.
+func (c *Controller) repairPodTunnelKeyOnStartup(pod *v1.Pod, providers []string) {
 	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 	// This is a startup fallback, never the normal allocation path. Keep the
 	// warning visible so operators know this cluster contained legacy/stale

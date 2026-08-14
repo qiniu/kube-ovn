@@ -442,11 +442,14 @@ func (c *Controller) InitIPAM() error {
 		}
 
 		// Startup fallback only: normal allocation atomically writes IP/network,
-		// tunnel_key and allocated annotations. Repair synchronously when status
-		// is ready; only an unavailable key or transient failure is queued because
-		// InitIPAM runs before the subnet/repair workers needed to finish it.
-		// Detection logs a Warning requiring a Cilium restart for existing endpoints.
-		c.repairPodTunnelKeyOnStartup(pod)
+		// tunnel_key and allocated annotations. Enter recovery only when persisted
+		// annotations are missing, invalid or inconsistent with subnet policy.
+		// Repair synchronously when status is ready; only an unavailable key or
+		// transient failure is queued because InitIPAM runs before the workers
+		// needed to finish it.
+		if providers := c.podProvidersNeedingTunnelKeyRepair(pod); len(providers) != 0 {
+			c.repairPodTunnelKeyOnStartup(pod, providers)
+		}
 
 		podNets, err := c.getPodKubeovnNets(pod)
 		if err != nil {

@@ -1382,7 +1382,7 @@ func TestPodProvidersNeedingTunnelKeyRepair(t *testing.T) {
 }
 
 func TestRepairPodTunnelKeyOnStartup(t *testing.T) {
-	pod := func(name, subnet string, phase corev1.PodPhase, hostNetwork, sts bool) *corev1.Pod {
+	pod := func(name, subnet string, phase corev1.PodPhase, sts bool) *corev1.Pod {
 		p := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name,
@@ -1392,7 +1392,6 @@ func TestRepairPodTunnelKeyOnStartup(t *testing.T) {
 					util.LogicalSwitchAnnotation: subnet,
 				},
 			},
-			Spec:   corev1.PodSpec{HostNetwork: hostNetwork},
 			Status: corev1.PodStatus{Phase: phase},
 		}
 		if sts {
@@ -1408,11 +1407,9 @@ func TestRepairPodTunnelKeyOnStartup(t *testing.T) {
 		wantKey    string
 		wantQueued bool
 	}{
-		{name: "repairs synchronously when key is ready", pod: pod("ready", "ready-subnet", corev1.PodRunning, false, false), tunnelKey: 1234, wantKey: "1234"},
-		{name: "defers until subnet worker provides key", pod: pod("deferred", "deferred-subnet", corev1.PodRunning, false, false), wantQueued: true},
-		{name: "skips host network", pod: pod("host", "ready-subnet", corev1.PodRunning, true, false)},
-		{name: "skips terminated non-STS pod", pod: pod("dead", "ready-subnet", corev1.PodSucceeded, false, false)},
-		{name: "repairs non-alive STS synchronously", pod: pod("sts-0", "ready-subnet", corev1.PodSucceeded, false, true), tunnelKey: 1234, wantKey: "1234"},
+		{name: "repairs synchronously when key is ready", pod: pod("ready", "ready-subnet", corev1.PodRunning, false), tunnelKey: 1234, wantKey: "1234"},
+		{name: "defers until subnet worker provides key", pod: pod("deferred", "deferred-subnet", corev1.PodRunning, false), wantQueued: true},
+		{name: "repairs non-alive STS selected by InitIPAM", pod: pod("sts-0", "ready-subnet", corev1.PodSucceeded, true), tunnelKey: 1234, wantKey: "1234"},
 	}
 
 	for _, tt := range tests {
@@ -1426,7 +1423,9 @@ func TestRepairPodTunnelKeyOnStartup(t *testing.T) {
 			require.NoError(t, err)
 			c := fc.fakeController
 
-			c.repairPodTunnelKeyOnStartup(tt.pod)
+			providers := c.podProvidersNeedingTunnelKeyRepair(tt.pod)
+			require.NotEmpty(t, providers)
+			c.repairPodTunnelKeyOnStartup(tt.pod, providers)
 
 			updated, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), tt.pod.Name, metav1.GetOptions{})
 			require.NoError(t, err)
