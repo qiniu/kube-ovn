@@ -644,12 +644,17 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 			return
 		}
 	}
-	if len(c.podProvidersNeedingTunnelKeyRepair(pod)) == 0 {
+	providers := c.podProvidersNeedingTunnelKeyRepair(pod)
+	if len(providers) == 0 {
 		return
 	}
 	key := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+	// This is a startup fallback, never the normal allocation path. Keep the
+	// warning visible so operators know this cluster contained legacy/stale
+	// tunnel_key data and must restart Cilium after the backfill, allowing
+	// already-created endpoints to reload the corrected VNI.
+	klog.Warningf("detected pod %s with inconsistent tunnel_key annotations for providers %v; enqueuing startup repair, restart Cilium after the backfill completes", key, providers)
 	c.repairTunnelKeyQueue.Add(key)
-	klog.V(3).Infof("enqueued tunnel_key repair for pod %s", key)
 }
 
 // handleRepairTunnelKey reconciles per-provider tunnel_key (VNI) annotations:
@@ -739,7 +744,7 @@ func (c *Controller) handleRepairTunnelKey(key string) error {
 			return err
 		}
 		metricPodTunnelKeyRepairPatches.Inc()
-		klog.Infof("reconciled tunnel key annotation for pod %s/%s", namespace, name)
+		klog.Warningf("startup fallback reconciled tunnel_key annotations for pod %s/%s; restart Cilium after the backfill completes if an endpoint already exists", namespace, name)
 	}
 	if keyNotReady {
 		return fmt.Errorf("tunnel key not observed for pod %s/%s, requeuing", namespace, name)
@@ -813,6 +818,8 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 			patch[fmt.Sprintf(util.PodNicAnnotationTemplate, podNet.ProviderName)] = nil
 			patch[fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNet.ProviderName)] = nil
 		}
+		// Do not persist allocated independently: for an OVN VPC provider its
+		// IP/network annotations and tunnel_key are already in this same patch.
 		patch[fmt.Sprintf(util.AllocatedAnnotationTemplate, podNet.ProviderName)] = "true"
 		if vmKey != "" {
 			patch[fmt.Sprintf(util.VMAnnotationTemplate, podNet.ProviderName)] = vmName
@@ -910,6 +917,9 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 			return nil, err
 		}
 	}
+	// Commit all providers once. This single API patch is the normal-path
+	// invariant: IP/network data, VPC tunnel_key and allocated=true become
+	// visible together before kube-ovn CNI ADD can succeed.
 	if err = util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(namespace), name, patch); err != nil {
 		if k8serrors.IsNotFound(err) {
 			// Sometimes pod is deleted between kube-ovn configure ovn-nb and patch pod.

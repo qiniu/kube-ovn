@@ -441,14 +441,12 @@ func (c *Controller) InitIPAM() error {
 			continue
 		}
 
-		// Enqueue pods whose tunnel_key (VNI) annotation needs reconciliation into the
-		// dedicated repair queue. It restores missing/invalid OVN VPC keys and
-		// removes stale keys from vlan/underlay or non-OVN providers. The enqueue is annotation-driven
-		// (podProvidersNeedingTunnelKeyRepair), so it runs before the network
-		// resolution below and cannot be skipped by a transient NAD/namespace
-		// resolution failure - no periodic resync is needed. The repair handler
-		// retries until the subnet key becomes available, so pods are enqueued
-		// even if it is still 0.
+		// Startup fallback only: normal allocation atomically writes IP/network,
+		// tunnel_key and allocated annotations. This sweep repairs legacy or
+		// stale persisted annotations and logs a warning requiring a Cilium
+		// restart for already-created endpoints. It runs before network
+		// resolution, needs no periodic task, and retries until the subnet key
+		// becomes available.
 		c.enqueuePodTunnelKeyRepair(pod)
 
 		podNets, err := c.getPodKubeovnNets(pod)

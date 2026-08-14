@@ -58,7 +58,13 @@ the population flow 2 repairs.
 The repair enqueue runs only during the InitIPAM startup sweep. It is driven
 by persisted pod annotations (`podProvidersNeedingTunnelKeyRepair`) before
 NAD/default-subnet resolution, so every eligible legacy pod is enqueued once
-without a periodic task or a pod-update fallback.
+without a periodic task or a pod-update fallback. Detection and successful
+repair are logged at Warning level, including the instruction to restart
+Cilium after backfill so already-created endpoints reload the corrected VNI.
+
+This asynchronous repair is fallback recovery only; it is not part of normal
+pod allocation. Normal allocation writes IP/network, tunnel_key and
+`allocated=true` in one pod annotation patch.
 
 Repair is multi-NIC aware and driven by the per-provider annotations the
 allocation wrote (`allocated` + `logical_switch`). A provider is repaired
