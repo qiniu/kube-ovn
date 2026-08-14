@@ -92,10 +92,10 @@ type Controller struct {
 	podsSynced          cache.InformerSynced
 	addOrUpdatePodQueue workqueue.TypedRateLimitingInterface[string]
 	deletePodQueue      workqueue.TypedRateLimitingInterface[string]
-	// repairTunnelKeyQueue reconciles per-provider tunnel_key annotations. It
-	// is fed by InitIPAM and pod updates using only persisted annotations; its
-	// workers serialize with normal pod reconciliation through podKeyMutex.
-	// See docs/tunnel-key-annotation-guarantee.md for the full invariant.
+	// repairTunnelKeyQueue reconciles persisted per-provider tunnel_key
+	// annotations during the InitIPAM startup sweep. Its workers serialize with
+	// normal pod reconciliation through podKeyMutex. See
+	// docs/tunnel-key-annotation-guarantee.md for the full invariant.
 	repairTunnelKeyQueue   workqueue.TypedRateLimitingInterface[string]
 	deletingPodObjMap      *xsync.Map[string, *corev1.Pod]
 	deletingNodeObjMap     *xsync.Map[string, *corev1.Node]

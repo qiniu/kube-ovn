@@ -55,11 +55,10 @@ the population flow 2 repairs.
   an aggregate 10-qps token bucket until the key becomes available (subnet
   reconcile may still be syncing it).
 
-Enqueue is not one-shot: reconciliation is annotation-driven
-(`podProvidersNeedingTunnelKeyRepair`), so the startup sweep cannot skip a pod
-because its NAD or default subnet could not be resolved at that moment; the
-pod reconcile path (`handleAddOrUpdatePod`) re-enqueues on any later update
-event.
+The repair enqueue runs only during the InitIPAM startup sweep. It is driven
+by persisted pod annotations (`podProvidersNeedingTunnelKeyRepair`) before
+NAD/default-subnet resolution, so every eligible legacy pod is enqueued once
+without a periodic task or a pod-update fallback.
 
 Repair is multi-NIC aware and driven by the per-provider annotations the
 allocation wrote (`allocated` + `logical_switch`). A provider is repaired
@@ -127,9 +126,10 @@ the backfill logic existed.
   Cilium starts keying secondary NICs.
 - A pod whose `logical_switch` subnet no longer exists is skipped (counted
   by `pod_tunnel_key_repair_skipped_total`) and not retried: the repair
-  queue forgets it, and there is no periodic resync. It is re-enqueued on
-  the next pod update event or the next controller restart - acceptable
-  because the pod usually cannot survive its subnet's deletion anyway.
+  queue forgets it, and there is no periodic or pod-update resync. It is
+  reconsidered on the next controller restart - acceptable because the pod
+  usually cannot survive its subnet's deletion anyway, and accidental manual
+  deletion is outside this guarantee.
 - The upgrade sequence above is operator discipline, not enforced by code:
   restarting cilium before the backfill completes leaves already-created
   endpoints on the non-VPC scheme until the next cilium restart. This affects

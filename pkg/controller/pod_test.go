@@ -739,6 +739,12 @@ func TestReconcileAllocateSubnets_gatedOnTunnelKey(t *testing.T) {
 	_, err = c.reconcileAllocateSubnets(pod, podNets)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "tunnel key not observed")
+
+	persisted, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, "true", persisted.Annotations[util.AllocatedAnnotation])
+	require.Empty(t, persisted.Annotations[util.IPAddressAnnotation])
+	require.Empty(t, persisted.Annotations[util.TunnelKeyAnnotation])
 }
 
 // TestReconcileAllocateSubnets_allowedWhenTunnelKeySynced is the happy-path counterpart of the gate
@@ -788,6 +794,15 @@ func TestReconcileAllocateSubnets_allowedWhenTunnelKeySynced(t *testing.T) {
 	require.NotNil(t, allocated)
 	tunnelKeyKey := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNets[0].ProviderName)
 	require.Equal(t, "1234", allocated.Annotations[tunnelKeyKey])
+	require.Equal(t, "true", allocated.Annotations[util.AllocatedAnnotation])
+	require.NotEmpty(t, allocated.Annotations[util.IPAddressAnnotation])
+	require.Equal(t, subnet.Name, allocated.Annotations[util.LogicalSwitchAnnotation])
+
+	persisted, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, allocated.Annotations[util.IPAddressAnnotation], persisted.Annotations[util.IPAddressAnnotation])
+	require.Equal(t, "1234", persisted.Annotations[util.TunnelKeyAnnotation])
+	require.Equal(t, "true", persisted.Annotations[util.AllocatedAnnotation])
 }
 
 func TestReconcileAllocateSubnetsUsesResolvedSubnetForTunnelKey(t *testing.T) {
@@ -1424,29 +1439,4 @@ func TestEnqueuePodTunnelKeyRepair(t *testing.T) {
 		"default/vlan-stale",
 		"default/sts-0",
 	}, keys)
-}
-
-func TestHandleAddOrUpdatePodEnqueuesTunnelKeyRepairBeforeValidation(t *testing.T) {
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "legacy-pod",
-			Namespace: "default",
-			Annotations: map[string]string{
-				util.AllocatedAnnotation:     "true",
-				util.LogicalSwitchAnnotation: "ovn-subnet",
-				util.IPAddressAnnotation:     "not-an-ip",
-			},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
-	}
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{pod}})
-	require.NoError(t, err)
-	c := fc.fakeController
-
-	err = c.handleAddOrUpdatePod("default/legacy-pod")
-	require.Error(t, err, "invalid network annotation must still stop normal pod reconciliation")
-	require.Equal(t, 1, c.repairTunnelKeyQueue.Len(), "repair must be enqueued before validation returns")
-	key, _ := c.repairTunnelKeyQueue.Get()
-	c.repairTunnelKeyQueue.Done(key)
-	require.Equal(t, "default/legacy-pod", key)
 }

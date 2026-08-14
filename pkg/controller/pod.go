@@ -508,14 +508,6 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 		return err
 	}
 
-	// Re-enqueue the tunnel_key repair for already-allocated OVN pods missing
-	// the annotation (idempotent, normally a no-op). Complements the InitIPAM
-	// startup sweep: a pod that appears or changes after startup heals on its
-	// next update event. Annotation-driven, so it must run before the early
-	// returns below (network validation / resolution): a legacy pod whose NAD
-	// or default subnet has broken since startup must still be repaired.
-	c.enqueuePodTunnelKeyRepair(pod)
-
 	if err := util.ValidatePodNetwork(pod.Annotations); err != nil {
 		klog.Errorf("validate pod %s/%s failed: %v", namespace, name, err)
 		c.recorder.Eventf(pod, v1.EventTypeWarning, "ValidatePodNetworkFailed", err.Error())
@@ -634,13 +626,10 @@ func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
 // annotations do not match subnet policy, so handleRepairTunnelKey can add a
 // VPC key or remove a stale key.
 //
-// It is called from InitIPAM's pod loop and from the pod reconcile path
-// (handleAddOrUpdatePod). It is driven by podProvidersNeedingTunnelKeyRepair,
-// so it cannot be skipped by a transient NAD/namespace resolution failure - a
-// pod is enqueued whenever its annotations need reconciliation. The
-// enqueue is independent of the subnet key state: the repair handler retries
-// until the key becomes available, so a pod whose subnet key is still 0 at
-// init time is not lost.
+// It is called only from InitIPAM's startup pod sweep. It is driven by
+// podProvidersNeedingTunnelKeyRepair, so it cannot be skipped by a transient
+// NAD/namespace resolution failure. The enqueue is independent of subnet key
+// state: the repair handler retries until the key becomes available.
 func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 	if pod.Spec.HostNetwork {
 		return
@@ -668,9 +657,9 @@ func (c *Controller) enqueuePodTunnelKeyRepair(pod *v1.Pod) {
 // has a stale key removed. Cilium (native-vpc mode) keys VPC pod identities by
 // this annotation, so a missing or stale annotation selects the wrong scheme.
 //
-// The handler is fed by the dedicated repairTunnelKeyQueue, which is populated
-// by enqueuePodTunnelKeyRepair during InitIPAM and pod updates. It is
-// idempotent: providers already matching their subnet policy are untouched;
+// The handler is fed by repairTunnelKeyQueue, populated once by InitIPAM at
+// controller startup. It is idempotent: providers already matching their
+// subnet policy are untouched;
 // invalid VPC subnet status is never written and instead triggers a retry.
 //
 // Reconciliation is multi-NIC aware and driven by allocated + logical_switch
