@@ -1,6 +1,37 @@
 package util
 
-import "strings"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+)
+
+// MaxTunnelKey is OVN's maximum 24-bit Datapath_Binding.tunnel_key value.
+const MaxTunnelKey = 1<<24 - 1
+
+func IsValidTunnelKey(key int) bool {
+	return key > 0 && key <= MaxTunnelKey
+}
+
+// IsOvnVpcSubnet reports whether a subnet participates in the VPC tunnel-key
+// guarantee. It includes default and custom VPCs; vlan is the only
+// VPC/underlay discriminator after the OVN-provider check.
+func IsOvnVpcSubnet(subnet *kubeovnv1.Subnet) bool {
+	return subnet != nil && IsOvnProvider(subnet.Spec.Provider) && subnet.Spec.Vlan == ""
+}
+
+// IsTunnelKeyAnnotationValidForSubnet reports whether a provider annotation
+// carries the exact valid key required by a non-vlan OVN VPC subnet. Other
+// subnet types do not require the annotation and therefore return true.
+func IsTunnelKeyAnnotationValidForSubnet(annotations map[string]string, provider string, subnet *kubeovnv1.Subnet) bool {
+	if !IsOvnVpcSubnet(subnet) {
+		return true
+	}
+	tunnelKey, err := strconv.Atoi(annotations[fmt.Sprintf(TunnelKeyAnnotationTemplate, provider)])
+	return err == nil && IsValidTunnelKey(tunnelKey) && tunnelKey == subnet.Status.TunnelKey
+}
 
 func IsOvnProvider(provider string) bool {
 	if provider == "" || provider == OvnProvider {

@@ -88,10 +88,15 @@ type Controller struct {
 	// ExternalGatewayType define external gateway type, centralized
 	ExternalGatewayType string
 
-	podsLister             v1.PodLister
-	podsSynced             cache.InformerSynced
-	addOrUpdatePodQueue    workqueue.TypedRateLimitingInterface[string]
-	deletePodQueue         workqueue.TypedRateLimitingInterface[string]
+	podsLister          v1.PodLister
+	podsSynced          cache.InformerSynced
+	addOrUpdatePodQueue workqueue.TypedRateLimitingInterface[string]
+	deletePodQueue      workqueue.TypedRateLimitingInterface[string]
+	// repairTunnelKeyQueue contains only startup repairs that could not finish
+	// synchronously in InitIPAM because a subnet worker must still produce the
+	// key or a transient error needs retry. Workers start afterward and serialize
+	// with pod reconciliation via podKeyMutex. See the guarantee document.
+	repairTunnelKeyQueue   workqueue.TypedRateLimitingInterface[string]
 	deletingPodObjMap      *xsync.Map[string, *corev1.Pod]
 	deletingNodeObjMap     *xsync.Map[string, *corev1.Node]
 	updatePodSecurityQueue workqueue.TypedRateLimitingInterface[string]
@@ -553,6 +558,15 @@ func Run(ctx context.Context, config *Configuration) {
 		podsLister:          podInformer.Lister(),
 		podsSynced:          podInformer.Informer().HasSynced,
 		addOrUpdatePodQueue: newTypedRateLimitingQueue[string]("AddOrUpdatePod", nil),
+		// Repair retries start at 1s instead of the default 5ms, and a global
+		// token bucket caps the aggregate requeue rate: a subnet whose tunnel
+		// key stays 0 makes the queued pods requeue in a loop, and a 5ms base
+		// with no bucket would hammer the shared podKeyMutex buckets.
+		repairTunnelKeyQueue: newTypedRateLimitingQueue[string]("RepairTunnelKey",
+			workqueue.NewTypedMaxOfRateLimiter[string](
+				workqueue.NewTypedItemExponentialFailureRateLimiter[string](time.Second, time.Minute),
+				&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+			)),
 		deletePodQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{
@@ -1180,6 +1194,7 @@ func (c *Controller) shutdown() {
 
 	c.addOrUpdatePodQueue.ShutDown()
 	c.deletePodQueue.ShutDown()
+	c.repairTunnelKeyQueue.ShutDown()
 	c.updatePodSecurityQueue.ShutDown()
 
 	c.addNamespaceQueue.ShutDown()
@@ -1404,6 +1419,11 @@ func (c *Controller) startWorkers(ctx context.Context) {
 		go wait.Until(runWorker("delete pod", c.deletePodQueue, c.handleDeletePod), time.Second, ctx.Done())
 		go wait.Until(runWorker("add/update pod", c.addOrUpdatePodQueue, c.handleAddOrUpdatePod), time.Second, ctx.Done())
 		go wait.Until(runWorker("update pod security", c.updatePodSecurityQueue, c.handleUpdatePodSecurity), time.Second, ctx.Done())
+		// tunnel_key repairs are idempotent merge-patches; multiple workers only
+		// parallelize across different pods (workqueue guarantees a key is
+		// processed by one worker at a time), which keeps the startup backfill
+		// fast on large clusters.
+		go wait.Until(runWorker("repair tunnel key", c.repairTunnelKeyQueue, c.handleRepairTunnelKey), time.Second, ctx.Done())
 
 		go wait.Until(runWorker("delete subnet", c.deleteSubnetQueue, c.handleDeleteSubnet), time.Second, ctx.Done())
 		go wait.Until(runWorker("delete ippool", c.deleteIPPoolQueue, c.handleDeleteIPPool), time.Second, ctx.Done())

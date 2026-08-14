@@ -46,6 +46,21 @@ func createCniServerHandler(config *Configuration, controller *Controller) *cniS
 	return csh
 }
 
+func (csh cniServerHandler) podTunnelKeyReady(pod *v1.Pod, provider string) (bool, error) {
+	lsName := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)]
+	if lsName == "" {
+		// Without a persisted logical_switch this provider is not identifiable
+		// as a VPC subnet, so no tunnel_key is required. Normal OVN VPC
+		// allocation always writes logical_switch atomically with allocated.
+		return true, nil
+	}
+	subnet, err := csh.Controller.subnetsLister.Get(lsName)
+	if err != nil {
+		return false, fmt.Errorf("failed to get subnet %s: %w", lsName, err)
+	}
+	return util.IsTunnelKeyAnnotationValidForSubnet(pod.Annotations, provider, subnet), nil
+}
+
 func (csh cniServerHandler) providerExists(provider string) (*kubeovnv1.Subnet, bool) {
 	if util.IsOvnProvider(provider) {
 		return nil, true
@@ -117,6 +132,13 @@ func (csh cniServerHandler) handleAdd(req *restful.Request, resp *restful.Respon
 			// wait controller assign an address
 			cniWaitAddressResult.WithLabelValues(nodeName).Inc()
 			time.Sleep(1 * time.Second)
+			continue
+		}
+		tunnelKeyReady, err := csh.podTunnelKeyReady(pod, podRequest.Provider)
+		if err != nil || !tunnelKeyReady {
+			klog.V(3).Infof("wait tunnel key for pod %s/%s provider %s: %v", podRequest.PodNamespace, podRequest.PodName, podRequest.Provider, err)
+			cniWaitTunnelKeyResult.WithLabelValues(nodeName).Inc()
+			time.Sleep(time.Second)
 			continue
 		}
 		ip = pod.Annotations[fmt.Sprintf(util.IPAddressAnnotationTemplate, podRequest.Provider)]
@@ -203,6 +225,17 @@ func (csh cniServerHandler) handleAdd(req *restful.Request, resp *restful.Respon
 		err := fmt.Errorf("no address allocated to pod %s/%s provider %s, please see kube-ovn-controller logs to find errors", pod.Namespace, pod.Name, podRequest.Provider)
 		klog.Error(err)
 		if err := resp.WriteHeaderAndEntity(http.StatusInternalServerError, request.CniResponse{Err: err.Error()}); err != nil {
+			klog.Errorf("failed to write response, %v", err)
+		}
+		return
+	}
+	if tunnelKeyReady, err := csh.podTunnelKeyReady(pod, podRequest.Provider); err != nil || !tunnelKeyReady {
+		errMsg := fmt.Errorf("tunnel key is not ready for pod %s/%s provider %s", pod.Namespace, pod.Name, podRequest.Provider)
+		if err != nil {
+			errMsg = fmt.Errorf("%w: %w", errMsg, err)
+		}
+		klog.Error(errMsg)
+		if err := resp.WriteHeaderAndEntity(http.StatusInternalServerError, request.CniResponse{Err: errMsg.Error()}); err != nil {
 			klog.Errorf("failed to write response, %v", err)
 		}
 		return

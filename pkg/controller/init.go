@@ -441,9 +441,21 @@ func (c *Controller) InitIPAM() error {
 			continue
 		}
 
+		// Startup fallback only: normal allocation atomically writes IP/network,
+		// tunnel_key and allocated annotations. Enter recovery only when persisted
+		// annotations are missing, invalid or inconsistent with subnet policy.
+		// Repair synchronously when status is ready; only an unavailable key or
+		// transient failure is queued because InitIPAM runs before the workers
+		// needed to finish it.
+		if providers := c.podProvidersNeedingTunnelKeyRepair(pod); len(providers) != 0 {
+			c.repairPodTunnelKeyOnStartup(pod, providers)
+		}
+
 		podNets, err := c.getPodKubeovnNets(pod)
 		if err != nil {
 			klog.Errorf("failed to get pod kubeovn nets %s.%s address %s: %v", pod.Name, pod.Namespace, pod.Annotations[util.IPAddressAnnotation], err)
+			// The pod is skipped for IPAM restoration only; its tunnel_key
+			// startup repair was already attempted above.
 			continue
 		}
 

@@ -3,20 +3,33 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ipam"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
+
+// readCounter reads a metric value without pulling the prometheus testutil
+// package (and its extra dependencies) into the test dependency tree.
+func readCounter(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, c.Write(&m))
+	return m.GetCounter().GetValue()
+}
 
 func TestCheckIsPodVpcNatGw(t *testing.T) {
 	tests := []struct {
@@ -726,6 +739,12 @@ func TestReconcileAllocateSubnets_gatedOnTunnelKey(t *testing.T) {
 	_, err = c.reconcileAllocateSubnets(pod, podNets)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "tunnel key not observed")
+
+	persisted, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NotEqual(t, "true", persisted.Annotations[util.AllocatedAnnotation])
+	require.Empty(t, persisted.Annotations[util.IPAddressAnnotation])
+	require.Empty(t, persisted.Annotations[util.TunnelKeyAnnotation])
 }
 
 // TestReconcileAllocateSubnets_allowedWhenTunnelKeySynced is the happy-path counterpart of the gate
@@ -775,6 +794,184 @@ func TestReconcileAllocateSubnets_allowedWhenTunnelKeySynced(t *testing.T) {
 	require.NotNil(t, allocated)
 	tunnelKeyKey := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, podNets[0].ProviderName)
 	require.Equal(t, "1234", allocated.Annotations[tunnelKeyKey])
+	require.Equal(t, "true", allocated.Annotations[util.AllocatedAnnotation])
+	require.NotEmpty(t, allocated.Annotations[util.IPAddressAnnotation])
+	require.Equal(t, subnet.Name, allocated.Annotations[util.LogicalSwitchAnnotation])
+
+	persisted, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, allocated.Annotations[util.IPAddressAnnotation], persisted.Annotations[util.IPAddressAnnotation])
+	require.Equal(t, "1234", persisted.Annotations[util.TunnelKeyAnnotation])
+	require.Equal(t, "true", persisted.Annotations[util.AllocatedAnnotation])
+}
+
+func TestReconcileAllocateSubnetsUsesResolvedSubnetForTunnelKey(t *testing.T) {
+	initialSubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ipam-only-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.3.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  "net1.default",
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100},
+	}
+	resolvedSubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.4.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  util.OvnProvider,
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100, TunnelKey: 2345},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.IPAddressAnnotation: "10.0.4.5",
+			},
+		},
+	}
+	namespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "default",
+			Annotations: map[string]string{
+				util.LogicalSwitchAnnotation: initialSubnet.Name + "," + resolvedSubnet.Name,
+			},
+		},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{namespace},
+		Subnets:    []*kubeovnv1.Subnet{initialSubnet, resolvedSubnet},
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.ipam = newIPAMForTest([]*kubeovnv1.Subnet{initialSubnet, resolvedSubnet})
+
+	fc.mockOvnClient.EXPECT().CreateLogicalSwitchPort(
+		resolvedSubnet.Name, gomock.Any(), "10.0.4.5", gomock.Any(), gomock.Any(), gomock.Any(),
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+	).Return(nil)
+
+	podNets, err := c.getPodKubeovnNets(pod)
+	require.NoError(t, err)
+	require.Len(t, podNets, 1)
+	require.Equal(t, initialSubnet.Name, podNets[0].Subnet.Name)
+
+	allocated, err := c.reconcileAllocateSubnets(pod, podNets)
+	require.NoError(t, err)
+	require.Equal(t, resolvedSubnet.Name, allocated.Annotations[util.LogicalSwitchAnnotation])
+	require.Equal(t, "2345", allocated.Annotations[util.TunnelKeyAnnotation])
+}
+
+func TestReconcileAllocateSubnetsOVNVlanKeepsNicAnnotationsWithoutTunnelKey(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.LogicalSwitchAnnotation: "vlan-subnet",
+				util.TunnelKeyAnnotation:     "1234",
+			},
+		},
+	}
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "vlan-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.5.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  util.OvnProvider,
+			Vlan:      "vlan-a",
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100},
+	}
+	vlan := &kubeovnv1.Vlan{
+		ObjectMeta: metav1.ObjectMeta{Name: "vlan-a"},
+		Spec:       kubeovnv1.VlanSpec{ID: 100, Provider: "provider-a"},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:    []*kubeovnv1.Subnet{subnet},
+		Vlans:      []*kubeovnv1.Vlan{vlan},
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.PodNicType = util.VethType
+	c.ipam = newIPAMForTest([]*kubeovnv1.Subnet{subnet})
+
+	fc.mockOvnClient.EXPECT().CreateLogicalSwitchPort(
+		subnet.Name, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+	).Return(nil)
+
+	allocated, err := c.reconcileAllocateSubnets(pod, []*kubeovnNet{{
+		Type:         providerTypeOriginal,
+		ProviderName: util.OvnProvider,
+		Subnet:       subnet,
+	}})
+	require.NoError(t, err)
+	require.Equal(t, subnet.Name, allocated.Annotations[util.LogicalSwitchAnnotation])
+	require.Equal(t, util.VethType, allocated.Annotations[fmt.Sprintf(util.PodNicAnnotationTemplate, util.OvnProvider)])
+	_, ok := allocated.Annotations[util.TunnelKeyAnnotation]
+	require.False(t, ok, "OVN vlan/underlay subnet must keep the default tunnel key")
+}
+
+func TestReconcileAllocateSubnetsClearsStaleTunnelKeyForNonOVNProvider(t *testing.T) {
+	const provider = "net1.default"
+	logicalSwitchKey := fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)
+	podNicKey := fmt.Sprintf(util.PodNicAnnotationTemplate, provider)
+	tunnelKeyKey := fmt.Sprintf(util.TunnelKeyAnnotationTemplate, provider)
+	allocatedKey := fmt.Sprintf(util.AllocatedAnnotationTemplate, provider)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Annotations: map[string]string{
+				logicalSwitchKey: "old-ovn-subnet",
+				podNicKey:        util.VethType,
+				tunnelKeyKey:     "1234",
+			},
+		},
+	}
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ipam-only-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.2.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  provider,
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:    []*kubeovnv1.Subnet{subnet},
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.ipam = newIPAMForTest([]*kubeovnv1.Subnet{subnet})
+
+	allocated, err := c.reconcileAllocateSubnets(pod, []*kubeovnNet{{
+		Type:         providerTypeIPAM,
+		ProviderName: provider,
+		Subnet:       subnet,
+	}})
+	require.NoError(t, err)
+	require.NotNil(t, allocated)
+	require.Equal(t, "true", allocated.Annotations[allocatedKey])
+	_, ok := allocated.Annotations[logicalSwitchKey]
+	require.False(t, ok, "non-OVN provider must not keep a stale logical_switch")
+	_, ok = allocated.Annotations[podNicKey]
+	require.False(t, ok, "non-OVN provider must not keep a stale pod_nic")
+	_, ok = allocated.Annotations[tunnelKeyKey]
+	require.False(t, ok, "non-OVN provider must not keep a stale tunnel_key")
 }
 
 func TestGetNamedPortByNsReturnsCopy(t *testing.T) {
@@ -856,9 +1053,14 @@ func TestTunnelKeyNotReady(t *testing.T) {
 			Status:     kubeovnv1.SubnetStatus{TunnelKey: tunnelKey},
 		}
 	}
-	underlaySubnet := &kubeovnv1.Subnet{
-		ObjectMeta: metav1.ObjectMeta{Name: "underlay-subnet"},
-		Spec:       kubeovnv1.SubnetSpec{Provider: "underlay.default"},
+	vlanSubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "vlan-subnet"},
+		Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a"},
+		Status:     kubeovnv1.SubnetStatus{TunnelKey: 0},
+	}
+	nonOvnSubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ipam-only-subnet"},
+		Spec:       kubeovnv1.SubnetSpec{Provider: "net1.default"},
 		Status:     kubeovnv1.SubnetStatus{TunnelKey: 0},
 	}
 
@@ -867,16 +1069,373 @@ func TestTunnelKeyNotReady(t *testing.T) {
 		subnet   *kubeovnv1.Subnet
 		expected bool
 	}{
-		{"ovn subnet, tunnel key not ready", ovnSubnet(0), true},
+		{"ovn subnet, zero tunnel key is not ready", ovnSubnet(0), true},
+		{"ovn subnet, negative tunnel key is invalid", ovnSubnet(-1), true},
+		{"ovn subnet, out-of-range tunnel key is invalid", ovnSubnet(util.MaxTunnelKey + 1), true},
 		{"ovn subnet, tunnel key ready", ovnSubnet(5), false},
-		{"non-ovn subnet is ignored", underlaySubnet, false},
+		{"ovn subnet, maximum tunnel key is valid", ovnSubnet(util.MaxTunnelKey), false},
+		{"ovn vlan subnet keeps default tunnel key", vlanSubnet, false},
+		{"non-ovn subnet is ignored", nonOvnSubnet, false},
 		{"nil subnet is nil-safe", nil, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Controller{config: &Configuration{}}
-			assert.Equal(t, tt.expected, c.tunnelKeyNotReady(tt.subnet))
+			assert.Equal(t, tt.expected, tunnelKeyNotReady(tt.subnet))
+		})
+	}
+}
+
+func TestHandleRepairTunnelKey(t *testing.T) {
+	ovnSubnet := func(tunnelKey int) *kubeovnv1.Subnet {
+		return &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+			Spec: kubeovnv1.SubnetSpec{
+				CIDRBlock: "10.0.1.0/24",
+				Protocol:  kubeovnv1.ProtocolIPv4,
+				Provider:  util.OvnProvider,
+			},
+			Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100, TunnelKey: tunnelKey},
+		}
+	}
+
+	ovnPod := func(tunnelKey *string) *corev1.Pod {
+		annotations := map[string]string{
+			util.LogicalSwitchAnnotation: "ovn-subnet",
+			util.AllocatedAnnotation:     "true",
+		}
+		if tunnelKey != nil {
+			annotations[util.TunnelKeyAnnotation] = *tunnelKey
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "test-pod",
+				Namespace:   "default",
+				Annotations: annotations,
+			},
+		}
+	}
+
+	deletingPod := ovnPod(nil)
+	deletingPod.DeletionTimestamp = ptr.To(metav1.Now())
+	hostNetworkPod := ovnPod(nil)
+	hostNetworkPod.Spec.HostNetwork = true
+
+	tests := []struct {
+		name          string
+		pod           *corev1.Pod
+		subnet        *kubeovnv1.Subnet
+		wantErr       bool
+		wantAnnotated bool
+		wantValue     string
+	}{
+		{
+			name:          "patches missing tunnel_key from subnet status",
+			pod:           ovnPod(nil),
+			subnet:        ovnSubnet(1234),
+			wantAnnotated: true,
+			wantValue:     "1234",
+		},
+		{
+			name:          "leaves matching valid annotation untouched",
+			pod:           ovnPod(ptr.To("1234")),
+			subnet:        ovnSubnet(1234),
+			wantAnnotated: true,
+			wantValue:     "1234",
+		},
+		{
+			name:          "repairs stale but valid annotation",
+			pod:           ovnPod(ptr.To("999")),
+			subnet:        ovnSubnet(1234),
+			wantAnnotated: true,
+			wantValue:     "1234",
+		},
+		{
+			name:          "repairs zero annotation",
+			pod:           ovnPod(ptr.To("0")),
+			subnet:        ovnSubnet(1234),
+			wantAnnotated: true,
+			wantValue:     "1234",
+		},
+		{
+			name:          "repairs non-numeric annotation",
+			pod:           ovnPod(ptr.To("invalid")),
+			subnet:        ovnSubnet(1234),
+			wantAnnotated: true,
+			wantValue:     "1234",
+		},
+		{
+			name:          "repairs out-of-range annotation",
+			pod:           ovnPod(ptr.To(strconv.Itoa(util.MaxTunnelKey + 1))),
+			subnet:        ovnSubnet(1234),
+			wantAnnotated: true,
+			wantValue:     "1234",
+		},
+		{
+			name:    "requeues when subnet tunnel key not synced yet",
+			pod:     ovnPod(nil),
+			subnet:  ovnSubnet(0),
+			wantErr: true,
+		},
+		{
+			name:    "requeues when subnet tunnel key is out of range",
+			pod:     ovnPod(nil),
+			subnet:  ovnSubnet(util.MaxTunnelKey + 1),
+			wantErr: true,
+		},
+		{
+			name: "removes stale key from OVN vlan underlay subnet",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.LogicalSwitchAnnotation: "vlan-subnet",
+						util.AllocatedAnnotation:     "true",
+						util.TunnelKeyAnnotation:     "1234",
+					},
+				},
+			},
+			subnet: &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: "vlan-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a"},
+				Status:     kubeovnv1.SubnetStatus{TunnelKey: 0},
+			},
+		},
+		{
+			name: "removes stale key without logical switch",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.AllocatedAnnotation: "true",
+						util.TunnelKeyAnnotation: "7",
+					},
+				},
+			},
+			subnet: &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: "unused-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: "net1.default"},
+			},
+		},
+		{
+			name: "removes stale key from non-ovn subnet",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+					Annotations: map[string]string{
+						util.LogicalSwitchAnnotation: "underlay-subnet",
+						util.AllocatedAnnotation:     "true",
+						util.TunnelKeyAnnotation:     "7",
+					},
+				},
+			},
+			subnet: &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: "underlay-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: "underlay.default"},
+				Status:     kubeovnv1.SubnetStatus{TunnelKey: 7},
+			},
+		},
+		{name: "skips deleting pod", pod: deletingPod, subnet: ovnSubnet(1234)},
+		{name: "skips hostNetwork pod", pod: hostNetworkPod, subnet: ovnSubnet(1234)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+				Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+				Subnets:    []*kubeovnv1.Subnet{tt.subnet},
+				Pods:       []*corev1.Pod{tt.pod},
+			})
+			require.NoError(t, err)
+			c := fc.fakeController
+
+			err = c.handleRepairTunnelKey("default/test-pod")
+			if tt.wantErr {
+				require.Error(t, err)
+				updated, getErr := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), "test-pod", metav1.GetOptions{})
+				require.NoError(t, getErr)
+				_, ok := updated.Annotations[util.TunnelKeyAnnotation]
+				require.False(t, ok, "invalid subnet tunnel key must never be patched")
+				return
+			}
+			require.NoError(t, err)
+
+			updated, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), "test-pod", metav1.GetOptions{})
+			require.NoError(t, err)
+			if tt.wantAnnotated {
+				require.Equal(t, tt.wantValue, updated.Annotations[util.TunnelKeyAnnotation])
+			} else {
+				_, ok := updated.Annotations[util.TunnelKeyAnnotation]
+				require.False(t, ok, "tunnel_key annotation must not be added")
+			}
+		})
+	}
+
+	t.Run("pod not found is a no-op", func(t *testing.T) {
+		fc, err := newFakeControllerWithOptions(t, nil)
+		require.NoError(t, err)
+		require.NoError(t, fc.fakeController.handleRepairTunnelKey("default/does-not-exist"))
+	})
+}
+
+func TestHandleRepairTunnelKeyMultiNIC(t *testing.T) {
+	subnets := []*kubeovnv1.Subnet{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ovn-a"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+			Status:     kubeovnv1.SubnetStatus{TunnelKey: 1234},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ovn-b"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+			Status:     kubeovnv1.SubnetStatus{TunnelKey: 0},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "multi-nic",
+			Namespace: "default",
+			Annotations: map[string]string{
+				nadv1.NetworkAttachmentAnnot: "default/net1, default/net2, default/net3, default/net4",
+				// NIC 1: allocated on ovn-a, missing tunnel_key -> patched
+				util.AllocatedAnnotation:     "true",
+				util.LogicalSwitchAnnotation: "ovn-a",
+				// NIC 2: allocated on ovn-b whose key is not synced -> requeued, not patched
+				"net1.ovn.kubernetes.io/allocated":      "true",
+				"net1.ovn.kubernetes.io/logical_switch": "ovn-b",
+				// NIC 3: allocated non-OVN NIC with no logical_switch -> silent skip, not counted
+				"net2.kubernetes.io/allocated": "true",
+				// NIC 4: logical_switch points to a subnet that does not exist -> skipped and counted
+				"net3.ovn.kubernetes.io/allocated":      "true",
+				"net3.ovn.kubernetes.io/logical_switch": "ovn-c",
+				// NIC 5: has logical_switch but is NOT allocated -> skipped
+				"net4.ovn.kubernetes.io/logical_switch": "ovn-a",
+			},
+		},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		Subnets:    subnets,
+		Pods:       []*corev1.Pod{pod},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	skippedBefore := readCounter(t, metricPodTunnelKeySkipped)
+	err = c.handleRepairTunnelKey("default/multi-nic")
+	require.Error(t, err, "must requeue while any allocated subnet key is not synced yet")
+
+	updated, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), "multi-nic", metav1.GetOptions{})
+	require.NoError(t, err)
+	// NIC 1 must be patched even though NIC 2 is not ready (partial progress lands).
+	require.Equal(t, "1234", updated.Annotations[util.TunnelKeyAnnotation])
+	// NIC 2 must not be patched with a stale zero key.
+	_, ok := updated.Annotations["net1.ovn.kubernetes.io/tunnel_key"]
+	require.False(t, ok)
+	// NIC 5 (not allocated) must not be patched.
+	_, ok = updated.Annotations["net4.ovn.kubernetes.io/tunnel_key"]
+	require.False(t, ok)
+	// Only the unresolvable logical_switch (NIC 4) counts as skipped; the
+	// non-OVN NIC 3 with no logical_switch must be silent.
+	require.Equal(t, float64(1), readCounter(t, metricPodTunnelKeySkipped)-skippedBefore)
+}
+
+func TestPodProvidersNeedingTunnelKeyRepair(t *testing.T) {
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Subnets: []*kubeovnv1.Subnet{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+				Status:     kubeovnv1.SubnetStatus{TunnelKey: 1234},
+			},
+			{ObjectMeta: metav1.ObjectMeta{Name: "vlan-subnet"}, Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a"}},
+		},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		wantRepair  bool
+	}{
+		{name: "missing VPC key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet"}, wantRepair: true},
+		{name: "matching VPC key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "1234"}},
+		{name: "stale VPC key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "999"}, wantRepair: true},
+		{name: "invalid VPC key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "ovn-subnet", util.TunnelKeyAnnotation: "invalid"}, wantRepair: true},
+		{name: "not allocated", annotations: map[string]string{util.LogicalSwitchAnnotation: "ovn-subnet"}},
+		{name: "non-OVN without key", annotations: map[string]string{util.AllocatedAnnotation: "true"}},
+		{name: "non-OVN stale key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.TunnelKeyAnnotation: "1234"}, wantRepair: true},
+		{name: "vlan without key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "vlan-subnet"}},
+		{name: "vlan stale key", annotations: map[string]string{util.AllocatedAnnotation: "true", util.LogicalSwitchAnnotation: "vlan-subnet", util.TunnelKeyAnnotation: "1234"}, wantRepair: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
+			require.Equal(t, tt.wantRepair, len(c.podProvidersNeedingTunnelKeyRepair(pod)) != 0)
+		})
+	}
+}
+
+func TestRepairPodTunnelKeyOnStartup(t *testing.T) {
+	pod := func(name, subnet string, phase corev1.PodPhase, sts bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				Annotations: map[string]string{
+					util.AllocatedAnnotation:     "true",
+					util.LogicalSwitchAnnotation: subnet,
+				},
+			},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+		if sts {
+			p.OwnerReferences = []metav1.OwnerReference{{Kind: util.KindStatefulSet, Name: "sts", APIVersion: appsv1.SchemeGroupVersion.String()}}
+		}
+		return p
+	}
+
+	tests := []struct {
+		name       string
+		pod        *corev1.Pod
+		tunnelKey  int
+		wantKey    string
+		wantQueued bool
+	}{
+		{name: "repairs synchronously when key is ready", pod: pod("ready", "ready-subnet", corev1.PodRunning, false), tunnelKey: 1234, wantKey: "1234"},
+		{name: "defers until subnet worker provides key", pod: pod("deferred", "deferred-subnet", corev1.PodRunning, false), wantQueued: true},
+		{name: "repairs non-alive STS selected by InitIPAM", pod: pod("sts-0", "ready-subnet", corev1.PodSucceeded, true), tunnelKey: 1234, wantKey: "1234"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			subnet := &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: tt.pod.Annotations[util.LogicalSwitchAnnotation]},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+				Status:     kubeovnv1.SubnetStatus{TunnelKey: tt.tunnelKey},
+			}
+			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Subnets: []*kubeovnv1.Subnet{subnet}, Pods: []*corev1.Pod{tt.pod}})
+			require.NoError(t, err)
+			c := fc.fakeController
+
+			providers := c.podProvidersNeedingTunnelKeyRepair(tt.pod)
+			require.NotEmpty(t, providers)
+			c.repairPodTunnelKeyOnStartup(tt.pod, providers)
+
+			updated, err := c.config.KubeClient.CoreV1().Pods("default").Get(context.Background(), tt.pod.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, tt.wantKey, updated.Annotations[util.TunnelKeyAnnotation])
+			if tt.wantQueued {
+				require.Equal(t, 1, c.repairTunnelKeyQueue.Len())
+			} else {
+				require.Zero(t, c.repairTunnelKeyQueue.Len())
+			}
 		})
 	}
 }

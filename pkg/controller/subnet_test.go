@@ -12,6 +12,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
@@ -699,6 +700,85 @@ func Test_syncSubnetTunnelKey(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "sb unavailable")
 	})
+
+	for _, tunnelKey := range []int{0, -1, util.MaxTunnelKey + 1} {
+		t.Run(fmt.Sprintf("rejects invalid tunnel key %d", tunnelKey), func(t *testing.T) {
+			fc.mockOvnSbClient.EXPECT().GetLogicalSwitchTunnelKey("test-ovn-subnet").
+				Return(tunnelKey, nil)
+
+			err := ctrl.syncSubnetTunnelKey(subnet)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "invalid tunnel key")
+		})
+	}
+}
+
+func Test_reconcileSubnetTunnelKey(t *testing.T) {
+	tests := []struct {
+		name       string
+		subnet     *kubeovnv1.Subnet
+		sbKey      *int
+		wantStatus int
+	}{
+		{
+			name: "syncs invalid OVN VPC key",
+			subnet: &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: "vpc-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+			},
+			sbKey:      ptr.To(77),
+			wantStatus: 77,
+		},
+		{
+			name: "keeps valid OVN VPC key",
+			subnet: &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: "vpc-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider},
+				Status:     kubeovnv1.SubnetStatus{TunnelKey: 88},
+			},
+			wantStatus: 88,
+		},
+		{
+			name: "clears OVN vlan underlay key",
+			subnet: &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: "vlan-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vlan: "vlan-a"},
+				Status:     kubeovnv1.SubnetStatus{TunnelKey: 99},
+			},
+			wantStatus: 0,
+		},
+		{
+			name: "clears non-OVN provider key",
+			subnet: &kubeovnv1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ipam-only-subnet"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: "net1.default"},
+				Status:     kubeovnv1.SubnetStatus{TunnelKey: 99},
+			},
+			wantStatus: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+				Subnets: []*kubeovnv1.Subnet{tt.subnet},
+			})
+			require.NoError(t, err)
+			if tt.sbKey != nil {
+				fc.mockOvnSbClient.EXPECT().GetLogicalSwitchTunnelKey(tt.subnet.Name).
+					Return(*tt.sbKey, nil)
+			}
+
+			err = fc.fakeController.reconcileSubnetTunnelKey(tt.subnet)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantStatus, tt.subnet.Status.TunnelKey)
+
+			updated, err := fc.fakeController.config.KubeOvnClient.KubeovnV1().Subnets().Get(
+				context.Background(), tt.subnet.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, tt.wantStatus, updated.Status.TunnelKey)
+		})
+	}
 }
 
 func Test_isOvnSubnet(t *testing.T) {
