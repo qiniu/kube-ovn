@@ -17,8 +17,8 @@ The guarantee is upheld by two flows:
 
 `reconcileAllocateSubnets` (pkg/controller/pod.go) refuses to complete the
 allocation (requeues, persisting no pod annotations) while the resolved
-subnet's tunnel key has not been synced from OVN SB
-(`Status.TunnelKey == 0`), and writes the tunnel_key annotation in the same
+subnet's tunnel key is not valid (`Status.TunnelKey` is outside
+`1..16777215`), and writes the tunnel_key annotation in the same
 atomic patch as `allocated=true`. For a non-vlan OVN VPC subnet, the
 kube-ovn CNI server blocks until `allocated=true` and the pod annotation is
 a valid value equal to `Subnet.Status.TunnelKey`. Cilium (chained after
@@ -44,7 +44,7 @@ the population flow 2 repairs.
 
 - Pods created after the restart follow flow 1 (the gate lives in the
   allocation path and is unrelated to restarts).
-- Pods that already carry the annotation keep it (persisted in etcd).
+- Pods whose persisted annotation is valid and matches subnet status keep it.
 - Legacy pods allocated before the subnet tunnel key was synced (or before
   this code existed) can have a missing, non-numeric or out-of-range
   annotation (valid OVN tunnel keys are `1..16777215`). On startup,
@@ -74,8 +74,8 @@ Repair is multi-NIC aware and driven by the per-provider annotations the
 allocation wrote (`allocated` + `logical_switch`). A provider is repaired
 only when its logical switch resolves to a non-vlan OVN VPC subnet and its
 key is missing, invalid or different from `subnet.Status.TunnelKey`.
-Providers managed by another CNI have no `logical_switch`; OVN vlan/underlay subnets have one but
-are filtered by `isOvnVpcSubnet`. Both keep no pod tunnel_key annotation;
+Providers managed by another CNI have no `logical_switch`; OVN
+vlan/underlay subnets have one but are filtered by `isOvnVpcSubnet`. Both keep no pod tunnel_key annotation;
 startup repair removes stale keys written by older controller versions.
 The subnet is never guessed from namespace/default fallbacks, because
 writing a wrong VNI is worse than a missing one (nothing would correct it
@@ -117,8 +117,8 @@ restart cilium so it re-reads them for already-created endpoints. Every CNI
 ADD waits for `allocated=true`; when the persisted logical_switch resolves to
 a non-vlan OVN VPC subnet, it additionally waits for a valid annotation equal
 to `Subnet.Status.TunnelKey`. If backfill has not completed within the wait
-loop, ADD fails and kubelet retries. The cilium restart is still required for endpoints created before
-the backfill logic existed.
+loop, ADD fails and kubelet retries. The Cilium restart is still required for
+endpoints created before the backfill logic existed.
 
 ## Compatibility and rolling upgrade
 
