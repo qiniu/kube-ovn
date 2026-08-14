@@ -49,7 +49,10 @@ func createCniServerHandler(config *Configuration, controller *Controller) *cniS
 func (csh cniServerHandler) podTunnelKeyReady(pod *v1.Pod, provider string) (bool, error) {
 	lsName := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, provider)]
 	if lsName == "" {
-		return true, nil
+		// An allocated OVN provider must identify its logical switch before CNI
+		// can decide whether the VPC key is required. Non-OVN/IPAM-only
+		// providers legitimately have no logical_switch and bypass this gate.
+		return !util.IsOvnProvider(provider), nil
 	}
 	subnet, err := csh.Controller.subnetsLister.Get(lsName)
 	if err != nil {

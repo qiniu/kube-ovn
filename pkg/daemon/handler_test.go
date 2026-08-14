@@ -44,24 +44,26 @@ func TestPodTunnelKeyReady(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		pod     *corev1.Pod
-		want    bool
-		wantErr bool
+		name     string
+		pod      *corev1.Pod
+		provider string
+		want     bool
+		wantErr  bool
 	}{
-		{name: "provider without logical switch", pod: pod("", ""), want: true},
-		{name: "VPC key matches subnet status", pod: pod("vpc-subnet", "1234"), want: true},
-		{name: "VPC key missing", pod: pod("vpc-subnet", ""), want: false},
-		{name: "VPC key zero", pod: pod("vpc-subnet", "0"), want: false},
-		{name: "VPC key non-numeric", pod: pod("vpc-subnet", "invalid"), want: false},
-		{name: "VPC key differs from subnet status", pod: pod("vpc-subnet", "999"), want: false},
-		{name: "vlan subnet needs no key", pod: pod("vlan-subnet", ""), want: true},
-		{name: "missing subnet", pod: pod("missing-subnet", "1234"), want: false, wantErr: true},
+		{name: "OVN provider without logical switch", pod: pod("", ""), provider: util.OvnProvider, want: false},
+		{name: "non-OVN provider without logical switch", pod: pod("", ""), provider: "net1.default", want: true},
+		{name: "VPC key matches subnet status", pod: pod("vpc-subnet", "1234"), provider: util.OvnProvider, want: true},
+		{name: "VPC key missing", pod: pod("vpc-subnet", ""), provider: util.OvnProvider, want: false},
+		{name: "VPC key zero", pod: pod("vpc-subnet", "0"), provider: util.OvnProvider, want: false},
+		{name: "VPC key non-numeric", pod: pod("vpc-subnet", "invalid"), provider: util.OvnProvider, want: false},
+		{name: "VPC key differs from subnet status", pod: pod("vpc-subnet", "999"), provider: util.OvnProvider, want: false},
+		{name: "vlan subnet needs no key", pod: pod("vlan-subnet", ""), provider: util.OvnProvider, want: true},
+		{name: "missing subnet", pod: pod("missing-subnet", "1234"), provider: util.OvnProvider, want: false, wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := csh.podTunnelKeyReady(tt.pod, util.OvnProvider)
+			got, err := csh.podTunnelKeyReady(tt.pod, tt.provider)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("podTunnelKeyReady() error = %v, wantErr %v", err, tt.wantErr)
 			}

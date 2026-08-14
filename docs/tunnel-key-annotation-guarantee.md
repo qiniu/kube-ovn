@@ -58,9 +58,13 @@ the population flow 2 repairs.
 The repair enqueue runs only during the InitIPAM startup sweep. It is driven
 by persisted pod annotations (`podProvidersNeedingTunnelKeyRepair`) before
 NAD/default-subnet resolution, so every eligible legacy pod is enqueued once
-without a periodic task or a pod-update fallback. Detection and successful
-repair are logged at Warning level, including the instruction to restart
-Cilium after backfill so already-created endpoints reload the corrected VNI.
+without a periodic task or a pod-update fallback. The queue is necessarily
+asynchronous because InitIPAM runs before `startWorkers`; a missing subnet key
+may require the subnet worker, so waiting synchronously in InitIPAM would
+block the worker that produces it. Repair workers start afterward and retry
+with rate limiting. Detection and successful repair are logged at Warning
+level, including the instruction to restart Cilium after backfill so
+already-created endpoints reload the corrected VNI.
 
 This asynchronous repair is fallback recovery only; it is not part of normal
 pod allocation. Normal allocation writes IP/network, tunnel_key and
@@ -110,8 +114,9 @@ TunnelKey value.
 
 Restart kube-ovn-controller first (flow 2 backfills the annotations), then
 restart cilium so it re-reads them for already-created endpoints. For every
-new CNI ADD on a non-vlan OVN VPC subnet, the CNI server waits for both
-`allocated=true` and a valid annotation equal to `Subnet.Status.TunnelKey`;
+new CNI ADD on a non-vlan OVN VPC subnet, the CNI server waits for an OVN
+logical_switch, `allocated=true`, and a valid annotation equal to
+`Subnet.Status.TunnelKey`;
 if backfill has not completed within the wait loop, ADD fails and kubelet
 retries. The cilium restart is still required for endpoints created before
 the backfill logic existed.
