@@ -577,13 +577,47 @@ func tunnelKeyNotReady(subnet *kubeovnv1.Subnet) bool {
 	return util.IsOvnVpcSubnet(subnet) && !util.IsValidTunnelKey(subnet.Status.TunnelKey)
 }
 
+// podDefaultTunnelKeyPolicySatisfied is the O(1) fast path for the common
+// single-network pod. Multus/custom-default pods fall back to the complete
+// per-provider scan below.
+func (c *Controller) podDefaultTunnelKeyPolicySatisfied(pod *v1.Pod) bool {
+	annotations := pod.Annotations
+	if strings.TrimSpace(annotations[nadv1.NetworkAttachmentAnnot]) != "" ||
+		strings.TrimSpace(annotations[nadv1.NetworkStatusAnnot]) != "" ||
+		annotations[util.DefaultNetworkAnnotation] != "" {
+		return false
+	}
+	if annotations[util.AllocatedAnnotation] != "true" {
+		return true
+	}
+
+	tunnelKeyValue, hasTunnelKey := annotations[util.TunnelKeyAnnotation]
+	lsName := annotations[util.LogicalSwitchAnnotation]
+	if lsName == "" {
+		return !hasTunnelKey
+	}
+	subnet, err := c.subnetsLister.Get(lsName)
+	if err != nil {
+		return false
+	}
+	if !util.IsOvnVpcSubnet(subnet) {
+		return !hasTunnelKey
+	}
+	tunnelKey, err := strconv.Atoi(tunnelKeyValue)
+	return hasTunnelKey && err == nil && util.IsValidTunnelKey(tunnelKey) &&
+		util.IsValidTunnelKey(subnet.Status.TunnelKey) && tunnelKey == subnet.Status.TunnelKey
+}
+
 // podProvidersNeedingTunnelKeyRepair returns allocated providers whose pod
 // annotation does not match the subnet policy: non-vlan OVN VPC subnets need
 // the exact valid key from subnet status, while every other subnet type needs
-// no key.
-// The predicate is shared by repairPodTunnelKeyOnStartup and
+// no key. The predicate is shared by repairPodTunnelKeyOnStartup and
 // handleRepairTunnelKey so detection and reconciliation cannot drift apart.
 func (c *Controller) podProvidersNeedingTunnelKeyRepair(pod *v1.Pod) []string {
+	if c.podDefaultTunnelKeyPolicySatisfied(pod) {
+		return nil
+	}
+
 	var providers []string
 	for annotKey, v := range pod.Annotations {
 		if v != "true" || !strings.HasSuffix(annotKey, util.AllocatedAnnotationSuffix) {
