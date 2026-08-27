@@ -311,8 +311,17 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 				continue
 			}
 			ipStr := strings.Split(addr.String(), "/")[0]
-			// exclude the vip as encap ip unless host-tunnel-src is true;
-			// the node internal IP is never a vip, e.g. a /32 address assigned by cloud DHCP
+			// A full-mask address (/32, /128) is usually a VIP, e.g. one managed by
+			// keepalived: using it as the encap IP would break all tunnels once the VIP
+			// drifts to another node, so it is skipped by default. Two exceptions:
+			//   - host-tunnel-src: the operator deliberately sources tunnels from a
+			//     full-mask address, typically a /32 loopback advertised via BGP;
+			//   - the node internal IP: kube-apiserver already accepts it as this node's
+			//     address, so by definition it is not a floating VIP. Cloud providers
+			//     commonly assign it as a /32 via DHCP, in which case it is the only
+			//     candidate on the NIC.
+			// Note the address scope cannot be used to tell these apart: both a DHCP
+			// node IP and a keepalived VIP are scope global.
 			if ones, bits := ipCidr.Mask.Size(); ones == bits && !config.HostTunnelSrc &&
 				ipStr != config.NodeIPv4 && ipStr != config.NodeIPv6 {
 				klog.Infof("Skip address %s", ipCidr.String())
