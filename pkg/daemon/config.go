@@ -304,7 +304,6 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 		if err != nil {
 			return fmt.Errorf("failed to get iface addr. %w", err)
 		}
-		nodeIPv4, nodeIPv6 := util.GetNodeInternalIP(*node)
 		for _, addr := range addrs {
 			_, ipCidr, err := net.ParseCIDR(addr.String())
 			if err != nil {
@@ -315,7 +314,7 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 			// exclude the vip as encap ip unless host-tunnel-src is true;
 			// the node internal IP is never a vip, e.g. a /32 address assigned by cloud DHCP
 			if ones, bits := ipCidr.Mask.Size(); ones == bits && !config.HostTunnelSrc &&
-				ipStr != nodeIPv4 && ipStr != nodeIPv6 {
+				ipStr != config.NodeIPv4 && ipStr != config.NodeIPv6 {
 				klog.Infof("Skip address %s", ipCidr.String())
 				continue
 			}
