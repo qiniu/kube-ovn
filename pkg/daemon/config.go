@@ -304,54 +304,7 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 		if err != nil {
 			return fmt.Errorf("failed to get iface addr. %w", err)
 		}
-		// gather the usable unicast addresses of the interface, excluding link-local
-		// and loopback ones, and count them per address family
-		ips := make([]net.IP, 0, len(addrs))
-		fullMask := make(map[string]bool, len(addrs))
-		var n4, n6 int
-		for _, addr := range addrs {
-			ip, ipNet, err := net.ParseCIDR(addr.String())
-			if err != nil {
-				klog.Errorf("Failed to parse CIDR address %s: %v, skipping", addr.String(), err)
-				continue
-			}
-			if ip.IsLinkLocalUnicast() || ip.IsLoopback() {
-				continue
-			}
-			ips = append(ips, ip)
-			if ones, bits := ipNet.Mask.Size(); ones == bits {
-				fullMask[ip.String()] = true
-			}
-			if ip.To4() != nil {
-				n4++
-			} else {
-				n6++
-			}
-		}
-		for _, ip := range ips {
-			ipStr := ip.String()
-			sameFamily := n4
-			if ip.To4() == nil {
-				sameFamily = n6
-			}
-			// A full-mask address (/32, /128) sharing the interface with other addresses
-			// of the same family is most likely a VIP, e.g. one managed by keepalived:
-			// using it as the encap IP would break all tunnels once the VIP drifts to
-			// another node, so it is skipped. Two exceptions:
-			//   - it is the only address of its family on the interface: a VIP never lives
-			//     alone on the tunnel NIC, so this is the node address itself, typically a
-			//     /32 assigned by a cloud DHCP server;
-			//   - host-tunnel-src is set: the operator deliberately sources tunnels from a
-			//     full-mask address, typically a /32 loopback advertised via BGP.
-			if fullMask[ipStr] && sameFamily > 1 && !config.HostTunnelSrc {
-				klog.Infof("Skip address %s", ipStr)
-				continue
-			}
-			if len(srcIPs) == 0 || slices.Contains(srcIPs, ipStr) {
-				encapIP = ipStr
-				break
-			}
-		}
+		encapIP = selectEncapIP(addrs, srcIPs, config.HostTunnelSrc)
 		if len(encapIP) == 0 {
 			return fmt.Errorf("iface %s has no valid IP address", tunnelNic)
 		}
@@ -411,6 +364,60 @@ func (config *Configuration) getEncapIP(node *corev1.Node) string {
 		return ipv4
 	}
 	return ipv6
+}
+
+// selectEncapIP picks the tunnel source address among the addresses of the tunnel
+// interface. It returns an empty string if no address is usable.
+//
+// A full-mask address (/32, /128) sharing the interface with other addresses of the
+// same family is most likely a VIP, e.g. one managed by keepalived: using it as the
+// encap IP would break all tunnels once the VIP drifts to another node, so it is
+// skipped. Two exceptions:
+//   - it is the only address of its family on the interface: a VIP never lives alone
+//     on the tunnel NIC, so this is the node address itself, typically a /32 assigned
+//     by a cloud DHCP server;
+//   - hostTunnelSrc is set: the operator deliberately sources tunnels from a full-mask
+//     address, typically a /32 loopback advertised via BGP.
+//
+// srcIPs holds the source addresses of the link scope routes on the interface: when it
+// is not empty, the encap IP must be one of them.
+func selectEncapIP(addrs []net.Addr, srcIPs []string, hostTunnelSrc bool) string {
+	// gather the usable unicast addresses, excluding link-local and loopback ones,
+	// and count them per address family
+	candidates := make([]net.IPNet, 0, len(addrs))
+	var n4, n6 int
+	for _, addr := range addrs {
+		ip, ipNet, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			klog.Errorf("Failed to parse CIDR address %s: %v, skipping", addr.String(), err)
+			continue
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLoopback() {
+			continue
+		}
+		candidates = append(candidates, net.IPNet{IP: ip, Mask: ipNet.Mask})
+		if ip.To4() != nil {
+			n4++
+		} else {
+			n6++
+		}
+	}
+
+	for _, c := range candidates {
+		ipStr := c.IP.String()
+		sameFamily := n4
+		if c.IP.To4() == nil {
+			sameFamily = n6
+		}
+		if ones, bits := c.Mask.Size(); ones == bits && sameFamily > 1 && !hostTunnelSrc {
+			klog.Infof("Skip address %s", ipStr)
+			continue
+		}
+		if len(srcIPs) == 0 || slices.Contains(srcIPs, ipStr) {
+			return ipStr
+		}
+	}
+	return ""
 }
 
 func findInterface(ifaceStr string) (*net.Interface, error) {
@@ -534,14 +541,16 @@ func (config *Configuration) setEncapIPs() error {
 	encapIPStr := strings.Join(ips, ",")
 	// #nosec G204
 	raw, err := exec.Command(
-		"ovs-vsctl", "set", "open", ".", "external-ids:ovn-encap-ip="+encapIPStr).CombinedOutput()
+		"ovs-vsctl", "set", "open", ".", "external-ids:ovn-encap-ip="+encapIPStr,
+	).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to set ovn-encap-ip, %s", string(raw))
 	}
 
 	// #nosec G204
 	raw, err = exec.Command(
-		"ovs-vsctl", "set", "open", ".", "external-ids:ovn-encap-ip-default="+defaultIP).CombinedOutput()
+		"ovs-vsctl", "set", "open", ".", "external-ids:ovn-encap-ip-default="+defaultIP,
+	).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to set ovn-encap-ip-default, %s", string(raw))
 	}
