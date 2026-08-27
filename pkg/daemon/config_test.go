@@ -242,6 +242,10 @@ func TestSelectEncapIP(t *testing.T) {
 		nodeIPs:  []string{"192.168.0.10"},
 		expected: "192.168.0.10",
 	}, {
+		name:     "no candidate is left when every address of the single stack nic is a vip",
+		addrs:    addrs("192.168.0.11/32", "192.168.0.12/32"),
+		expected: "",
+	}, {
 		name:     "address must be a route source when any exists",
 		addrs:    addrs("192.168.0.10/24", "192.168.1.10/24"),
 		srcIPs:   []string{"192.168.1.10"},

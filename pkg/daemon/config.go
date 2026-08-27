@@ -369,17 +369,18 @@ func (config *Configuration) getEncapIP(node *corev1.Node) string {
 // selectEncapIP picks the tunnel source address among the addresses of the tunnel
 // interface. It returns an empty string if no address is usable.
 //
-// A full-mask address (/32, /128) sharing the interface with other addresses of the
-// same family is most likely a VIP, e.g. one managed by keepalived: using it as the
+// A full-mask address (/32, /128) sharing the interface with other usable addresses of
+// the same family is most likely a VIP, e.g. one managed by keepalived: using it as the
 // encap IP would break all tunnels once the VIP drifts to another node, so it is
 // skipped. Three exceptions:
-//   - it is the only address of its family on the interface: a VIP never lives alone
-//     on the tunnel NIC, so this is the node address itself, typically a /32 assigned
-//     by a cloud DHCP server;
+//   - it is the only usable, i.e. neither loopback nor link-local, address of its family
+//     on the interface: a VIP never lives alone on the tunnel NIC, so this is the node
+//     address itself, typically a /32 assigned by a cloud DHCP server;
 //   - it is one of the node internal IPs: kube-apiserver already accepts it as this
 //     node's own address, so it is not a floating VIP;
 //   - hostTunnelSrc is set: the operator deliberately sources tunnels from a full-mask
-//     address, typically a /32 loopback advertised via BGP.
+//     address, typically a /32 advertised via BGP and assigned to lo or a dummy
+//     interface. Note a real loopback address such as 127.0.0.1 is always excluded.
 //
 // srcIPs holds the source addresses of the link scope routes on the interface: when it
 // is not empty, the encap IP must be one of them.
@@ -413,7 +414,8 @@ func selectEncapIP(addrs []net.Addr, srcIPs []string, hostTunnelSrc bool, nodeIP
 		}
 		if ones, bits := c.Mask.Size(); ones == bits && sameFamily > 1 && !hostTunnelSrc &&
 			!slices.Contains(nodeIPs, ipStr) {
-			klog.Infof("Skip address %s", ipStr)
+			klog.Infof("Skip address %s: it looks like a vip, the interface has %d usable addresses of the same family",
+				ipStr, sameFamily)
 			continue
 		}
 		if len(srcIPs) == 0 || slices.Contains(srcIPs, ipStr) {
