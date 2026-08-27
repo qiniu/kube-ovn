@@ -304,7 +304,7 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 		if err != nil {
 			return fmt.Errorf("failed to get iface addr. %w", err)
 		}
-		encapIP = selectEncapIP(addrs, srcIPs, config.HostTunnelSrc)
+		encapIP = selectEncapIP(addrs, srcIPs, config.HostTunnelSrc, config.NodeIPv4, config.NodeIPv6)
 		if len(encapIP) == 0 {
 			return fmt.Errorf("iface %s has no valid IP address", tunnelNic)
 		}
@@ -372,16 +372,18 @@ func (config *Configuration) getEncapIP(node *corev1.Node) string {
 // A full-mask address (/32, /128) sharing the interface with other addresses of the
 // same family is most likely a VIP, e.g. one managed by keepalived: using it as the
 // encap IP would break all tunnels once the VIP drifts to another node, so it is
-// skipped. Two exceptions:
+// skipped. Three exceptions:
 //   - it is the only address of its family on the interface: a VIP never lives alone
 //     on the tunnel NIC, so this is the node address itself, typically a /32 assigned
 //     by a cloud DHCP server;
+//   - it is one of the node internal IPs: kube-apiserver already accepts it as this
+//     node's own address, so it is not a floating VIP;
 //   - hostTunnelSrc is set: the operator deliberately sources tunnels from a full-mask
 //     address, typically a /32 loopback advertised via BGP.
 //
 // srcIPs holds the source addresses of the link scope routes on the interface: when it
 // is not empty, the encap IP must be one of them.
-func selectEncapIP(addrs []net.Addr, srcIPs []string, hostTunnelSrc bool) string {
+func selectEncapIP(addrs []net.Addr, srcIPs []string, hostTunnelSrc bool, nodeIPs ...string) string {
 	// gather the usable unicast addresses, excluding link-local and loopback ones,
 	// and count them per address family
 	candidates := make([]net.IPNet, 0, len(addrs))
@@ -409,7 +411,8 @@ func selectEncapIP(addrs []net.Addr, srcIPs []string, hostTunnelSrc bool) string
 		if c.IP.To4() == nil {
 			sameFamily = n6
 		}
-		if ones, bits := c.Mask.Size(); ones == bits && sameFamily > 1 && !hostTunnelSrc {
+		if ones, bits := c.Mask.Size(); ones == bits && sameFamily > 1 && !hostTunnelSrc &&
+			!slices.Contains(nodeIPs, ipStr) {
 			klog.Infof("Skip address %s", ipStr)
 			continue
 		}

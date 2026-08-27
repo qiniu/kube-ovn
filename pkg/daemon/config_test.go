@@ -205,6 +205,7 @@ func TestSelectEncapIP(t *testing.T) {
 		addrs         []net.Addr
 		srcIPs        []string
 		hostTunnelSrc bool
+		nodeIPs       []string
 		expected      string
 	}{{
 		name:     "no address",
@@ -236,6 +237,11 @@ func TestSelectEncapIP(t *testing.T) {
 		addrs:    addrs("192.168.0.11/32", "192.168.0.12/32", "fd00::1/128"),
 		expected: "fd00::1",
 	}, {
+		name:     "node ip is used even when another full mask address exists",
+		addrs:    addrs("192.168.0.11/32", "192.168.0.10/32"),
+		nodeIPs:  []string{"192.168.0.10"},
+		expected: "192.168.0.10",
+	}, {
 		name:     "address must be a route source when any exists",
 		addrs:    addrs("192.168.0.10/24", "192.168.1.10/24"),
 		srcIPs:   []string{"192.168.1.10"},
@@ -253,7 +259,7 @@ func TestSelectEncapIP(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.expected, selectEncapIP(tt.addrs, tt.srcIPs, tt.hostTunnelSrc))
+			require.Equal(t, tt.expected, selectEncapIP(tt.addrs, tt.srcIPs, tt.hostTunnelSrc, tt.nodeIPs...))
 		})
 	}
 }
