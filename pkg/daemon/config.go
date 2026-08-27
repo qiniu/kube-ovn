@@ -304,32 +304,47 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 		if err != nil {
 			return fmt.Errorf("failed to get iface addr. %w", err)
 		}
+		// gather the usable unicast addresses of the interface, excluding link-local
+		// and loopback ones, and count them per address family
+		ips := make([]net.IP, 0, len(addrs))
+		fullMask := make(map[string]bool, len(addrs))
+		var n4, n6 int
 		for _, addr := range addrs {
-			_, ipCidr, err := net.ParseCIDR(addr.String())
+			ip, ipNet, err := net.ParseCIDR(addr.String())
 			if err != nil {
 				klog.Errorf("Failed to parse CIDR address %s: %v, skipping", addr.String(), err)
 				continue
 			}
-			ipStr := strings.Split(addr.String(), "/")[0]
-			// A full-mask address (/32, /128) is usually a VIP, e.g. one managed by
-			// keepalived: using it as the encap IP would break all tunnels once the VIP
-			// drifts to another node, so it is skipped by default. Two exceptions:
-			//   - host-tunnel-src: the operator deliberately sources tunnels from a
-			//     full-mask address, typically a /32 loopback advertised via BGP;
-			//   - the node internal IP: kube-apiserver already accepts it as this node's
-			//     address, so by definition it is not a floating VIP. Cloud providers
-			//     commonly assign it as a /32 via DHCP, in which case it is the only
-			//     candidate on the NIC.
-			// Note the address scope cannot be used to tell these apart: both a DHCP
-			// node IP and a keepalived VIP are scope global.
-			if ones, bits := ipCidr.Mask.Size(); ones == bits && !config.HostTunnelSrc &&
-				ipStr != config.NodeIPv4 && ipStr != config.NodeIPv6 {
-				klog.Infof("Skip address %s", ipCidr.String())
+			if ip.IsLinkLocalUnicast() || ip.IsLoopback() {
 				continue
 			}
-
-			// exclude link-local and loopback addresses
-			if ip := net.ParseIP(ipStr); ip == nil || ip.IsLinkLocalUnicast() || ip.IsLoopback() {
+			ips = append(ips, ip)
+			if ones, bits := ipNet.Mask.Size(); ones == bits {
+				fullMask[ip.String()] = true
+			}
+			if ip.To4() != nil {
+				n4++
+			} else {
+				n6++
+			}
+		}
+		for _, ip := range ips {
+			ipStr := ip.String()
+			sameFamily := n4
+			if ip.To4() == nil {
+				sameFamily = n6
+			}
+			// A full-mask address (/32, /128) sharing the interface with other addresses
+			// of the same family is most likely a VIP, e.g. one managed by keepalived:
+			// using it as the encap IP would break all tunnels once the VIP drifts to
+			// another node, so it is skipped. Two exceptions:
+			//   - it is the only address of its family on the interface: a VIP never lives
+			//     alone on the tunnel NIC, so this is the node address itself, typically a
+			//     /32 assigned by a cloud DHCP server;
+			//   - host-tunnel-src is set: the operator deliberately sources tunnels from a
+			//     full-mask address, typically a /32 loopback advertised via BGP.
+			if fullMask[ipStr] && sameFamily > 1 && !config.HostTunnelSrc {
+				klog.Infof("Skip address %s", ipStr)
 				continue
 			}
 			if len(srcIPs) == 0 || slices.Contains(srcIPs, ipStr) {
