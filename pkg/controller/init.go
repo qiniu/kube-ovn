@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -14,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -790,12 +792,256 @@ func (c *Controller) syncVpcNatGatewayCR() error {
 	}
 
 	for _, gw := range gws {
-		if err := c.updateCrdNatGwLabels(gw.Name, ""); err != nil {
+		// Passing an empty policy here would blank the QoS credential the in-use check counts,
+		// undoing the backfill for every gateway right after the workers started.
+		if err := c.updateCrdNatGwLabels(gw.Name, gw.Spec.QoSPolicy); err != nil {
+			// A gateway pointing at a policy that no longer exists must not take the whole
+			// controller down at startup. The backfill skips the same case, and the gateway's own
+			// reconcile retries and reports it per object.
 			klog.Errorf("failed to update nat gw %s: %v", gw.Name, err)
-			return err
+			continue
 		}
 	}
 	return nil
+}
+
+func copyLabels(labels map[string]string) map[string]string {
+	newLabels := make(map[string]string, len(labels)+2)
+	for k, v := range labels {
+		newLabels[k] = v
+	}
+	return newLabels
+}
+
+func patchLabelsOp(labels map[string]string) string {
+	if len(labels) == 0 {
+		return "add"
+	}
+	return "replace"
+}
+
+// natGwLabelType identifies VpcNatGateway in a natLabelClaim; the iptables kinds reuse the
+// util.*UsingEip values that updateIptableLabels already dispatches on.
+const natGwLabelType = "vpc-nat-gw"
+
+// natLabelClaim is a UID credential written by the startup backfill. Workers must observe it
+// through the informer cache before they may conclude that nothing references the target.
+type natLabelClaim struct {
+	name     string
+	natType  string
+	labelKey string
+	value    string
+}
+
+func (c *Controller) natLabelSynced(claim natLabelClaim) (bool, error) {
+	var current map[string]string
+	var err error
+	switch claim.natType {
+	case util.FipUsingEip:
+		var obj *kubeovnv1.IptablesFIPRule
+		if obj, err = c.iptablesFipsLister.Get(claim.name); err == nil {
+			current = obj.Labels
+		}
+	case util.DnatUsingEip:
+		var obj *kubeovnv1.IptablesDnatRule
+		if obj, err = c.iptablesDnatRulesLister.Get(claim.name); err == nil {
+			current = obj.Labels
+		}
+	case util.SnatUsingEip:
+		var obj *kubeovnv1.IptablesSnatRule
+		if obj, err = c.iptablesSnatRulesLister.Get(claim.name); err == nil {
+			current = obj.Labels
+		}
+	case "eip":
+		var obj *kubeovnv1.IptablesEIP
+		if obj, err = c.iptablesEipsLister.Get(claim.name); err == nil {
+			current = obj.Labels
+		}
+	case natGwLabelType:
+		var obj *kubeovnv1.VpcNatGateway
+		if obj, err = c.vpcNatGatewayLister.Get(claim.name); err == nil {
+			current = obj.Labels
+		}
+	default:
+		return false, fmt.Errorf("unknown nat label type %s", claim.natType)
+	}
+	if err != nil {
+		// Deleted while we backfilled: there is no credential left to observe.
+		if k8serrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return current[claim.labelKey] == claim.value, nil
+}
+
+func (c *Controller) waitNatLabelClaimsSynced(ctx context.Context, claims []natLabelClaim) error {
+	if len(claims) == 0 {
+		return nil
+	}
+	return wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, time.Minute, true, func(context.Context) (bool, error) {
+		for _, claim := range claims {
+			synced, err := c.natLabelSynced(claim)
+			if err != nil || !synced {
+				return false, err
+			}
+		}
+		return true, nil
+	})
+}
+
+// syncNatUIDLabels backfills the UID credentials the in-use checks select on, then blocks until the
+// informer cache reflects them so the workers started afterwards never read a pre-backfill view.
+func (c *Controller) syncNatUIDLabels(ctx context.Context) error {
+	claims, err := c.backfillNatEipUIDLabels(nil)
+	if err != nil {
+		return err
+	}
+	if claims, err = c.backfillNatQoSUIDLabels(claims); err != nil {
+		return err
+	}
+	return c.waitNatLabelClaimsSynced(ctx, claims)
+}
+
+func (c *Controller) backfillEipUIDLabel(name, natType, eipName string, current map[string]string) (natLabelClaim, bool, error) {
+	eip, err := c.iptablesEipsLister.Get(eipName)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			klog.Warningf("skip syncing %s %s eip uid label, eip %s not found", natType, name, eipName)
+			return natLabelClaim{}, false, nil
+		}
+		klog.Errorf("failed to get eip %s, %v", eipName, err)
+		return natLabelClaim{}, false, err
+	}
+	uid := string(eip.UID)
+	if current[util.EipUIDLabel] == uid {
+		return natLabelClaim{}, false, nil
+	}
+	newLabels := copyLabels(current)
+	newLabels[util.EipUIDLabel] = uid
+	if err := c.updateIptableLabels(name, patchLabelsOp(current), natType, newLabels); err != nil {
+		return natLabelClaim{}, false, err
+	}
+	return natLabelClaim{name: name, natType: natType, labelKey: util.EipUIDLabel, value: uid}, true, nil
+}
+
+func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabelClaim, error) {
+	fips, err := c.iptablesFipsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list iptables fips, %v", err)
+		return nil, err
+	}
+	for _, fip := range fips {
+		claim, ok, err := c.backfillEipUIDLabel(fip.Name, util.FipUsingEip, fip.Spec.EIP, fip.Labels)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			claims = append(claims, claim)
+		}
+	}
+
+	dnats, err := c.iptablesDnatRulesLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list iptables dnats, %v", err)
+		return nil, err
+	}
+	for _, dnat := range dnats {
+		claim, ok, err := c.backfillEipUIDLabel(dnat.Name, util.DnatUsingEip, dnat.Spec.EIP, dnat.Labels)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			claims = append(claims, claim)
+		}
+	}
+
+	snats, err := c.iptablesSnatRulesLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list iptables snats, %v", err)
+		return nil, err
+	}
+	for _, snat := range snats {
+		claim, ok, err := c.backfillEipUIDLabel(snat.Name, util.SnatUsingEip, snat.Spec.EIP, snat.Labels)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			claims = append(claims, claim)
+		}
+	}
+	return claims, nil
+}
+
+func (c *Controller) qosUIDLabels(kind, name, qosName string, current map[string]string) (map[string]string, string, bool, error) {
+	if qosName == "" {
+		return nil, "", false, nil
+	}
+	qos, err := c.qosPoliciesLister.Get(qosName)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			klog.Warningf("skip syncing %s %s qos uid label, qos %s not found", kind, name, qosName)
+			return nil, "", false, nil
+		}
+		klog.Errorf("failed to get qos %s, %v", qosName, err)
+		return nil, "", false, err
+	}
+	uid := string(qos.UID)
+	if current[util.QoSLabel] == qosName && current[util.QoSPolicyUIDLabel] == uid {
+		return nil, "", false, nil
+	}
+	newLabels := copyLabels(current)
+	newLabels[util.QoSLabel] = qosName
+	newLabels[util.QoSPolicyUIDLabel] = uid
+	return newLabels, uid, true, nil
+}
+
+func (c *Controller) backfillNatQoSUIDLabels(claims []natLabelClaim) ([]natLabelClaim, error) {
+	eips, err := c.iptablesEipsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list iptables eips, %v", err)
+		return nil, err
+	}
+	for _, eip := range eips {
+		newLabels, uid, ok, err := c.qosUIDLabels("eip", eip.Name, eip.Spec.QoSPolicy, eip.Labels)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		if err := c.updateIptableLabels(eip.Name, patchLabelsOp(eip.Labels), "eip", newLabels); err != nil {
+			return nil, err
+		}
+		claims = append(claims, natLabelClaim{name: eip.Name, natType: "eip", labelKey: util.QoSPolicyUIDLabel, value: uid})
+	}
+
+	gws, err := c.vpcNatGatewayLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list vpc nat gateways, %v", err)
+		return nil, err
+	}
+	for _, gw := range gws {
+		newLabels, uid, ok, err := c.qosUIDLabels(natGwLabelType, gw.Name, gw.Spec.QoSPolicy, gw.Labels)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		raw, _ := json.Marshal(newLabels)
+		patchPayload := fmt.Sprintf(`[{ "op": "%s", "path": "/metadata/labels", "value": %s }]`, patchLabelsOp(gw.Labels), raw)
+		if _, err := c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Patch(context.Background(), gw.Name,
+			types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{}); err != nil {
+			if k8serrors.IsNotFound(err) {
+				continue
+			}
+			klog.Errorf("failed to patch vpc nat gw %s: %v", gw.Name, err)
+			return nil, err
+		}
+		claims = append(claims, natLabelClaim{name: gw.Name, natType: natGwLabelType, labelKey: util.QoSPolicyUIDLabel, value: uid})
+	}
+	return claims, nil
 }
 
 func (c *Controller) syncVlanCR() error {

@@ -65,11 +65,17 @@ func alwaysReady() bool { return true }
 type FakeControllerOptions struct {
 	Subnets            []*kubeovnv1.Subnet
 	VpcNatGateways     []*kubeovnv1.VpcNatGateway
+	QoSPolicies        []*kubeovnv1.QoSPolicy
+	IptablesEIPs       []*kubeovnv1.IptablesEIP
+	IptablesFIPs       []*kubeovnv1.IptablesFIPRule
+	IptablesDnatRules  []*kubeovnv1.IptablesDnatRule
+	IptablesSnatRules  []*kubeovnv1.IptablesSnatRule
 	IPs                []*kubeovnv1.IP
 	Vlans              []*kubeovnv1.Vlan
 	NetworkAttachments []*nadv1.NetworkAttachmentDefinition
 	Pods               []*corev1.Pod
 	Namespaces         []*corev1.Namespace
+	ConfigMaps         []*corev1.ConfigMap
 }
 
 // newFakeControllerWithOptions creates a fake controller with optional pre-populated objects
@@ -101,13 +107,17 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	for _, pod := range opts.Pods {
 		kubeObjects = append(kubeObjects, pod)
 	}
+	for _, cm := range opts.ConfigMaps {
+		kubeObjects = append(kubeObjects, cm)
+	}
 	kubeClient := fake.NewSimpleClientset(kubeObjects...)
 
 	// Create fake NAD client
 	nadClient := nadfake.NewSimpleClientset()
 	for _, nad := range opts.NetworkAttachments {
 		_, err := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(nad.Namespace).Create(
-			context.Background(), nad, metav1.CreateOptions{})
+			context.Background(), nad, metav1.CreateOptions{},
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -117,28 +127,72 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	kubeovnClient := kubeovnfake.NewSimpleClientset()
 	for _, subnet := range opts.Subnets {
 		_, err := kubeovnClient.KubeovnV1().Subnets().Create(
-			context.Background(), subnet, metav1.CreateOptions{})
+			context.Background(), subnet, metav1.CreateOptions{},
+		)
 		if err != nil {
 			return nil, err
 		}
 	}
 	for _, gw := range opts.VpcNatGateways {
 		_, err := kubeovnClient.KubeovnV1().VpcNatGateways().Create(
-			context.Background(), gw, metav1.CreateOptions{})
+			context.Background(), gw, metav1.CreateOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, qos := range opts.QoSPolicies {
+		_, err := kubeovnClient.KubeovnV1().QoSPolicies().Create(
+			context.Background(), qos, metav1.CreateOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, eip := range opts.IptablesEIPs {
+		_, err := kubeovnClient.KubeovnV1().IptablesEIPs().Create(
+			context.Background(), eip, metav1.CreateOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, fip := range opts.IptablesFIPs {
+		_, err := kubeovnClient.KubeovnV1().IptablesFIPRules().Create(
+			context.Background(), fip, metav1.CreateOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, dnat := range opts.IptablesDnatRules {
+		_, err := kubeovnClient.KubeovnV1().IptablesDnatRules().Create(
+			context.Background(), dnat, metav1.CreateOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, snat := range opts.IptablesSnatRules {
+		_, err := kubeovnClient.KubeovnV1().IptablesSnatRules().Create(
+			context.Background(), snat, metav1.CreateOptions{},
+		)
 		if err != nil {
 			return nil, err
 		}
 	}
 	for _, ip := range opts.IPs {
 		_, err := kubeovnClient.KubeovnV1().IPs().Create(
-			context.Background(), ip, metav1.CreateOptions{})
+			context.Background(), ip, metav1.CreateOptions{},
+		)
 		if err != nil {
 			return nil, err
 		}
 	}
 	for _, vlan := range opts.Vlans {
 		_, err := kubeovnClient.KubeovnV1().Vlans().Create(
-			context.Background(), vlan, metav1.CreateOptions{})
+			context.Background(), vlan, metav1.CreateOptions{},
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -150,6 +204,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	namespaceInformer := kubeInformerFactory.Core().V1().Namespaces()
 	podInformer := kubeInformerFactory.Core().V1().Pods()
 	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
+	configMapInformer := kubeInformerFactory.Core().V1().ConfigMaps()
 
 	nadInformerFactory := nadinformers.NewSharedInformerFactory(nadClient, 0)
 	nadInformer := nadInformerFactory.K8sCniCncfIo().V1().NetworkAttachmentDefinitions()
@@ -159,6 +214,11 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	subnetInformer := kubeovnInformerFactory.Kubeovn().V1().Subnets()
 	ipInformer := kubeovnInformerFactory.Kubeovn().V1().IPs()
 	vpcNatGwInformer := kubeovnInformerFactory.Kubeovn().V1().VpcNatGateways()
+	qosPolicyInformer := kubeovnInformerFactory.Kubeovn().V1().QoSPolicies()
+	iptablesEipInformer := kubeovnInformerFactory.Kubeovn().V1().IptablesEIPs()
+	iptablesFipInformer := kubeovnInformerFactory.Kubeovn().V1().IptablesFIPRules()
+	iptablesDnatRuleInformer := kubeovnInformerFactory.Kubeovn().V1().IptablesDnatRules()
+	iptablesSnatRuleInformer := kubeovnInformerFactory.Kubeovn().V1().IptablesSnatRules()
 	vlanInformer := kubeovnInformerFactory.Kubeovn().V1().Vlans()
 
 	fakeInformers := &fakeControllerInformers{
@@ -184,6 +244,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		namespacesLister:        namespaceInformer.Lister(),
 		podsLister:              podInformer.Lister(),
 		nodesLister:             nodeInformer.Lister(),
+		configMapsLister:        configMapInformer.Lister(),
 		vpcsLister:              vpcInformer.Lister(),
 		vpcSynced:               alwaysReady,
 		subnetsLister:           subnetInformer.Lister(),
@@ -194,6 +255,12 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		netAttachLister:         nadInformer.Lister(),
 		netAttachSynced:         alwaysReady,
 		vpcNatGatewayLister:     vpcNatGwInformer.Lister(),
+		qosPoliciesLister:       qosPolicyInformer.Lister(),
+		iptablesEipsLister:      iptablesEipInformer.Lister(),
+		iptablesFipsLister:      iptablesFipInformer.Lister(),
+		iptablesDnatRulesLister: iptablesDnatRuleInformer.Lister(),
+		iptablesSnatRulesLister: iptablesSnatRuleInformer.Lister(),
+		vpcNatGwKeyMutex:        keymutex.NewHashed(0),
 		OVNNbClient:             mockOvnClient,
 		OVNSbClient:             mockOvnSbClient,
 		ipam:                    ovnipam.NewIPAM(),

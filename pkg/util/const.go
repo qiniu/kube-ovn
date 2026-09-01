@@ -50,6 +50,7 @@ const (
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
 	OvnEipTypeLabel                         = "ovn.kubernetes.io/ovn_eip_type"
 	EipV4IpLabel                            = "ovn.kubernetes.io/eip_v4_ip"
+	EipUIDLabel                             = "ovn.kubernetes.io/eip_uid"
 	EipV6IpLabel                            = "ovn.kubernetes.io/eip_v6_ip"
 
 	SwitchLBRuleVipsAnnotation = "ovn.kubernetes.io/switch_lb_vip"
@@ -131,6 +132,7 @@ const (
 	VpcLbLabel                         = "ovn.kubernetes.io/vpc_lb"
 	VpcDNSNameLabel                    = "ovn.kubernetes.io/vpc-dns"
 	QoSLabel                           = "ovn.kubernetes.io/qos"
+	QoSPolicyUIDLabel                  = "ovn.kubernetes.io/qos_uid"
 	NodeNameLabel                      = "ovn.kubernetes.io/node-name"
 	NetworkPolicyLogAnnotation         = "ovn.kubernetes.io/enable_log"
 	NetworkPolicyEnforcementAnnotation = "ovn.kubernetes.io/network_policy_enforcement"

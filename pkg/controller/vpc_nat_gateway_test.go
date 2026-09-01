@@ -22,6 +22,70 @@ func TestVpcNatGwScriptConstants(t *testing.T) {
 	assert.Equal(t, "vpc-nat-gw", vpcNatGwServiceAccountName, "ServiceAccount name should be vpc-nat-gw")
 }
 
+func TestEnqueueVpcNatGwRoutesTerminatingToDelete(t *testing.T) {
+	t.Parallel()
+
+	updateQueue := newTypedRateLimitingQueue[string]("VpcNatGateway", nil)
+	deleteQueue := newTypedRateLimitingQueue[string]("DeleteVpcNatGateway", nil)
+	t.Cleanup(updateQueue.ShutDown)
+	t.Cleanup(deleteQueue.ShutDown)
+	c := &Controller{
+		addOrUpdateVpcNatGatewayQueue: updateQueue,
+		delVpcNatGatewayQueue:         deleteQueue,
+		config:                        &Configuration{PodNamespace: "kube-system"},
+	}
+	now := metav1.Now()
+	liveGw := fakeGw("live-gw")
+	dyingAddGw := fakeGw("dying-add-gw")
+	dyingAddGw.DeletionTimestamp = &now
+	dyingAddGw.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	dyingUpdateGw := fakeGw("dying-update-gw")
+	dyingUpdateGw.DeletionTimestamp = &now
+	dyingUpdateGw.Finalizers = []string{util.KubeOVNControllerFinalizer}
+
+	c.enqueueAddVpcNatGw(liveGw)
+	require.Equal(t, 1, updateQueue.Len())
+	c.enqueueAddVpcNatGw(dyingAddGw)
+	require.Equal(t, 1, updateQueue.Len())
+	require.Equal(t, 1, deleteQueue.Len())
+	c.enqueueUpdateVpcNatGw(liveGw, dyingUpdateGw)
+	require.Equal(t, 1, updateQueue.Len())
+	require.Equal(t, 2, deleteQueue.Len())
+}
+
+func TestHandleAddOrUpdateVpcNatGwSkipsTerminating(t *testing.T) {
+	t.Parallel()
+
+	now := metav1.Now()
+	gw := fakeGw("dying-gw")
+	gw.DeletionTimestamp = &now
+	gw.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+	require.NoError(t, fc.fakeController.handleAddOrUpdateVpcNatGw("dying-gw"))
+}
+
+// TestHandleInitVpcNatGwSkipsTerminating pins the same guard on the init path, which pod update
+// events keep feeding while the gateway pod is still terminating.
+func TestHandleInitVpcNatGwSkipsTerminating(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	gw := fakeGw("dying-gw")
+	gw.DeletionTimestamp = &now
+	gw.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+	// Without the guard this reaches getNatGwPod and fails on the already gone pod.
+	require.NoError(t, fc.fakeController.handleInitVpcNatGw("dying-gw"))
+}
+
 func TestIsVpcNatGwChanged(t *testing.T) {
 	tests := []struct {
 		name     string

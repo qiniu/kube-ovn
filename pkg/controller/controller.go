@@ -767,6 +767,9 @@ func Run(ctx context.Context, config *Configuration) {
 		controller.vpcSynced, controller.subnetSynced,
 		controller.ipSynced, controller.virtualIpsSynced, controller.iptablesEipSynced,
 		controller.iptablesFipSynced, controller.iptablesDnatRuleSynced, controller.iptablesSnatRuleSynced,
+		// syncNatUIDLabels backfills the QoS UID credential from this lister before the workers
+		// start, and resync is disabled, so an unsynced QoS cache would drop the reference for good.
+		controller.qosPolicySynced,
 		controller.vlanSynced, controller.podsSynced, controller.namespacesSynced, controller.nodesSynced,
 		controller.serviceSynced, controller.endpointSlicesSynced, controller.deploymentsSynced, controller.configMapsSynced,
 		controller.ovnEipSynced, controller.ovnFipSynced, controller.ovnSnatRuleSynced,
@@ -1109,6 +1112,10 @@ func (c *Controller) Run(ctx context.Context) {
 
 	if err := c.syncFinalizers(); err != nil {
 		util.LogFatalAndExit(err, "failed to initialize crd finalizers")
+	}
+
+	if err := c.syncNatUIDLabels(ctx); err != nil {
+		util.LogFatalAndExit(err, "failed to sync vpc nat uid labels")
 	}
 
 	if err := c.InitIPAM(); err != nil {
