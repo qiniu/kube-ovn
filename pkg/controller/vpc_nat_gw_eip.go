@@ -328,6 +328,9 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			}
 		}
 
+		// Unlike the FIP/DNAT/SNAT rebind, the claim is swapped after the pod work, not before:
+		// delEipQoS reads the rules to remove off the old policy, so releasing it early would let
+		// it be collected and leave its bandwidth rules behind in the gateway pod.
 		if err = c.patchEipLabel(key); err != nil {
 			klog.Errorf("failed to label qos in eip, %v", err)
 			return err
