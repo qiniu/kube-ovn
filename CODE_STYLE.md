@@ -140,7 +140,8 @@ These rules make the check correct:
 
 - Put it on the **writer of the reference**, not on the handler. The reference is what the
   in-use check counts, e.g. `util.QoSPolicyUIDLabel` written by `patchEipLabel` and
-  `updateCrdNatGwLabels`, or `util.EipUIDLabel` written by `patchFipLabel`. Guarding one
+  `updateCrdNatGwLabels`, or `util.EipUIDLabel` written by `patchFipLabel`, `patchDnatLabel`
+  and `patchSnatLabel`. Guarding one
   caller leaves the delayed and replay paths (`resetIptablesEipQueue.AddAfter`, `redoFip`,
   gateway re-init) wide open. A guard placed earlier is only equivalent when every writer
   is provably downstream of it, as `getBindableEip` is for the three `patch*Label` helpers.

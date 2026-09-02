@@ -2226,6 +2226,9 @@ func (c *Controller) patchIptableInfo(name, natType, patchPayload string) error 
 	case "eip":
 		_, err = c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Patch(context.Background(), name,
 			types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{})
+	default:
+		// Silently writing nothing would strand the startup backfill until its poll deadline.
+		return fmt.Errorf("unknown nat type %s", natType)
 	}
 	if err != nil {
 		if k8serrors.IsNotFound(err) {

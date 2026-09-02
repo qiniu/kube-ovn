@@ -782,11 +782,8 @@ func (c *Controller) createOrUpdateEipCR(key, v4ip, v6ip, mac, natGwDp, qos, ext
 		eip.Labels[util.SubnetNameLabel] = externalNet
 		eip.Labels[util.VpcNatGatewayNameLabel] = natGwDp
 		eip.Labels[util.EipV4IpLabel] = v4ip
-		if eip.Spec.QoSPolicy != "" {
-			eip.Labels[util.QoSLabel] = eip.Spec.QoSPolicy
-			eip.Labels[util.QoSPolicyUIDLabel] = qosPolicyUID
-		}
-
+		eip.Labels[util.QoSLabel] = qos
+		eip.Labels[util.QoSPolicyUIDLabel] = qosPolicyUID
 		if v4ip != "" {
 			klog.V(3).Infof("update eip cr %s", key)
 			eip.Spec.V4ip = v4ip
@@ -992,6 +989,8 @@ func (c *Controller) getIptablesEipNat(eip *kubeovnv1.IptablesEIP) (string, erro
 // rather than the informer cache. The finalizer release decision must not run on a cache that has
 // not observed a freshly written reference yet, or the EIP is dropped while rules still claim it.
 func (c *Controller) getIptablesEipNatFromAPI(eip *kubeovnv1.IptablesEIP) (string, error) {
+	// Do not set a Limit here: with a label selector the server may return zero items alongside a
+	// continue token, and this result decides whether the EIP's finalizer is released.
 	opts := metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(labels.Set{util.EipUIDLabel: string(eip.UID)}).String(),
 	}
@@ -1099,7 +1098,7 @@ func (c *Controller) patchEipLabel(eipName string) error {
 
 	// patchEipLabel writes util.QoSLabel and util.QoSPolicyUIDLabel on the update/redo path, and the
 	// QoS policy in-use check is keyed on the UID label. Refuse to point a live EIP at a terminating
-	// QoS policy: handleResetIptablesEip runs from a 3s delayed queue keyed by the EIP address, so it
+	// QoS policy: handleResetIptablesEip runs from a 3s delayed queue keyed by the EIP name, so it
 	// can otherwise attach the tombstone of a previous instance to a freshly recreated EIP of the
 	// same name.
 	// Only a reference that would actually change is rejected. Rewriting the label the EIP already

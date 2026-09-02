@@ -879,15 +879,25 @@ func (c *Controller) waitNatLabelClaimsSynced(ctx context.Context, claims []natL
 	if len(claims) == 0 {
 		return nil
 	}
-	return wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, time.Minute, true, func(context.Context) (bool, error) {
+	var pending []string
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, time.Minute, true, func(context.Context) (bool, error) {
+		pending = pending[:0]
 		for _, claim := range claims {
 			synced, err := c.natLabelSynced(claim)
-			if err != nil || !synced {
+			if err != nil {
 				return false, err
 			}
+			if !synced {
+				pending = append(pending, fmt.Sprintf("%s/%s", claim.natType, claim.name))
+			}
 		}
-		return true, nil
+		return len(pending) == 0, nil
 	})
+	// The caller aborts startup on error, so name the stragglers instead of just the deadline.
+	if err != nil && len(pending) != 0 {
+		return fmt.Errorf("%w, %d of %d claims still unsynced: %s", err, len(pending), len(claims), strings.Join(pending, ", "))
+	}
+	return err
 }
 
 // syncNatUIDLabels backfills the UID credentials the in-use checks select on, then blocks until the

@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -282,4 +284,56 @@ func TestFipRebindClaimsEipBeforeTouchingPod(t *testing.T) {
 	stored, err := c.config.KubeOvnClient.KubeovnV1().IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, "new-uid", stored.Labels[util.EipUIDLabel], "the claim must survive a failed data-plane step")
+}
+
+// TestCreateOrUpdateEipCRClearsQoSLabels pins the update branch to the create branch: writing the
+// QoS credential only when the reference is non-empty leaves the previous UID behind, and the
+// in-use check counts that label.
+func TestCreateOrUpdateEipCRClearsQoSLabels(t *testing.T) {
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "eip",
+			Labels: map[string]string{util.QoSLabel: "gone-qos", util.QoSPolicyUIDLabel: "gone-uid"},
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{V4ip: "1.1.1.1", NatGwDp: "gw"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.createOrUpdateEipCR("eip", "1.1.1.1", "", "", "gw", "", "external", ""))
+
+	stored, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, stored.Labels[util.QoSLabel])
+	require.Empty(t, stored.Labels[util.QoSPolicyUIDLabel], "a dropped reference must not keep counting")
+}
+
+// TestWaitNatLabelClaimsSyncedNamesStragglers covers the diagnostics on a path whose caller aborts
+// startup, where a bare deadline error says nothing about what failed to converge.
+func TestWaitNatLabelClaimsSyncedNamesStragglers(t *testing.T) {
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesFIPs: []*kubeovnv1.IptablesFIPRule{
+			{ObjectMeta: metav1.ObjectMeta{Name: "fip"}},
+		},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	err = fc.fakeController.waitNatLabelClaimsSynced(ctx, []natLabelClaim{
+		{natType: util.FipUsingEip, name: "fip", labelKey: util.EipUIDLabel, value: "never-written"},
+	})
+	require.ErrorContains(t, err, "fip")
+	require.ErrorContains(t, err, "1 of 1 claims still unsynced")
+}
+
+// TestPatchIptableInfoRejectsUnknownType keeps an unroutable type from reporting success, which
+// would leave the startup backfill waiting for a label nobody wrote.
+func TestPatchIptableInfoRejectsUnknownType(t *testing.T) {
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{})
+	require.NoError(t, err)
+	require.ErrorContains(t, fc.fakeController.patchIptableInfo("name", "bogus", "[]"), "unknown nat type")
 }
