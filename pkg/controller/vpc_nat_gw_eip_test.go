@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
@@ -120,17 +121,26 @@ func TestDelEipQoSInPod_NatGwExistsPodMissing(t *testing.T) {
 // existing objects and fires only AddFunc.
 func TestEnqueueAddIptablesEip(t *testing.T) {
 	t.Parallel()
-	c := &Controller{
-		addIptablesEipQueue:    newTypedRateLimitingQueue[string]("AddIptablesEip", nil),
-		updateIptablesEipQueue: newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil),
+	fip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "fip"},
+		Spec:       kubeovnv1.IptablesFIPRuleSpec{EIP: "terminating-eip", InternalIP: "10.0.0.1"},
+		Status:     kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalIP: "10.0.0.1"},
 	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{IptablesFIPs: []*kubeovnv1.IptablesFIPRule{fip}})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.addIptablesEipQueue = newTypedRateLimitingQueue[string]("AddIptablesEip", nil)
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
+	c.updateIptablesFipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesFip", nil)
 	t.Cleanup(c.addIptablesEipQueue.ShutDown)
 	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+	t.Cleanup(c.updateIptablesFipQueue.ShutDown)
 	now := metav1.Now()
 	assertEnqueueAddRouting(t, c.addIptablesEipQueue, c.updateIptablesEipQueue, c.enqueueAddIptablesEip,
 		&kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "live-eip"}},
 		&kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "terminating-eip", DeletionTimestamp: &now}},
 	)
+	require.Equal(t, 1, c.updateIptablesFipQueue.Len())
 }
 
 func TestEnqueueUpdateIptablesEipWakesPendingNatRules(t *testing.T) {
@@ -292,7 +302,41 @@ func TestEnqueueDelIptablesEipNotifiesReferrers(t *testing.T) {
 	require.Equal(t, 1, c.updateIptablesFipQueue.Len())
 }
 
-func TestReadyEipAddReplayNotifiesReferrers(t *testing.T) {
+func TestEipReferrerGenerationsAreIsolated(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		boundUID   string
+		eipUID     string
+		usable     bool
+		wantQueued int
+	}{
+		{name: "old delete ignores new binding", boundUID: "new-uid", eipUID: "old-uid", wantQueued: 0},
+		{name: "new usable wakes old binding", boundUID: "old-uid", eipUID: "new-uid", usable: true, wantQueued: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eip := &kubeovnv1.IptablesEIP{
+				ObjectMeta: metav1.ObjectMeta{Name: "eip", UID: types.UID(tc.eipUID)},
+				Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"},
+				Status:     kubeovnv1.IptablesEIPStatus{Ready: true, IP: "1.1.1.1"},
+			}
+			fip := &kubeovnv1.IptablesFIPRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "fip", Labels: map[string]string{util.EipUIDLabel: tc.boundUID}},
+				Spec:       kubeovnv1.IptablesFIPRuleSpec{EIP: "eip", InternalIP: "10.0.0.1"},
+				Status:     kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalIP: "10.0.0.1"},
+			}
+			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{IptablesFIPs: []*kubeovnv1.IptablesFIPRule{fip}})
+			require.NoError(t, err)
+			c := fc.fakeController
+			c.updateIptablesFipQueue = newTypedRateLimitingQueue[string]("EipGenerationFip", nil)
+			t.Cleanup(c.updateIptablesFipQueue.ShutDown)
+
+			require.NoError(t, c.enqueueIptablesEipReferrers(eip, tc.usable))
+			require.Equal(t, tc.wantQueued, c.updateIptablesFipQueue.Len())
+		})
+	}
+}
+
+func TestReadyEipAddReplayDoesNotScanReferrers(t *testing.T) {
 	eip := &kubeovnv1.IptablesEIP{
 		ObjectMeta: metav1.ObjectMeta{Name: "eip"},
 		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"},
@@ -314,7 +358,7 @@ func TestReadyEipAddReplayNotifiesReferrers(t *testing.T) {
 
 	c.enqueueAddIptablesEip(eip)
 	require.Equal(t, 1, c.addIptablesEipQueue.Len())
-	require.Equal(t, 1, c.addIptablesFipQueue.Len())
+	require.Zero(t, c.addIptablesFipQueue.Len())
 }
 
 func TestEipReferrerListFailureIsIsolated(t *testing.T) {

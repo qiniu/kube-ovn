@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -65,6 +66,21 @@ func TestHandleAddOrUpdateVpcNatGwSkipsTerminating(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, fc.fakeController.handleAddOrUpdateVpcNatGw("dying-gw"))
+}
+
+func TestVpcNatGatewayRejectsStaleQoSGenerationAfterReferenceIsDropped(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: types.UID("new-uid")}}
+	gw := fakeGw("gw")
+	gw.Labels = map[string]string{util.QoSPolicyUIDLabel: "old-uid"}
+	gw.Status.QoSPolicy = "qos"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{qos},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.handleAddOrUpdateVpcNatGw("gw")
+	require.ErrorContains(t, err, "previous generation of qos policy qos")
 }
 
 // TestHandleInitVpcNatGwSkipsTerminating pins the same guard on the init path, which pod update

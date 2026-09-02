@@ -30,7 +30,7 @@ func (c *Controller) enqueueAddQoSPolicy(obj any) {
 	// can be released; handleAddQoSPolicy does not process terminating policies. This also covers
 	// controller restart, where the informer re-lists objects already in their final state.
 	if enqueueUpdateIfTerminating(c.updateQoSPolicyQueue, key, "qos", qos.DeletionTimestamp) {
-		if err := c.enqueueQoSPolicyReferrers(key, false); err != nil {
+		if err := c.enqueueQoSPolicyReferrers(qos, false); err != nil {
 			klog.Errorf("failed to enqueue referrers of terminating qos policy %s: %v", key, err)
 		}
 		return
@@ -41,18 +41,24 @@ func (c *Controller) enqueueAddQoSPolicy(obj any) {
 
 // enqueueQoSPolicyReferrers wakes pending bindings when usable, or every live referrer when the
 // policy is authoritatively unavailable.
-func (c *Controller) enqueueQoSPolicyReferrers(qosName string, usable bool) error {
+func (c *Controller) enqueueQoSPolicyReferrers(qos *kubeovnv1.QoSPolicy, usable bool) error {
 	var errs []error
+	qosName := qos.Name
+	qosUID := string(qos.UID)
 	eips, err := c.iptablesEipsLister.List(labels.Everything())
 	if err != nil {
 		errs = append(errs, fmt.Errorf("failed to list eips referencing qos policy %s: %w", qosName, err))
 	} else {
 		for _, eip := range eips {
 			if eip.DeletionTimestamp.IsZero() && eip.Spec.QoSPolicy == qosName {
+				boundUID := eip.Labels[util.QoSPolicyUIDLabel]
+				if !usable && boundUID != "" && boundUID != qosUID {
+					continue
+				}
 				switch {
 				case eip.Status.IP == "":
 					c.addIptablesEipQueue.Add(eip.Name)
-				case !usable || !eip.Status.Ready || eip.Status.QoSPolicy != qosName:
+				case !usable || !eip.Status.Ready || eip.Status.QoSPolicy != qosName || boundUID != qosUID:
 					c.updateIptablesEipQueue.Add(eip.Name)
 				}
 			}
@@ -64,8 +70,10 @@ func (c *Controller) enqueueQoSPolicyReferrers(qosName string, usable bool) erro
 		errs = append(errs, fmt.Errorf("failed to list vpc nat gateways referencing qos policy %s: %w", qosName, err))
 	} else {
 		for _, gateway := range gateways {
+			boundUID := gateway.Labels[util.QoSPolicyUIDLabel]
 			if gateway.DeletionTimestamp.IsZero() && gateway.Spec.QoSPolicy == qosName &&
-				(!usable || gateway.Status.QoSPolicy != qosName) {
+				(usable || boundUID == "" || boundUID == qosUID) &&
+				(!usable || gateway.Status.QoSPolicy != qosName || boundUID != qosUID) {
 				c.addOrUpdateVpcNatGatewayQueue.Add(gateway.Name)
 			}
 		}
@@ -125,7 +133,7 @@ func (c *Controller) enqueueUpdateQoSPolicy(oldObj, newObj any) {
 	newQos := newObj.(*kubeovnv1.QoSPolicy)
 	key := cache.MetaObjectToName(newQos).String()
 	if !newQos.DeletionTimestamp.IsZero() {
-		if err := c.enqueueQoSPolicyReferrers(key, false); err != nil {
+		if err := c.enqueueQoSPolicyReferrers(newQos, false); err != nil {
 			klog.Errorf("failed to enqueue referrers of terminating qos policy %s: %v", key, err)
 		}
 		klog.V(3).Infof("enqueue update to clean qos %s", key)
@@ -133,7 +141,7 @@ func (c *Controller) enqueueUpdateQoSPolicy(oldObj, newObj any) {
 		return
 	}
 	if qosPolicyUsable(oldQos) && !controllerutil.ContainsFinalizer(newQos, util.KubeOVNControllerFinalizer) {
-		if err := c.enqueueQoSPolicyReferrers(key, false); err != nil {
+		if err := c.enqueueQoSPolicyReferrers(oldQos, false); err != nil {
 			klog.Errorf("failed to enqueue referrers after qos policy %s lost its finalizer: %v", key, err)
 		}
 		return
@@ -142,7 +150,7 @@ func (c *Controller) enqueueUpdateQoSPolicy(oldObj, newObj any) {
 	// after UpdateStatus returns would let an EIP read and apply the previous rules from the cache.
 	if qosPolicyUsable(newQos) {
 		if !qosPolicyUsable(oldQos) {
-			if err := c.enqueueQoSPolicyReferrers(key, true); err != nil {
+			if err := c.enqueueQoSPolicyReferrers(newQos, true); err != nil {
 				klog.Errorf("failed to enqueue referrers of qos policy %s: %v", key, err)
 			}
 		}
@@ -176,7 +184,7 @@ func (c *Controller) enqueueDelQoSPolicy(obj any) {
 	key := cache.MetaObjectToName(qos).String()
 	klog.V(3).Infof("enqueue delete qos policy %s", key)
 	c.delQoSPolicyQueue.Add(key)
-	if err := c.enqueueQoSPolicyReferrers(key, false); err != nil {
+	if err := c.enqueueQoSPolicyReferrers(qos, false); err != nil {
 		klog.Errorf("failed to enqueue referrers of deleted qos policy %s: %v", key, err)
 	}
 }

@@ -27,31 +27,34 @@ func (c *Controller) enqueueAddIptablesEip(obj any) {
 	key := cache.MetaObjectToName(eip).String()
 	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesEipQueue, key, "iptables eip", eip.DeletionTimestamp) {
+		if err := c.enqueueIptablesEipReferrers(eip, false); err != nil {
+			klog.Errorf("failed to enqueue referrers of terminating eip %s during add replay: %v", key, err)
+		}
 		return
 	}
 	klog.Infof("enqueue add iptables eip %s", key)
 	c.addIptablesEipQueue.Add(key)
-	if eip.Status.Ready && eip.Status.IP != "" {
-		if err := c.enqueueIptablesEipReferrers(eip, true); err != nil {
-			klog.Errorf("failed to enqueue referrers of eip %s during add replay: %v", key, err)
-		}
-	}
 }
 
 // enqueueIptablesEipReferrers wakes NAT rules that may have been waiting for this EIP to become ready.
 func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usable bool) error {
 	var errs []error
+	eipUID := string(eip.UID)
 	fips, err := c.iptablesFipsLister.List(labels.Everything())
 	if err != nil {
 		errs = append(errs, fmt.Errorf("failed to list fips referencing eip %s: %w", eip.Name, err))
 	} else {
 		for _, fip := range fips {
 			if fip.DeletionTimestamp.IsZero() && fip.Spec.EIP == eip.Name {
+				boundUID := fip.Labels[util.EipUIDLabel]
+				if !usable && boundUID != "" && boundUID != eipUID {
+					continue
+				}
 				switch {
 				case fip.Status.V4ip == "" || fip.Status.NatGwDp == "" || fip.Status.InternalIP == "":
 					c.addIptablesFipQueue.Add(fip.Name)
 				case !usable || fip.Status.V4ip != eip.Status.IP || fip.Status.NatGwDp != eip.Spec.NatGwDp ||
-					fip.Status.InternalIP != fip.Spec.InternalIP:
+					fip.Status.InternalIP != fip.Spec.InternalIP || boundUID != eipUID:
 					c.updateIptablesFipQueue.Add(fip.Name)
 				case !fip.Status.Ready:
 					c.addIptablesFipQueue.Add(fip.Name)
@@ -65,13 +68,17 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 	} else {
 		for _, dnat := range dnats {
 			if dnat.DeletionTimestamp.IsZero() && dnat.Spec.EIP == eip.Name {
+				boundUID := dnat.Labels[util.EipUIDLabel]
+				if !usable && boundUID != "" && boundUID != eipUID {
+					continue
+				}
 				switch {
 				case dnat.Status.V4ip == "" || dnat.Status.NatGwDp == "" || dnat.Status.Protocol == "" ||
 					dnat.Status.ExternalPort == "" || dnat.Status.InternalIP == "" || dnat.Status.InternalPort == "":
 					c.addIptablesDnatRuleQueue.Add(dnat.Name)
 				case !usable || dnat.Status.V4ip != eip.Status.IP || dnat.Status.NatGwDp != eip.Spec.NatGwDp ||
 					dnat.Status.Protocol != dnat.Spec.Protocol || dnat.Status.ExternalPort != dnat.Spec.ExternalPort ||
-					dnat.Status.InternalIP != dnat.Spec.InternalIP || dnat.Status.InternalPort != dnat.Spec.InternalPort:
+					dnat.Status.InternalIP != dnat.Spec.InternalIP || dnat.Status.InternalPort != dnat.Spec.InternalPort || boundUID != eipUID:
 					c.updateIptablesDnatRuleQueue.Add(dnat.Name)
 				case !dnat.Status.Ready:
 					c.addIptablesDnatRuleQueue.Add(dnat.Name)
@@ -85,13 +92,17 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 	} else {
 		for _, snat := range snats {
 			if snat.DeletionTimestamp.IsZero() && snat.Spec.EIP == eip.Name {
+				boundUID := snat.Labels[util.EipUIDLabel]
+				if !usable && boundUID != "" && boundUID != eipUID {
+					continue
+				}
 				statusV4Cidr, _ := util.SplitStringIP(snat.Status.InternalCIDR)
 				specV4Cidr, _ := util.SplitStringIP(snat.Spec.InternalCIDR)
 				switch {
 				case snat.Status.V4ip == "" || snat.Status.NatGwDp == "" || snat.Status.InternalCIDR == "":
 					c.addIptablesSnatRuleQueue.Add(snat.Name)
 				case !usable || snat.Status.V4ip != eip.Status.IP || snat.Status.NatGwDp != eip.Spec.NatGwDp ||
-					statusV4Cidr != specV4Cidr:
+					statusV4Cidr != specV4Cidr || boundUID != eipUID:
 					c.updateIptablesSnatRuleQueue.Add(snat.Name)
 				case !snat.Status.Ready:
 					c.addIptablesSnatRuleQueue.Add(snat.Name)
@@ -189,7 +200,18 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 	klog.Infof("handle add iptables eip %s", key)
 
 	if cachedEip.Status.Ready && cachedEip.Status.IP != "" {
-		// already ok
+		if cachedEip.Spec.QoSPolicy == "" {
+			return nil
+		}
+		qos, getErr := c.getAvailableQoSPolicy(cachedEip.Spec.QoSPolicy)
+		if getErr != nil {
+			c.updateIptablesEipQueue.Add(key)
+			return nil
+		}
+		if cachedEip.Labels[util.QoSPolicyUIDLabel] == string(qos.UID) {
+			return nil
+		}
+		c.updateIptablesEipQueue.Add(key)
 		return nil
 	}
 
@@ -407,8 +429,9 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 	}
 
 	// update qos
+	var desiredQoS *kubeovnv1.QoSPolicy
 	if cachedEip.Status.QoSPolicy == cachedEip.Spec.QoSPolicy && cachedEip.Spec.QoSPolicy != "" {
-		if _, err = c.getAvailableQoSPolicy(cachedEip.Spec.QoSPolicy); err != nil {
+		if desiredQoS, err = c.getAvailableQoSPolicy(cachedEip.Spec.QoSPolicy); err != nil {
 			if cachedEip.Status.Ready {
 				if patchErr := c.patchEipStatus(key, "", "", "", false); patchErr != nil {
 					return fmt.Errorf("failed to mark eip %s not ready after its qos policy became unavailable: %w", key, patchErr)
@@ -416,7 +439,8 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			}
 			return err
 		}
-		if !cachedEip.Status.Ready && cachedEip.Status.Redo == "" && cachedEip.Status.IP != "" {
+		uidMatches := cachedEip.Labels[util.QoSPolicyUIDLabel] == string(desiredQoS.UID)
+		if uidMatches && !cachedEip.Status.Ready && cachedEip.Status.Redo == "" && cachedEip.Status.IP != "" {
 			if _, err = c.getBindableQoSPolicy(cachedEip.Spec.QoSPolicy); err != nil {
 				return err
 			}
@@ -426,14 +450,26 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			return nil
 		}
 	}
-	if cachedEip.Status.QoSPolicy != cachedEip.Spec.QoSPolicy {
+	qosUIDMismatch := desiredQoS != nil && cachedEip.Labels[util.QoSPolicyUIDLabel] != string(desiredQoS.UID)
+	if cachedEip.Status.QoSPolicy != cachedEip.Spec.QoSPolicy || qosUIDMismatch {
 		if _, err = c.getBindableQoSPolicy(cachedEip.Spec.QoSPolicy); err != nil {
 			return err
 		}
 		if err = c.checkNatGwNotTerminating(cachedEip.Spec.NatGwDp); err != nil {
 			return err
 		}
-		if cachedEip.Status.QoSPolicy != "" {
+		if qosUIDMismatch && cachedEip.Status.QoSPolicy == cachedEip.Spec.QoSPolicy {
+			if cachedEip.Status.Ready {
+				if err = c.patchEipStatus(key, "", "", "", false); err != nil {
+					return fmt.Errorf("failed to mark eip %s not ready before qos policy generation rebind: %w", key, err)
+				}
+			}
+			for _, direction := range []kubeovnv1.QoSPolicyRuleDirection{kubeovnv1.QoSDirectionIngress, kubeovnv1.QoSDirectionEgress} {
+				if err = c.delEipQoSInPod(cachedEip.Spec.NatGwDp, cachedEip.Status.IP, c.natEipNamespace(cachedEip), direction); err != nil {
+					return err
+				}
+			}
+		} else if cachedEip.Status.QoSPolicy != "" {
 			if err = c.delEipQoS(cachedEip, cachedEip.Status.IP); err != nil {
 				klog.Errorf("failed to del qos '%s' in pod, %v", key, err)
 				return err

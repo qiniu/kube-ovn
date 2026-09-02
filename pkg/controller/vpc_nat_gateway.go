@@ -239,6 +239,9 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	if !gw.DeletionTimestamp.IsZero() {
 		return nil
 	}
+	if err = c.rejectStaleVpcNatGwQoSGeneration(gw); err != nil {
+		return err
+	}
 
 	// create nat gw statefulset
 	c.vpcNatGwKeyMutex.LockKey(key)
@@ -335,12 +338,14 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	}
 
 	// Handle QoS update (independent of StatefulSet changes)
+	var desiredQoS *kubeovnv1.QoSPolicy
 	if gw.Spec.QoSPolicy != "" && gw.Status.QoSPolicy == gw.Spec.QoSPolicy {
-		if _, err = c.getAvailableQoSPolicy(gw.Spec.QoSPolicy); err != nil {
+		if desiredQoS, err = c.getAvailableQoSPolicy(gw.Spec.QoSPolicy); err != nil {
 			return err
 		}
 	}
-	if gw.Spec.QoSPolicy != gw.Status.QoSPolicy {
+	qosUIDMismatch := desiredQoS != nil && gw.Labels[util.QoSPolicyUIDLabel] != string(desiredQoS.UID)
+	if gw.Spec.QoSPolicy != gw.Status.QoSPolicy || qosUIDMismatch {
 		if gw.Status.QoSPolicy != "" {
 			if err = c.execNatGwQoS(gw, gw.Status.QoSPolicy, QoSDel); err != nil {
 				klog.Errorf("failed to del qos for nat gw %s, %v", key, err)
@@ -367,6 +372,17 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	// Return backfillErr last so the StatefulSet work above is always attempted,
 	// but the work queue still retries with rate-limited backoff if backfill failed.
 	return backfillErr
+}
+
+func (c *Controller) rejectStaleVpcNatGwQoSGeneration(gw *kubeovnv1.VpcNatGateway) error {
+	if gw.Status.QoSPolicy == "" || gw.Labels[util.QoSPolicyUIDLabel] == "" {
+		return nil
+	}
+	qos, err := c.qosPoliciesLister.Get(gw.Status.QoSPolicy)
+	if err == nil && gw.Labels[util.QoSPolicyUIDLabel] != string(qos.UID) {
+		return fmt.Errorf("vpc nat gateway %s references a previous generation of qos policy %s; remove or rebind it before applying the new generation", gw.Name, gw.Status.QoSPolicy)
+	}
+	return nil
 }
 
 func (c *Controller) handleInitVpcNatGw(key string) error {

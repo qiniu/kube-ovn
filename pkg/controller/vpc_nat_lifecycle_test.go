@@ -340,6 +340,24 @@ func TestCreateOrUpdateEipCRClearsQoSLabels(t *testing.T) {
 	require.Empty(t, stored.Labels[util.QoSPolicyUIDLabel], "a dropped reference must not keep counting")
 }
 
+func TestNatUIDBackfillKeepsGenerationMismatch(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: "new-qos-uid"}}
+	eip := &kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "eip", UID: "new-eip-uid"}}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:  []*kubeovnv1.QoSPolicy{qos},
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	_, ok, err := c.backfillEipUIDLabel("fip", util.FipUsingEip, "eip", true, map[string]string{util.EipUIDLabel: "old-eip-uid"})
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, _, ok, err = c.qosUIDLabels("eip", "eip", "qos", true, map[string]string{util.QoSLabel: "qos", util.QoSPolicyUIDLabel: "old-qos-uid"})
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
 // TestWaitNatLabelClaimsSyncedNamesStragglers covers the diagnostics on a path whose caller aborts
 // startup, where a bare deadline error says nothing about what failed to converge.
 func TestWaitNatLabelClaimsSyncedNamesStragglers(t *testing.T) {
@@ -729,12 +747,12 @@ func TestEipRecoversWhenBoundQoSPolicyBecomesUsable(t *testing.T) {
 	t.Cleanup(func() { vpcNatEnabled = old })
 
 	qos := &kubeovnv1.QoSPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "qos", Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: "new-uid", Finalizers: []string{util.KubeOVNControllerFinalizer}},
 		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
 		Status:     kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
 	}
 	eip := &kubeovnv1.IptablesEIP{
-		ObjectMeta: metav1.ObjectMeta{Name: "eip"},
+		ObjectMeta: metav1.ObjectMeta{Name: "eip", Labels: map[string]string{util.QoSPolicyUIDLabel: "new-uid"}},
 		Spec: kubeovnv1.IptablesEIPSpec{
 			V4ip: "1.1.1.1", QoSPolicy: "qos", NatGwDp: "gw", ExternalSubnet: "external",
 		},
@@ -757,6 +775,100 @@ func TestEipRecoversWhenBoundQoSPolicyBecomesUsable(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, stored.Status.Ready)
 	require.Equal(t, "qos", stored.Status.QoSPolicy)
+
+	staleEip := eip.DeepCopy()
+	staleEip.Name = "stale-eip"
+	staleEip.Labels[util.QoSPolicyUIDLabel] = "old-uid"
+	staleEip.Status.Ready = true
+	staleController, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{qos},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("gw")},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{staleEip},
+		Subnets: []*kubeovnv1.Subnet{{
+			ObjectMeta: metav1.ObjectMeta{Name: "external"},
+			Spec:       kubeovnv1.SubnetSpec{CIDRBlock: "1.1.1.0/24"},
+		}},
+	})
+	require.NoError(t, err)
+	require.Error(t, staleController.fakeController.handleUpdateIptablesEip("stale-eip"), "uid mismatch must reconcile the data plane")
+	stored, err = staleController.fakeController.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "stale-eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, stored.Status.Ready, "a failed generation rebind must not leave the eip ready")
+	require.Equal(t, "old-uid", stored.Labels[util.QoSPolicyUIDLabel])
+}
+
+func TestReadyEipAndFipAddReplayRouteGenerationMismatchToUpdate(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: "new-qos-uid", Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
+		Status:     kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip", UID: "new-eip-uid", Labels: map[string]string{util.QoSPolicyUIDLabel: "old-qos-uid"}},
+		Spec:       kubeovnv1.IptablesEIPSpec{QoSPolicy: "qos"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: true, IP: "1.1.1.1", QoSPolicy: "qos"},
+	}
+	fip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "fip", Labels: map[string]string{util.EipUIDLabel: "old-eip-uid"}},
+		Spec:       kubeovnv1.IptablesFIPRuleSpec{EIP: "eip", InternalIP: "10.0.0.1"},
+		Status:     kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalIP: "10.0.0.1"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:  []*kubeovnv1.QoSPolicy{qos},
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+		IptablesFIPs: []*kubeovnv1.IptablesFIPRule{fip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("ReplayEipUpdate", nil)
+	c.updateIptablesFipQueue = newTypedRateLimitingQueue[string]("ReplayFipUpdate", nil)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+	t.Cleanup(c.updateIptablesFipQueue.ShutDown)
+
+	require.NoError(t, c.handleAddIptablesEip("eip"))
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+	require.NoError(t, c.handleAddIptablesFip("fip"))
+	require.Equal(t, 1, c.updateIptablesFipQueue.Len())
+	require.Error(t, c.handleUpdateIptablesFip("fip"), "the old rule cannot be removed without its gateway pod")
+	storedFip, err := c.config.KubeOvnClient.KubeovnV1().IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, storedFip.Status.Ready, "a failed generation rebind must not leave the fip ready")
+}
+
+func TestReadyEipAddReplayMarksUnavailableQoSNotReady(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip", Labels: map[string]string{util.QoSPolicyUIDLabel: "old-uid"}},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			V4ip: "1.1.1.1", QoSPolicy: "missing-qos", NatGwDp: "gw", ExternalSubnet: "external",
+		},
+		Status: kubeovnv1.IptablesEIPStatus{Ready: true, IP: "1.1.1.1", QoSPolicy: "missing-qos"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+		Subnets: []*kubeovnv1.Subnet{{
+			ObjectMeta: metav1.ObjectMeta{Name: "external"},
+			Spec:       kubeovnv1.SubnetSpec{CIDRBlock: "1.1.1.0/24"},
+		}},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UnavailableQoSEipUpdate", nil)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	require.NoError(t, c.handleAddIptablesEip("eip"))
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+	require.Error(t, c.handleUpdateIptablesEip("eip"))
+	storedEip, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, storedEip.Status.Ready)
 }
 
 func TestTerminatingQoSPolicyReferenceReleaseClosesLifecycle(t *testing.T) {

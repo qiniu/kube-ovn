@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -128,7 +129,7 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 		c.iptablesEipsLister = failingEipLister{}
 		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("ListFailureGw", nil)
 		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
-		err := c.enqueueQoSPolicyReferrers("qos", false)
+		err := c.enqueueQoSPolicyReferrers(oldQos, false)
 		require.ErrorContains(t, err, "eip lister failed")
 		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
@@ -171,6 +172,44 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 		require.Equal(t, 1, c.delQoSPolicyQueue.Len())
 		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
 		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("same-name generations are isolated by uid", func(t *testing.T) {
+		oldGeneration := oldQos.DeepCopy()
+		oldGeneration.UID = types.UID("old-uid")
+		newGeneration := oldQos.DeepCopy()
+		newGeneration.UID = types.UID("new-uid")
+		for _, tc := range []struct {
+			name       string
+			boundUID   string
+			eventQos   *kubeovnv1.QoSPolicy
+			usable     bool
+			wantQueued int
+		}{
+			{name: "old delete ignores new binding", boundUID: "new-uid", eventQos: oldGeneration, wantQueued: 0},
+			{name: "new usable wakes old binding", boundUID: "old-uid", eventQos: newGeneration, usable: true, wantQueued: 1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				eip := eip.DeepCopy()
+				eip.Labels = map[string]string{util.QoSPolicyUIDLabel: tc.boundUID}
+				gw := gw.DeepCopy()
+				gw.Labels = map[string]string{util.QoSPolicyUIDLabel: tc.boundUID}
+				fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+					IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+					VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+				})
+				require.NoError(t, err)
+				c := fc.fakeController
+				c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("QoSGenerationEip", nil)
+				c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("QoSGenerationGw", nil)
+				t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+				t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+
+				require.NoError(t, c.enqueueQoSPolicyReferrers(tc.eventQos, tc.usable))
+				require.Equal(t, tc.wantQueued, c.updateIptablesEipQueue.Len())
+				require.Equal(t, tc.wantQueued, c.addOrUpdateVpcNatGatewayQueue.Len())
+			})
+		}
 	})
 }
 

@@ -176,10 +176,21 @@ update is not invalidation while old Status still describes a working data plane
 plane before advancing Status, while continuing to block new bindings.
 
 Route incomplete Status to add, complete but mismatched Status to update, and replay a matching
-not-ready identity idempotently on recovery. Skip terminating and converged referrers. On restart,
-each referrer's initial Add runs after all caches sync; do not scan all referrers for every
-dependency Add replay. Keep rate-limited retry as fallback. Tests must cover usable and unusable
-transitions, add/update routing, cleanup identity, termination, restart, and the API/cache gap.
+not-ready identity idempotently on recovery. A same-name dependency is converged only when its UID
+credential matches the current generation; rebind a mismatch only when the old data plane can be
+cleaned, and ignore invalidation events from an older generation once the referrer carries the newer UID. Skip terminating and converged
+referrers. On restart,
+each referrer's initial Add enqueues its key while caches synchronize; workers consume queued keys
+only after all required caches sync. Use dependency Add replay only where it provides a required
+readiness or invalidation notification. Keep rate-limited retry as fallback. Tests must cover usable
+and unusable transitions, add/update routing, cleanup identity, termination, restart, and the
+API/cache gap.
+
+Startup backfill fills only missing UID credentials; it must not overwrite a different UID and hide
+a same-name generation mismatch. A reconciler may rebind only when it can clean the previously
+applied data plane. For example, a VPC NAT Gateway cannot delete QoS rules from a force-deleted,
+same-name policy using the new policy's rule list; without a persisted old-rule snapshot, leave the
+gateway un-converged and require an explicit remove or rebind instead.
 
 The check and the credential write are two calls against two different objects, so the pair is
 not atomic: the referenced object can start terminating in between. What keeps that window from

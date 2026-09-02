@@ -930,10 +930,11 @@ func natRuleBound(current map[string]string, statusV4ip string) bool {
 	return current[util.EipV4IpLabel] != "" || statusV4ip != ""
 }
 
-// backfillEipUIDLabel migrates an existing binding to the UID credential. bound separates that
+// backfillEipUIDLabel fills a missing UID credential for an existing binding. bound separates that
 // from a reference that was never programmed: only the latter is refused when either side is
 // terminating, because a rule that is already in the gateway pod has to keep being counted no
-// matter which end is on its way out.
+// matter which end is on its way out. An existing different UID is an observable generation
+// mismatch for its reconciler, not a value startup can safely rewrite.
 func (c *Controller) backfillEipUIDLabel(name, natType, eipName string, bound bool, current map[string]string) (natLabelClaim, bool, error) {
 	eip, err := c.iptablesEipsLister.Get(eipName)
 	if err != nil {
@@ -950,6 +951,10 @@ func (c *Controller) backfillEipUIDLabel(name, natType, eipName string, bound bo
 	}
 	uid := string(eip.UID)
 	if current[util.EipUIDLabel] == uid {
+		return natLabelClaim{}, false, nil
+	}
+	if current[util.EipUIDLabel] != "" {
+		klog.Warningf("skip syncing %s %s eip uid label, it references a different generation", natType, name)
 		return natLabelClaim{}, false, nil
 	}
 	newLabels := copyLabels(current)
@@ -1052,6 +1057,10 @@ func (c *Controller) qosUIDLabels(kind, name, qosName string, bound bool, curren
 	}
 	uid := string(qos.UID)
 	if current[util.QoSLabel] == qosName && current[util.QoSPolicyUIDLabel] == uid {
+		return nil, "", false, nil
+	}
+	if current[util.QoSPolicyUIDLabel] != "" && current[util.QoSPolicyUIDLabel] != uid {
+		klog.Warningf("skip syncing %s %s qos uid label, it references a different generation", kind, name)
 		return nil, "", false, nil
 	}
 	newLabels := copyLabels(current)
