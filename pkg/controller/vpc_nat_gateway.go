@@ -390,7 +390,7 @@ func (c *Controller) rejectStaleVpcNatGwQoSGeneration(gw *kubeovnv1.VpcNatGatewa
 		return fmt.Errorf("vpc nat gateway %s is waiting for qos policy %s controller reconcile to restore its finalizer", gw.Name, gw.Status.QoSPolicy)
 	}
 	if gw.Labels[util.QoSPolicyUIDLabel] != string(qos.UID) {
-		return fmt.Errorf("vpc nat gateway %s references a previous generation of qos policy %s; remove or rebind it before applying the new generation", gw.Name, gw.Status.QoSPolicy)
+		return fmt.Errorf("vpc nat gateway %s references a previous generation of qos policy %s; delete and recreate the gateway before applying the new generation", gw.Name, gw.Status.QoSPolicy)
 	}
 	return nil
 }

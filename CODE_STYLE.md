@@ -190,7 +190,7 @@ Startup backfill fills only missing UID credentials; it must not overwrite a dif
 a same-name generation mismatch. A reconciler may rebind only when it can clean the previously
 applied data plane. For example, a VPC NAT Gateway cannot delete QoS rules from a force-deleted,
 same-name policy using the new policy's rule list; without a persisted old-rule snapshot, leave the
-gateway un-converged and require an explicit remove or rebind instead.
+gateway un-converged and require deleting and recreating the gateway.
 
 The check and the credential write are two calls against two different objects, so the pair is
 not atomic: the referenced object can start terminating in between. What keeps that window from

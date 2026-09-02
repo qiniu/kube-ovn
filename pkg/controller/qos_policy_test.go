@@ -231,6 +231,28 @@ func TestUpdateQoSPolicyRestoresMissingControllerFinalizer(t *testing.T) {
 	require.Contains(t, stored.Finalizers, util.KubeOVNControllerFinalizer)
 }
 
+func TestQoSPolicyFinalizerLossEnqueuesAndRestores(t *testing.T) {
+	oldQos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos", Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
+		Status:     kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	newQos := oldQos.DeepCopy()
+	newQos.Finalizers = nil
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{QoSPolicies: []*kubeovnv1.QoSPolicy{newQos}})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateQoSPolicyQueue = newTypedRateLimitingQueue[string]("QoSFinalizerRecovery", nil)
+	t.Cleanup(c.updateQoSPolicyQueue.ShutDown)
+
+	c.enqueueUpdateQoSPolicy(oldQos, newQos)
+	require.Equal(t, 1, c.updateQoSPolicyQueue.Len())
+	require.NoError(t, c.handleUpdateQoSPolicy("qos"))
+	stored, err := c.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(t.Context(), "qos", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, stored.Finalizers, util.KubeOVNControllerFinalizer)
+}
+
 func TestValidateRateValue(t *testing.T) {
 	t.Parallel()
 
