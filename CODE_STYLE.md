@@ -163,6 +163,24 @@ These rules make the check correct:
 Returning an error is enough, the work queues retry with backoff and never give up, so the
 binding succeeds as soon as the tombstone is reclaimed.
 
+Dependency recovery must be event-driven. A referrer cannot become Ready until its dependency
+exists, is not terminating, and its required data plane is ready. The dependency's informer event
+wakes pending referrers only after authoritative state reaches the cache; an API `UpdateStatus`
+success does not make the new Status immediately visible. Zero-value Spec and Status may match
+before the first reconcile, so use a persistent marker such as the controller finalizer when that
+distinction matters.
+
+An authoritative usable-to-unusable transition also wakes established referrers. They stop new
+data-plane writes, retain cleanup identity, and report not Ready until recovery. A pending Spec
+update is not invalidation while old Status still describes a working data plane: update that data
+plane before advancing Status, while continuing to block new bindings.
+
+Route incomplete Status to add, complete but mismatched Status to update, and replay a matching
+not-ready identity idempotently on recovery. Skip terminating and converged referrers. On restart,
+each referrer's initial Add runs after all caches sync; do not scan all referrers for every
+dependency Add replay. Keep rate-limited retry as fallback. Tests must cover usable and unusable
+transitions, add/update routing, cleanup identity, termination, restart, and the API/cache gap.
+
 The check and the credential write are two calls against two different objects, so the pair is
 not atomic: the referenced object can start terminating in between. What keeps that window from
 orphaning rules in a gateway pod is that a rule is never programmed without a credential
