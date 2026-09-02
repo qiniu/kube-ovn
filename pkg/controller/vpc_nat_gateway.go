@@ -113,7 +113,12 @@ func (c *Controller) resyncVpcNatGwConfig() {
 }
 
 func (c *Controller) enqueueAddVpcNatGw(obj any) {
-	key := cache.MetaObjectToName(obj.(*kubeovnv1.VpcNatGateway)).String()
+	gw := obj.(*kubeovnv1.VpcNatGateway)
+	if !gw.DeletionTimestamp.IsZero() {
+		c.enqueueDeleteVpcNatGw(gw)
+		return
+	}
+	key := cache.MetaObjectToName(gw).String()
 	klog.V(3).Infof("enqueue add vpc-nat-gw %s", key)
 	c.addOrUpdateVpcNatGatewayQueue.Add(key)
 }
@@ -130,11 +135,15 @@ func (c *Controller) enqueueUpdateVpcNatGw(oldObj, newObj any) {
 	oldGw := oldObj.(*kubeovnv1.VpcNatGateway)
 	newGw := newObj.(*kubeovnv1.VpcNatGateway)
 	key := cache.MetaObjectToName(newGw).String()
-	klog.V(3).Infof("enqueue update vpc-nat-gw %s", key)
-	c.addOrUpdateVpcNatGatewayQueue.Add(key)
+	if newGw.DeletionTimestamp.IsZero() {
+		klog.V(3).Infof("enqueue update vpc-nat-gw %s", key)
+		c.addOrUpdateVpcNatGatewayQueue.Add(key)
+	} else {
+		c.enqueueDeleteVpcNatGw(newGw)
+	}
 
 	// When the QoSLabel is cleared or switched, re-enqueue the previous QoS policy so it can drop
-	// its finalizer once unused (the in-use check is keyed on the label).
+	// its finalizer once unused (the queue key is the policy name).
 	c.enqueueQoSPolicyRelease(oldGw.Labels, newGw.Labels)
 }
 
@@ -165,7 +174,7 @@ func (c *Controller) enqueueDeleteVpcNatGw(obj any) {
 	c.delVpcNatGatewayQueue.Add(key)
 
 	// Trigger QoS Policy reconcile after NatGw is deleted so it can drop its finalizer if no
-	// other NatGw references it. Key on the QoSLabel, matching the QoS in-use check.
+	// other NatGw references it. The queue key is the policy name.
 	c.enqueueQoSPolicyRelease(gw.Labels, nil)
 }
 
@@ -226,6 +235,9 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		}
 		klog.Error(err)
 		return err
+	}
+	if !gw.DeletionTimestamp.IsZero() {
+		return nil
 	}
 
 	// create nat gw statefulset
@@ -360,6 +372,11 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		}
 		klog.Error(err)
 		return err
+	}
+	// Terminating pods still produce update events that land here, and this path both programs the
+	// pod and writes the gateway's QoS credential.
+	if !gw.DeletionTimestamp.IsZero() {
+		return nil
 	}
 
 	if vpcNatEnabled != "true" {
@@ -1310,8 +1327,27 @@ func (c *Controller) updateCrdNatGwLabels(key, qos string) error {
 	var needUpdateLabel bool
 	var op string
 
+	// updateCrdNatGwLabels writes util.QoSLabel and util.QoSPolicyUIDLabel on VpcNatGateway, and the
+	// QoSBindingTypeNatGw in-use check is keyed on the UID label. Same rule as patchEipLabel: never
+	// point a live gateway at a terminating QoS policy, or the policy can never drop its finalizer.
+	// Only a reference that would actually change is rejected, rewriting the current one adds nothing
+	// to the in-use count.
+	qosPolicy, qosErr := c.getBindableQoSPolicy(qos)
+	if qosErr != nil && oriGw.DeletionTimestamp.IsZero() && oriGw.Labels[util.QoSLabel] != qos {
+		return qosErr
+	}
+	// On an exempt path the policy is unreadable, so keep the recorded UID: clearing it would drop
+	// this reference from the in-use count while the gateway still points at the policy.
+	qosPolicyUID := oriGw.Labels[util.QoSPolicyUIDLabel]
+	if qosErr == nil {
+		qosPolicyUID = ""
+		if qosPolicy != nil {
+			qosPolicyUID = string(qosPolicy.UID)
+		}
+	}
+
 	// Create a new labels map to avoid modifying the informer cache
-	labels := make(map[string]string, len(oriGw.Labels)+3)
+	labels := make(map[string]string, len(oriGw.Labels)+4)
 	for k, v := range oriGw.Labels {
 		labels[k] = v
 	}
@@ -1322,6 +1358,7 @@ func (c *Controller) updateCrdNatGwLabels(key, qos string) error {
 		labels[util.SubnetNameLabel] = oriGw.Spec.Subnet
 		labels[util.VpcNameLabel] = oriGw.Spec.Vpc
 		labels[util.QoSLabel] = qos
+		labels[util.QoSPolicyUIDLabel] = qosPolicyUID
 		needUpdateLabel = true
 	} else {
 		if oriGw.Labels[util.SubnetNameLabel] != oriGw.Spec.Subnet {
@@ -1337,6 +1374,11 @@ func (c *Controller) updateCrdNatGwLabels(key, qos string) error {
 		if oriGw.Labels[util.QoSLabel] != qos {
 			op = "replace"
 			labels[util.QoSLabel] = qos
+			needUpdateLabel = true
+		}
+		if oriGw.Labels[util.QoSPolicyUIDLabel] != qosPolicyUID {
+			op = "replace"
+			labels[util.QoSPolicyUIDLabel] = qosPolicyUID
 			needUpdateLabel = true
 		}
 	}

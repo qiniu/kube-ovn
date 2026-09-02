@@ -237,6 +237,16 @@ func (c *Controller) getShareBackends(gwName, eipName, externalPort, protocol, d
 // Conntrack is only cleared on full identity deletion (see deleteNftDnatMapInPod /
 // del_nft_dnat_map in the gateway script).
 func (c *Controller) cleanupShareDnatInPod(key, gwName, eipName, protocol, v4ip, externalPort, dnatName string) error {
+	// The gateway pod is gone with the gateway, so both the rebuild and the delete branch below
+	// would retry forever against a missing pod and never let the finalizer go.
+	deleted, err := c.natGwDeleted(gwName)
+	if err != nil {
+		klog.Error(err)
+		return err
+	}
+	if deleted {
+		return nil
+	}
 	remainingBackends, err := c.getShareBackends(gwName, eipName, externalPort, protocol, dnatName)
 	if err != nil {
 		return fmt.Errorf("failed to get share backends for dnat %s: %w", key, err)

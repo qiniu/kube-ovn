@@ -2,7 +2,7 @@
 
 ## Introduction
 
-The goal of this guide is to manage the complexity, keep a consistent code style and prevent common mistakes. 
+The goal of this guide is to manage the complexity, keep a consistent code style and prevent common mistakes.
 New code should follow the guides below and reviewers should check if new PRs follow the rules.
 
 ## Style
@@ -93,10 +93,10 @@ When err occurs in the function, it should be returned to the caller not skipped
 
 ```go
 func startHandle() {
-	if err = some(); err != nil {
-		klog.Errorf(err)    
+ if err = some(); err != nil {
+  klog.Errorf(err)
     }
-	return
+ return
 }
 ```
 
@@ -106,7 +106,7 @@ func startHandle() {
 func startHandle() error {
     if err = some(); err != nil {
         klog.Errorf(err)
-		return err
+  return err
     }
     return nil
 }
@@ -114,7 +114,6 @@ func startHandle() error {
 
 </td></tr>
 </tbody></table>
-
 
 ## CRD
 
@@ -125,3 +124,53 @@ When adding a new CRD to Kube-OVN, you should consider things below to avoid com
 3. The `cleanup.sh` should clean the CRD and all the related resources.
 4. The `gc.go` should check the inconsistent resource and do the cleanup.
 5. The add/update/delete event can be triggered many times during the lifecycle, the handler should be reentrant.
+6. Never bind a resource to a referenced CRD that is being deleted.
+7. If a finalizer is released only when nobody references the CRD, reference writers must first check that the referenced CRD is not being deleted.
+
+When CRD `A` only drops its finalizer once nothing references it any more, every place
+that *establishes* such a reference must first check `A.DeletionTimestamp`. Otherwise a
+reference created after `A` was marked for deletion keeps `A` terminating forever, and
+`A` in turn blocks whatever the platform deletes next. The API server rejects a same-named
+create while the old object is still terminating, so the danger is not a live tombstone but a
+*new generation*: these resources are named after the address they carry (`IptablesEIP`,
+`IptablesFIPRule`, `QoSPolicy`, ...), so once the previous instance is gone a recreated one
+inherits every stale reference still recorded under that shared name or address.
+
+These rules make the check correct:
+
+- Put it on the **writer of the reference**, not on the handler. The reference is what the
+  in-use check counts, e.g. `util.QoSPolicyUIDLabel` written by `patchEipLabel` and
+  `updateCrdNatGwLabels`, or `util.EipUIDLabel` written by `patchFipLabel`, `patchDnatLabel`
+  and `patchSnatLabel`. Guarding one
+  caller leaves the delayed and replay paths (`resetIptablesEipQueue.AddAfter`, `redoFip`,
+  gateway re-init) wide open. A guard placed earlier is only equivalent when every writer
+  is provably downstream of it, as `getBindableEip` is for the three `patch*Label` helpers.
+- Store the referenced object's **UID** on the referrer and make the in-use check select by
+  UID, not by name, IP, or other reusable business keys. When adding a new UID reference
+  label, add startup backfill before workers run so existing objects are not seen as unused.
+- Reject only a reference that would be **added or changed**. Rewriting the value the object
+  already carries adds nothing to the in-use count, and refusing it is actively harmful where
+  the caller iterates: `handleUpdateVpcFloatingIP` returns on the first error, so one EIP
+  pointing at a tombstone would stop `redoFip` for every other FIP of that gateway and leave
+  their rules unapplied after a gateway pod restart.
+- Guard **binding only**, never reading or cleanup. Deletion paths legitimately read a
+  terminating object, `finalDeleteFipInPod` needs the dying EIP's `Status.IP` to remove the
+  rules from the gateway pod. Rejecting there deadlocks the cleanup itself.
+- **Exempt a terminating referrer.** It establishes no new binding, and blocking it can
+  break its own deletion: `handleResetIptablesEip` must reach its status patch, which is
+  what re-enqueues the terminating EIP.
+
+Returning an error is enough, the work queues retry with backoff and never give up, so the
+binding succeeds as soon as the tombstone is reclaimed.
+
+The check and the credential write are two calls against two different objects, so the pair is
+not atomic: the referenced object can start terminating in between. What keeps that window from
+orphaning rules in a gateway pod is that a rule is never programmed without a credential
+covering it: a new claim is written before the rule it covers exists, and an old claim is held
+until the rule it covers is gone. On a rebind that puts the swap between the two data-plane
+calls, not before both, since one label carries both claims. Where cleanup needs the referenced
+object to know what to undo, as `delEipQoS` does, the swap can only come after both. The release
+path reads the referrers back from the API server rather than the informer cache for the same
+reason. None of this makes the check and the write mutually exclusive. Closing the window
+completely means recording the reference on the referenced object itself under a resourceVersion
+precondition, which is a much larger change and is deliberately left for later.

@@ -211,30 +211,32 @@ func (v *ValidatingHook) iptablesEIPDeleteHook(ctx context.Context, req admissio
 	}
 
 	if eip.Status.Ready {
-		var err error
+		// Match the controller's in-use check: select the NAT rules that claimed this EIP
+		// generation by UID. Driving the lookup off eip.Status.Nat instead would skip the check
+		// whenever that status is stale, and selecting by address would count rules belonging to a
+		// different EIP that happens to carry the same one.
 		fipList := ovnv1.IptablesFIPRuleList{}
 		snatList := ovnv1.IptablesSnatRuleList{}
 		dnatList := ovnv1.IptablesDnatRuleList{}
-
-		for natType := range strings.SplitSeq(eip.Status.Nat, ",") {
-			switch natType {
-			case util.FipUsingEip:
-				err = v.cache.List(ctx, &fipList, cli.MatchingLabels{util.EipV4IpLabel: eip.Status.IP})
-			case util.SnatUsingEip:
-				err = v.cache.List(ctx, &snatList, cli.MatchingLabels{util.EipV4IpLabel: eip.Status.IP})
-			case util.DnatUsingEip:
-				err = v.cache.List(ctx, &dnatList, cli.MatchingLabels{util.EipV4IpLabel: eip.Status.IP})
-			}
-		}
-
-		if err != nil {
-			if !k8serrors.IsNotFound(err) {
+		selector := eipUIDSelector(&eip)
+		for _, list := range []cli.ObjectList{&fipList, &snatList, &dnatList} {
+			if err := v.cache.List(ctx, list, selector); err != nil && !k8serrors.IsNotFound(err) {
 				return ctrlwebhook.Errored(http.StatusInternalServerError, err)
 			}
 		}
 
-		if len(fipList.Items) != 0 || len(snatList.Items) != 0 || len(dnatList.Items) != 0 {
-			err = fmt.Errorf("eip \"%s\" is still in use,you need to delete the %s of eip first", eip.Name, eip.Status.Nat)
+		var inUse []string
+		if len(fipList.Items) != 0 {
+			inUse = append(inUse, util.FipUsingEip)
+		}
+		if len(snatList.Items) != 0 {
+			inUse = append(inUse, util.SnatUsingEip)
+		}
+		if len(dnatList.Items) != 0 {
+			inUse = append(inUse, util.DnatUsingEip)
+		}
+		if len(inUse) != 0 {
+			err := fmt.Errorf("eip \"%s\" is still in use,you need to delete the %s of eip first", eip.Name, strings.Join(inUse, ","))
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
 		}
 	}
@@ -449,14 +451,34 @@ func (v *ValidatingHook) ValidateVpcNatGW(ctx context.Context, gw *ovnv1.VpcNatG
 		}
 	}
 
-	if gw.Spec.QoSPolicy != "" {
-		qos := &ovnv1.QoSPolicy{}
-		key = types.NamespacedName{Name: gw.Spec.QoSPolicy}
-		if err := v.cache.Get(ctx, key, qos); err != nil {
-			return err
-		}
+	if err := validateQoSPolicyRef(ctx, v.cache, gw.Spec.QoSPolicy); err != nil {
+		return err
 	}
 
+	return nil
+}
+
+// eipUIDSelector matches the NAT rules that claimed this EIP generation. It is the same credential
+// the controller's in-use check counts, so admission and the finalizer never disagree.
+func eipUIDSelector(eip *ovnv1.IptablesEIP) cli.MatchingLabels {
+	return cli.MatchingLabels{util.EipUIDLabel: string(eip.UID)}
+}
+
+// validateQoSPolicyRef rejects a reference to a QoSPolicy that does not exist or is terminating.
+// The controller keeps such a referrer out of Ready, so failing at admission hands the user the
+// error directly. The read comes from an informer cache, so this is best effort and the controller
+// stays the authority.
+func validateQoSPolicyRef(ctx context.Context, reader cli.Reader, qosPolicy string) error {
+	if qosPolicy == "" {
+		return nil
+	}
+	qos := &ovnv1.QoSPolicy{}
+	if err := reader.Get(ctx, types.NamespacedName{Name: qosPolicy}, qos); err != nil {
+		return err
+	}
+	if !qos.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("qos policy %s is terminating", qosPolicy)
+	}
 	return nil
 }
 
@@ -495,6 +517,9 @@ func (v *ValidatingHook) ValidateVpcNatGatewayConfig(ctx context.Context) error 
 func (v *ValidatingHook) ValidateIptablesEIP(ctx context.Context, eip *ovnv1.IptablesEIP) error {
 	if eip.Spec.NatGwDp == "" {
 		return errors.New("parameter \"natGwDp\" cannot be empty")
+	}
+	if err := validateQoSPolicyRef(ctx, v.cache, eip.Spec.QoSPolicy); err != nil {
+		return err
 	}
 	return v.validateIptablesEIPIPFields(ctx, eip)
 }
@@ -630,14 +655,12 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 
 	// Check FIP/DNAT exclusivity: FIP claims all traffic to the EIP (EXCLUSIVE_DNAT),
 	// which shadows any port-specific DNAT rules (SHARED_DNAT) for the same EIP.
-	if eip.Status.IP != "" {
-		fipList := &ovnv1.IptablesFIPRuleList{}
-		if err := v.cache.List(ctx, fipList, cli.MatchingLabels{util.EipV4IpLabel: eip.Status.IP}); err != nil {
-			return fmt.Errorf("failed to list iptables FIP rules: %w", err)
-		}
-		if len(fipList.Items) != 0 {
-			return fmt.Errorf("EIP %q is already used by FIP rule %q; floating IP requires exclusive use of the EIP (FIP matches all traffic, shadowing port-specific DNAT rules)", dnat.Spec.EIP, fipList.Items[0].Name)
-		}
+	fipList := &ovnv1.IptablesFIPRuleList{}
+	if err := v.cache.List(ctx, fipList, eipUIDSelector(eip)); err != nil {
+		return fmt.Errorf("failed to list iptables FIP rules: %w", err)
+	}
+	if len(fipList.Items) != 0 {
+		return fmt.Errorf("EIP %q is already used by FIP rule %q; floating IP requires exclusive use of the EIP (FIP matches all traffic, shadowing port-specific DNAT rules)", dnat.Spec.EIP, fipList.Items[0].Name)
 	}
 
 	return nil
@@ -678,14 +701,12 @@ func (v *ValidatingHook) ValidateIptablesFip(ctx context.Context, fip *ovnv1.Ipt
 
 	// Check FIP/DNAT exclusivity: FIP claims all traffic to the EIP (EXCLUSIVE_DNAT),
 	// which shadows any port-specific DNAT rules (SHARED_DNAT) for the same EIP.
-	if eip.Status.IP != "" {
-		dnatList := &ovnv1.IptablesDnatRuleList{}
-		if err := v.cache.List(ctx, dnatList, cli.MatchingLabels{util.EipV4IpLabel: eip.Status.IP}); err != nil {
-			return fmt.Errorf("failed to list iptables DNAT rules: %w", err)
-		}
-		if len(dnatList.Items) != 0 {
-			return fmt.Errorf("EIP %q is already used by DNAT rule %q; floating IP requires exclusive use of the EIP (FIP matches all traffic, shadowing port-specific DNAT rules)", fip.Spec.EIP, dnatList.Items[0].Name)
-		}
+	dnatList := &ovnv1.IptablesDnatRuleList{}
+	if err := v.cache.List(ctx, dnatList, eipUIDSelector(eip)); err != nil {
+		return fmt.Errorf("failed to list iptables DNAT rules: %w", err)
+	}
+	if len(dnatList.Items) != 0 {
+		return fmt.Errorf("EIP %q is already used by DNAT rule %q; floating IP requires exclusive use of the EIP (FIP matches all traffic, shadowing port-specific DNAT rules)", fip.Spec.EIP, dnatList.Items[0].Name)
 	}
 
 	return nil

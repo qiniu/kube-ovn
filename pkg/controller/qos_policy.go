@@ -37,9 +37,10 @@ func (c *Controller) enqueueAddQoSPolicy(obj any) {
 
 // enqueueQoSPolicyRelease re-enqueues a QoS policy whose QoSLabel a referencing resource (EIP or
 // NatGw) no longer carries, so a policy marked for deletion can drop its finalizer once unused.
-// The QoS reconcile decides "in use" via the QoSLabel selector, so the re-enqueue must key on the
-// label's old value. It is triggered from the delete handler (old labels only, newLabels nil) and
-// from the update handler when the label is cleared or switched; both fire only after the informer
+// The in-use check selects on util.QoSPolicyUIDLabel, but the queue key is the policy name, so the
+// re-enqueue keys on the old value of the name label. It is triggered from the delete handler (old
+// labels only, newLabels nil) and from the update handler when the label is cleared or switched;
+// both fire only after the informer
 // cache already reflects the change, which avoids the stale-cache race that left policies stuck in
 // Terminating.
 func (c *Controller) enqueueQoSPolicyRelease(oldLabels, newLabels map[string]string) {
@@ -119,6 +120,10 @@ func (c *Controller) handleAddQoSPolicy(key string) error {
 		}
 		klog.Error(err)
 		return err
+	}
+	// The key may have been queued while the object was still live; the update queue owns cleanup.
+	if !cachedQoS.DeletionTimestamp.IsZero() {
+		return nil
 	}
 
 	c.vpcNatGwKeyMutex.LockKey(key)
@@ -417,28 +422,31 @@ func (c *Controller) handleUpdateQoSPolicy(key string) error {
 
 	// should delete
 	if !cachedQos.DeletionTimestamp.IsZero() {
-		// Check if the QoS policy is still being used before allowing deletion
+		// Check if the QoS policy is still being used before allowing deletion.
+		// Read through the API server: a referrer that claimed this policy moments ago may not be
+		// in the informer cache yet, and releasing on that stale view drops a live reference.
+		opts := metav1.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labels.Set{util.QoSPolicyUIDLabel: string(cachedQos.UID)}).String(),
+		}
 		var inUse bool
 		if cachedQos.Spec.BindingType == kubeovnv1.QoSBindingTypeEIP {
-			eips, err := c.iptablesEipsLister.List(
-				labels.SelectorFromSet(labels.Set{util.QoSLabel: key}))
+			eips, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().List(context.Background(), opts)
 			// when eip is not found, we should delete finalizer
 			if err != nil && !k8serrors.IsNotFound(err) {
 				klog.Errorf("failed to get eip list, %v", err)
 				return err
 			}
-			inUse = len(eips) != 0
+			inUse = eips != nil && len(eips.Items) != 0
 		}
 
 		if cachedQos.Spec.BindingType == kubeovnv1.QoSBindingTypeNatGw {
-			gws, err := c.vpcNatGatewayLister.List(
-				labels.SelectorFromSet(labels.Set{util.QoSLabel: key}))
+			gws, err := c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().List(context.Background(), opts)
 			// when nat gw is not found, we should delete finalizer
 			if err != nil && !k8serrors.IsNotFound(err) {
 				klog.Errorf("failed to get gw list, %v", err)
 				return err
 			}
-			inUse = len(gws) != 0
+			inUse = gws != nil && len(gws.Items) != 0
 		}
 
 		if inUse {
@@ -479,7 +487,8 @@ func (c *Controller) handleUpdateQoSPolicy(key string) error {
 	if bandwidthRulesChanged {
 		klog.V(3).Infof(
 			"bandwidth limit rules is changed for qos %s, added: %s, deleted: %s, updated: %s",
-			key, added.Strings(), deleted.Strings(), updated.Strings())
+			key, added.Strings(), deleted.Strings(), updated.Strings(),
+		)
 		if cachedQos.Status.Shared {
 			err := fmt.Errorf("not support shared qos %s change rule", key)
 			klog.Error(err)
@@ -489,7 +498,8 @@ func (c *Controller) handleUpdateQoSPolicy(key string) error {
 		if cachedQos.Status.BindingType == kubeovnv1.QoSBindingTypeEIP {
 			// filter to eip
 			eips, err := c.iptablesEipsLister.List(
-				labels.SelectorFromSet(labels.Set{util.QoSLabel: key}))
+				labels.SelectorFromSet(labels.Set{util.QoSPolicyUIDLabel: string(cachedQos.UID)}),
+			)
 			if err != nil {
 				klog.Errorf("failed to get eip list, %v", err)
 				return err

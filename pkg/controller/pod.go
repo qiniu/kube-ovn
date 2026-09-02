@@ -930,8 +930,12 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 	isVpcNatGw, vpcGwName := c.checkIsPodVpcNatGw(pod)
 	if isVpcNatGw {
 		c.enqueueAddOrUpdateVpcNatGwByName(vpcGwName, "natgw-pod-update")
-		klog.Infof("init vpc nat gateway pod %s/%s with name %s", namespace, name, vpcGwName)
-		c.initVpcNatGatewayQueue.Add(vpcGwName)
+		// A terminating pod still carries the annotation, and the init handler would only find the
+		// gateway on its way out and return. A replacement pod raises its own event.
+		if pod.DeletionTimestamp.IsZero() {
+			klog.Infof("init vpc nat gateway pod %s/%s with name %s", namespace, name, vpcGwName)
+			c.initVpcNatGatewayQueue.Add(vpcGwName)
+		}
 	}
 
 	return pod, nil

@@ -25,7 +25,7 @@ import (
 func (c *Controller) enqueueAddIptablesEip(obj any) {
 	eip := obj.(*kubeovnv1.IptablesEIP)
 	key := cache.MetaObjectToName(eip).String()
-	// A terminating object reconciles via the update queue for cleanup (handleAdd skips it; resync=0).
+	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesEipQueue, key, "iptables eip", eip.DeletionTimestamp) {
 		return
 	}
@@ -45,7 +45,7 @@ func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 	}
 
 	// When the QoSLabel is cleared or switched, re-enqueue the previous QoS policy so it can drop
-	// its finalizer once unused (the in-use check is keyed on the label).
+	// its finalizer once unused (the queue key is the policy name).
 	c.enqueueQoSPolicyRelease(oldEip.Labels, newEip.Labels)
 }
 
@@ -71,7 +71,7 @@ func (c *Controller) enqueueDelIptablesEip(obj any) {
 	c.delIptablesEipQueue.Add(eip)
 
 	// Re-trigger QoS reconcile so it can drop its finalizer once unused. DeleteFunc runs after
-	// the informer cache dropped this EIP; key on the QoSLabel, matching the QoS in-use check.
+	// the informer cache dropped this EIP; the queue key is the policy name.
 	c.enqueueQoSPolicyRelease(eip.Labels, nil)
 }
 
@@ -96,6 +96,10 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 		klog.Error(err)
 		return err
 	}
+	// The key may have been queued while the object was still live; the update queue owns cleanup.
+	if !cachedEip.DeletionTimestamp.IsZero() {
+		return nil
+	}
 
 	if vpcNatEnabled != "true" {
 		return errors.New("iptables nat gw not enable")
@@ -108,6 +112,13 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 	if cachedEip.Status.Ready && cachedEip.Status.IP != "" {
 		// already ok
 		return nil
+	}
+
+	if err = c.checkQoSPolicyNotTerminating(cachedEip.Spec.QoSPolicy); err != nil {
+		return err
+	}
+	if err = c.checkNatGwNotTerminating(cachedEip.Spec.NatGwDp); err != nil {
+		return err
 	}
 
 	subnetName := util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet)
@@ -215,28 +226,16 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle update iptables eip %s", key)
 
-	subnetName := util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet)
-	subnet, err := c.subnetsLister.Get(subnetName)
-	if err != nil {
-		klog.Errorf("failed to get subnet %s: %v", subnetName, err)
-		return err
-	}
-
-	v4Cidr, _ := util.SplitStringIP(subnet.Spec.CIDRBlock)
-	if v4Cidr == "" {
-		err = fmt.Errorf("subnet %s does not support ipv4", subnet.Name)
-		klog.Error(err)
-		return err
-	}
-
+	// The cleanup path runs before the external subnet is resolved: a missing or malformed subnet
+	// must not hold the finalizer of an EIP that is already on its way out.
 	if !cachedEip.DeletionTimestamp.IsZero() {
 		klog.Infof("clean eip %q in pod", key)
 
 		// Check if EIP is still being used by any NAT rules (FIP/DNAT/SNAT)
 		// Only remove finalizer when no NAT rules are using it
-		// Note: We query NAT rules directly instead of relying on cachedEip.Status.Nat
-		// to avoid cache staleness issues
-		nat, err := c.getIptablesEipNat(cachedEip.Spec.V4ip)
+		// Read through the API server: a rule that claimed this EIP moments ago may not be in the
+		// informer cache yet, and releasing on that stale view would orphan its gateway pod rules.
+		nat, err := c.getIptablesEipNatFromAPI(cachedEip)
 		if err != nil {
 			klog.Errorf("failed to get eip %s nat rules, %v", key, err)
 			return err
@@ -247,15 +246,32 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 		}
 
 		if vpcNatEnabled == "true" {
-			v4ipCidr, err := util.GetIPAddrWithMask(cachedEip.Status.IP, v4Cidr)
-			if err != nil {
-				err = fmt.Errorf("failed to get eip %s with mask by cidr %s: %w", cachedEip.Status.IP, v4Cidr, err)
-				klog.Error(err)
+			var v4Cidr string
+			subnet, err := c.subnetsLister.Get(util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet))
+			switch {
+			case err == nil:
+				if v4Cidr, _ = util.SplitStringIP(subnet.Spec.CIDRBlock); v4Cidr == "" {
+					klog.Warningf("external subnet of eip %s has no ipv4 cidr, skip cleaning its address in pod", key)
+				}
+			case k8serrors.IsNotFound(err):
+				// Only reachable if the subnet's finalizer was forced off: it holds while any
+				// address is allocated, and this EIP is one of them.
+				klog.Warningf("external subnet of eip %s is gone, skip cleaning its address in pod", key)
+			default:
+				klog.Errorf("failed to get external subnet of eip %s: %v", key, err)
 				return err
 			}
-			if err = c.deleteEipInPod(cachedEip.Spec.NatGwDp, v4ipCidr, c.natEipNamespace(cachedEip)); err != nil {
-				klog.Errorf("failed to clean eip '%s' in pod, %v", key, err)
-				return err
+			if v4Cidr != "" {
+				v4ipCidr, err := util.GetIPAddrWithMask(cachedEip.Status.IP, v4Cidr)
+				if err != nil {
+					err = fmt.Errorf("failed to get eip %s with mask by cidr %s: %w", cachedEip.Status.IP, v4Cidr, err)
+					klog.Error(err)
+					return err
+				}
+				if err = c.deleteEipInPod(cachedEip.Spec.NatGwDp, v4ipCidr, c.natEipNamespace(cachedEip)); err != nil {
+					klog.Errorf("failed to clean eip '%s' in pod, %v", key, err)
+					return err
+				}
 			}
 		}
 		if cachedEip.Status.QoSPolicy != "" {
@@ -276,6 +292,21 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 
 		return nil
 	}
+
+	subnetName := util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet)
+	subnet, err := c.subnetsLister.Get(subnetName)
+	if err != nil {
+		klog.Errorf("failed to get subnet %s: %v", subnetName, err)
+		return err
+	}
+
+	v4Cidr, _ := util.SplitStringIP(subnet.Spec.CIDRBlock)
+	if v4Cidr == "" {
+		err = fmt.Errorf("subnet %s does not support ipv4", subnet.Name)
+		klog.Error(err)
+		return err
+	}
+
 	klog.Infof("handle update eip %s", key)
 	// v6 ip address can not use upper case
 	if util.ContainsUppercase(cachedEip.Spec.V6ip) {
@@ -298,6 +329,12 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 
 	// update qos
 	if cachedEip.Status.QoSPolicy != cachedEip.Spec.QoSPolicy {
+		if err = c.checkQoSPolicyNotTerminating(cachedEip.Spec.QoSPolicy); err != nil {
+			return err
+		}
+		if err = c.checkNatGwNotTerminating(cachedEip.Spec.NatGwDp); err != nil {
+			return err
+		}
 		if cachedEip.Status.QoSPolicy != "" {
 			if err = c.delEipQoS(cachedEip, cachedEip.Status.IP); err != nil {
 				klog.Errorf("failed to del qos '%s' in pod, %v", key, err)
@@ -311,6 +348,9 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			}
 		}
 
+		// The FIP/DNAT/SNAT rebind swaps its claim between the two pod operations; here it can only
+		// come after both, because delEipQoS reads the rules to remove off the old policy and
+		// releasing it early would let it be collected with its bandwidth rules still programmed.
 		if err = c.patchEipLabel(key); err != nil {
 			klog.Errorf("failed to label qos in eip, %v", err)
 			return err
@@ -404,18 +444,16 @@ func (c *Controller) createEipInPod(dp, addrV4, ns string) error {
 	return c.execNatGwRules(gwPod, natGwEipAdd, []string{addrV4})
 }
 
-// natGwDeleted returns true when the VpcNatGateway CRD with the given name no
-// longer exists. A (true, nil) result means the gateway has been fully removed
-// and any in-pod cleanup can be safely skipped. Other errors are returned
-// as-is for the caller to handle.
+// natGwDeleted returns true when the VpcNatGateway CRD is gone or terminating.
 func (c *Controller) natGwDeleted(dp string) (bool, error) {
-	if _, err := c.vpcNatGatewayLister.Get(dp); err != nil {
+	gw, err := c.vpcNatGatewayLister.Get(dp)
+	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return true, nil
 		}
 		return false, err
 	}
-	return false, nil
+	return !gw.DeletionTimestamp.IsZero(), nil
 }
 
 func (c *Controller) deleteEipInPod(dp, v4Cidr, ns string) error {
@@ -462,20 +500,74 @@ func (c *Controller) addOrUpdateEIPBandwidthLimitRules(eip *kubeovnv1.IptablesEI
 	return nil
 }
 
+// getBindableEip returns the EIP a NAT rule (fip/dnat/snat) wants to bind to, refusing the
+// ones which are being deleted. Bindings established against a terminating EIP would keep its
+// finalizer alive forever, since the EIP waits for all NAT rules referencing it to go away.
+// This check and the caller's credential write are not atomic, see the binding rules in
+// CODE_STYLE.md for the window that remains and why it is bounded rather than eliminated.
+func (c *Controller) getBindableEip(eipName string) (*kubeovnv1.IptablesEIP, error) {
+	eip, err := c.GetEip(eipName)
+	if err != nil {
+		return nil, err
+	}
+	if !eip.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("eip %s is terminating, retry later", eipName)
+	}
+	// The rules land in the gateway pod, so binding to a gateway on its way out only programs a
+	// pod that is about to disappear.
+	if err := c.checkNatGwNotTerminating(eip.Spec.NatGwDp); err != nil {
+		return nil, err
+	}
+	return eip, nil
+}
+
+func (c *Controller) checkNatGwNotTerminating(gwName string) error {
+	gw, err := c.vpcNatGatewayLister.Get(gwName)
+	if err != nil {
+		klog.Errorf("failed to get vpc nat gw %s, %v", gwName, err)
+		return err
+	}
+	if !gw.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("vpc nat gw %s is terminating, retry later", gwName)
+	}
+	return nil
+}
+
+func (c *Controller) getBindableQoSPolicy(qosPolicyName string) (*kubeovnv1.QoSPolicy, error) {
+	if qosPolicyName == "" {
+		return nil, nil
+	}
+	qosPolicy, err := c.qosPoliciesLister.Get(qosPolicyName)
+	if err != nil {
+		// A referenced policy that does not exist must not be reported as bindable: the caller
+		// would stamp an empty UID credential the in-use check can never match.
+		klog.Errorf("failed to get qos policy %s, %v", qosPolicyName, err)
+		return nil, err
+	}
+	if !qosPolicy.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("qos policy %s is terminating, retry later", qosPolicyName)
+	}
+	return qosPolicy, nil
+}
+
+func (c *Controller) checkQoSPolicyNotTerminating(qosPolicyName string) error {
+	_, err := c.getBindableQoSPolicy(qosPolicyName)
+	return err
+}
+
 // add tc rule for eip in nat gw pod
 func (c *Controller) addEipQoS(eip *kubeovnv1.IptablesEIP, v4ip string) error {
 	var err error
+	// Reporting success for a missing policy would leave the EIP ready while its QoS rules are absent.
 	qosPolicy, err := c.qosPoliciesLister.Get(eip.Spec.QoSPolicy)
 	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
 		klog.Errorf("failed to get qos policy %s, %v", eip.Spec.QoSPolicy, err)
 		return err
 	}
 	if !qosPolicy.Status.Shared {
 		eips, err := c.iptablesEipsLister.List(
-			labels.SelectorFromSet(labels.Set{util.QoSLabel: qosPolicy.Name}))
+			labels.SelectorFromSet(labels.Set{util.QoSPolicyUIDLabel: string(qosPolicy.UID)}),
+		)
 		if err != nil {
 			klog.Errorf("failed to get eip list, %v", err)
 			return err
@@ -645,6 +737,14 @@ func (c *Controller) GetGwBySubnet(name string) (string, string, error) {
 }
 
 func (c *Controller) createOrUpdateEipCR(key, v4ip, v6ip, mac, natGwDp, qos, externalNet, gwNamespace string) error {
+	qosPolicy, err := c.getBindableQoSPolicy(qos)
+	if err != nil {
+		return err
+	}
+	qosPolicyUID := ""
+	if qosPolicy != nil {
+		qosPolicyUID = string(qosPolicy.UID)
+	}
 	needCreate := false
 	cachedEip, err := c.iptablesEipsLister.Get(key)
 	if err != nil {
@@ -666,6 +766,8 @@ func (c *Controller) createOrUpdateEipCR(key, v4ip, v6ip, mac, natGwDp, qos, ext
 					util.SubnetNameLabel:        externalNet,
 					util.EipV4IpLabel:           v4ip,
 					util.VpcNatGatewayNameLabel: natGwDp,
+					util.QoSLabel:               qos,
+					util.QoSPolicyUIDLabel:      qosPolicyUID,
 				},
 			},
 			Spec: kubeovnv1.IptablesEIPSpec{
@@ -700,10 +802,8 @@ func (c *Controller) createOrUpdateEipCR(key, v4ip, v6ip, mac, natGwDp, qos, ext
 		eip.Labels[util.SubnetNameLabel] = externalNet
 		eip.Labels[util.VpcNatGatewayNameLabel] = natGwDp
 		eip.Labels[util.EipV4IpLabel] = v4ip
-		if eip.Spec.QoSPolicy != "" {
-			eip.Labels[util.QoSLabel] = eip.Spec.QoSPolicy
-		}
-
+		eip.Labels[util.QoSLabel] = qos
+		eip.Labels[util.QoSPolicyUIDLabel] = qosPolicyUID
 		if v4ip != "" {
 			klog.V(3).Infof("update eip cr %s", key)
 			eip.Spec.V4ip = v4ip
@@ -874,9 +974,9 @@ func (c *Controller) patchEipQoSStatus(key, qos string) error {
 	return nil
 }
 
-func (c *Controller) getIptablesEipNat(eipV4IP string) (string, error) {
+func (c *Controller) getIptablesEipNat(eip *kubeovnv1.IptablesEIP) (string, error) {
 	nats := make([]string, 0, 3)
-	selector := labels.SelectorFromSet(labels.Set{util.EipV4IpLabel: eipV4IP})
+	selector := labels.SelectorFromSet(labels.Set{util.EipUIDLabel: string(eip.UID)})
 	dnats, err := c.iptablesDnatRulesLister.List(selector)
 	if err != nil {
 		klog.Errorf("failed to get dnats, %v", err)
@@ -905,6 +1005,44 @@ func (c *Controller) getIptablesEipNat(eipV4IP string) (string, error) {
 	return nat, nil
 }
 
+// getIptablesEipNatFromAPI reports which NAT rules reference the EIP, reading from the API server
+// rather than the informer cache. The finalizer release decision must not run on a cache that has
+// not observed a freshly written reference yet, or the EIP is dropped while rules still claim it.
+func (c *Controller) getIptablesEipNatFromAPI(eip *kubeovnv1.IptablesEIP) (string, error) {
+	// Do not set a Limit here: with a label selector the server may return zero items alongside a
+	// continue token, and this result decides whether the EIP's finalizer is released.
+	opts := metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{util.EipUIDLabel: string(eip.UID)}).String(),
+	}
+	client := c.config.KubeOvnClient.KubeovnV1()
+	nats := make([]string, 0, 3)
+	dnats, err := client.IptablesDnatRules().List(context.Background(), opts)
+	if err != nil {
+		klog.Errorf("failed to list dnats, %v", err)
+		return "", err
+	}
+	if len(dnats.Items) != 0 {
+		nats = append(nats, util.DnatUsingEip)
+	}
+	fips, err := client.IptablesFIPRules().List(context.Background(), opts)
+	if err != nil {
+		klog.Errorf("failed to list fips, %v", err)
+		return "", err
+	}
+	if len(fips.Items) != 0 {
+		nats = append(nats, util.FipUsingEip)
+	}
+	snats, err := client.IptablesSnatRules().List(context.Background(), opts)
+	if err != nil {
+		klog.Errorf("failed to list snats, %v", err)
+		return "", err
+	}
+	if len(snats.Items) != 0 {
+		nats = append(nats, util.SnatUsingEip)
+	}
+	return strings.Join(nats, ","), nil
+}
+
 func (c *Controller) patchEipStatus(key, v4ip, redo, qos string, ready bool) error {
 	oriEip, err := c.iptablesEipsLister.Get(key)
 	if err != nil {
@@ -931,7 +1069,7 @@ func (c *Controller) patchEipStatus(key, v4ip, redo, qos string, ready bool) err
 		changed = true
 	}
 
-	nat, err := c.getIptablesEipNat(oriEip.Spec.V4ip)
+	nat, err := c.getIptablesEipNat(oriEip)
 	if err != nil {
 		err = fmt.Errorf("failed to get eip nat: %w", err)
 		klog.Error(err)
@@ -978,6 +1116,32 @@ func (c *Controller) patchEipLabel(eipName string) error {
 	}
 	externalNetwork := util.GetExternalNetwork(oriEip.Spec.ExternalSubnet)
 
+	// patchEipLabel writes util.QoSLabel and util.QoSPolicyUIDLabel on the update/redo path, and the
+	// QoS policy in-use check is keyed on the UID label. Refuse to point a live EIP at a terminating
+	// QoS policy: handleResetIptablesEip runs from a 3s delayed queue keyed by the EIP name, so it
+	// can otherwise attach the tombstone of a previous instance to a freshly recreated EIP of the
+	// same name.
+	// Only a reference that would actually change is rejected. Rewriting the label the EIP already
+	// carries adds nothing to the in-use count, and failing it would abort the whole gateway's redo
+	// loop in handleUpdateVpcFloatingIP, which gives up on the first error and would leave unrelated
+	// FIPs unapplied after a gateway pod restart.
+	// A terminating EIP is exempt too: it establishes no new binding, its own deletion is unblocked
+	// by the status patch handleResetIptablesEip issues right after this call, and the QoS policy is
+	// released anyway once the EIP DeleteFunc fires.
+	qosPolicy, qosErr := c.getBindableQoSPolicy(oriEip.Spec.QoSPolicy)
+	if qosErr != nil && oriEip.DeletionTimestamp.IsZero() && oriEip.Labels[util.QoSLabel] != oriEip.Spec.QoSPolicy {
+		return qosErr
+	}
+	// On an exempt path the policy is unreadable, so keep the recorded UID: clearing it would drop
+	// this reference from the in-use count while the EIP still points at the policy.
+	qosPolicyUID := oriEip.Labels[util.QoSPolicyUIDLabel]
+	if qosErr == nil {
+		qosPolicyUID = ""
+		if qosPolicy != nil {
+			qosPolicyUID = string(qosPolicy.UID)
+		}
+	}
+
 	eip := oriEip.DeepCopy()
 	var needUpdateLabel bool
 	var op string
@@ -988,15 +1152,18 @@ func (c *Controller) patchEipLabel(eipName string) error {
 			util.SubnetNameLabel:        externalNetwork,
 			util.VpcNatGatewayNameLabel: eip.Spec.NatGwDp,
 			util.QoSLabel:               eip.Spec.QoSPolicy,
+			util.QoSPolicyUIDLabel:      qosPolicyUID,
 			util.EipV4IpLabel:           eip.Spec.V4ip,
 		}
 	} else if eip.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp || eip.Labels[util.QoSLabel] != eip.Spec.QoSPolicy ||
-		eip.Labels[util.SubnetNameLabel] != externalNetwork || eip.Labels[util.EipV4IpLabel] != eip.Spec.V4ip {
+		eip.Labels[util.QoSPolicyUIDLabel] != qosPolicyUID || eip.Labels[util.SubnetNameLabel] != externalNetwork ||
+		eip.Labels[util.EipV4IpLabel] != eip.Spec.V4ip {
 		op = "replace"
 		needUpdateLabel = true
 		eip.Labels[util.SubnetNameLabel] = externalNetwork
 		eip.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
 		eip.Labels[util.QoSLabel] = eip.Spec.QoSPolicy
+		eip.Labels[util.QoSPolicyUIDLabel] = qosPolicyUID
 		eip.Labels[util.EipV4IpLabel] = eip.Spec.V4ip
 	}
 	if needUpdateLabel {
@@ -1005,5 +1172,5 @@ func (c *Controller) patchEipLabel(eipName string) error {
 			return err
 		}
 	}
-	return err
+	return nil
 }

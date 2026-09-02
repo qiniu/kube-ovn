@@ -24,7 +24,7 @@ import (
 func (c *Controller) enqueueAddIptablesFip(obj any) {
 	fip := obj.(*kubeovnv1.IptablesFIPRule)
 	key := cache.MetaObjectToName(fip).String()
-	// A terminating object reconciles via the update queue for cleanup (handleAdd skips it; resync=0).
+	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesFipQueue, key, "fip", fip.DeletionTimestamp) {
 		return
 	}
@@ -80,7 +80,7 @@ func (c *Controller) enqueueDelIptablesFip(obj any) {
 func (c *Controller) enqueueAddIptablesDnatRule(obj any) {
 	dnat := obj.(*kubeovnv1.IptablesDnatRule)
 	key := cache.MetaObjectToName(dnat).String()
-	// A terminating object reconciles via the update queue for cleanup (handleAdd skips it; resync=0).
+	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesDnatRuleQueue, key, "dnat", dnat.DeletionTimestamp) {
 		return
 	}
@@ -141,7 +141,7 @@ func (c *Controller) enqueueDelIptablesDnatRule(obj any) {
 func (c *Controller) enqueueAddIptablesSnatRule(obj any) {
 	snat := obj.(*kubeovnv1.IptablesSnatRule)
 	key := cache.MetaObjectToName(snat).String()
-	// A terminating object reconciles via the update queue for cleanup (handleAdd skips it; resync=0).
+	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesSnatRuleQueue, key, "snat", snat.DeletionTimestamp) {
 		return
 	}
@@ -218,6 +218,10 @@ func (c *Controller) handleAddIptablesFip(key string) error {
 		klog.Error(err)
 		return err
 	}
+	// The key may have been queued while the object was still live; the update queue owns cleanup.
+	if !fip.DeletionTimestamp.IsZero() {
+		return nil
+	}
 
 	if vpcNatEnabled != "true" {
 		return errors.New("iptables nat gw not enable")
@@ -237,13 +241,13 @@ func (c *Controller) handleAddIptablesFip(key string) error {
 		return err
 	}
 
-	eip, err := c.GetEip(fip.Spec.EIP)
+	eip, err := c.getBindableEip(fip.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
 		return err
 	}
 
-	if err = c.fipTryUseEip(key, eip.Spec.V4ip); err != nil {
+	if err = c.fipTryUseEip(key, eip); err != nil {
 		err = fmt.Errorf("failed to create fip %s, %w", key, err)
 		klog.Error(err)
 		return err
@@ -259,6 +263,13 @@ func (c *Controller) handleAddIptablesFip(key string) error {
 		return err
 	}
 
+	// Claim the EIP before touching the gateway pod: the EIP in-use check counts this label, so a
+	// claim written only after the rules exist can be missed by a concurrent EIP release.
+	if err = c.patchFipLabel(key, eip); err != nil {
+		klog.Errorf("failed to update label for fip %s, %v", key, err)
+		return err
+	}
+
 	if err = c.createFipInPod(eip.Spec.NatGwDp, eip.Status.IP, fip.Spec.InternalIP); err != nil {
 		klog.Errorf("failed to create fip, %v", err)
 		return err
@@ -267,26 +278,21 @@ func (c *Controller) handleAddIptablesFip(key string) error {
 		klog.Errorf("failed to patch status for fip %s, %v", key, err)
 		return err
 	}
-	// label too long cause error
-	if err = c.patchFipLabel(key, eip); err != nil {
-		klog.Errorf("failed to update label for fip %s, %v", key, err)
-		return err
-	}
 	if err = c.patchEipStatus(fip.Spec.EIP, "", "", "", true); err != nil {
 		// refresh eip nats
 		klog.Errorf("failed to patch fip use eip %s, %v", key, err)
 		return err
 	}
-	// patchFipLabel updated the FIP's EipV4IpLabel via the API, but the informer cache
+	// patchFipLabel updated the FIP's EipUIDLabel via the API, but the informer cache
 	// may not have synced yet when patchEipStatus called getIptablesEipNat above, causing
 	// it to miss the FIP and leave EIP.Status.Nat stale. Schedule a delayed reset.
 	c.resetIptablesEipQueue.AddAfter(fip.Spec.EIP, 3*time.Second)
 	return nil
 }
 
-func (c *Controller) fipTryUseEip(fipName, eipV4IP string) error {
+func (c *Controller) fipTryUseEip(fipName string, eip *kubeovnv1.IptablesEIP) error {
 	// check if has another fip using this eip already
-	selector := labels.SelectorFromSet(labels.Set{util.EipV4IpLabel: eipV4IP})
+	selector := labels.SelectorFromSet(labels.Set{util.EipUIDLabel: string(eip.UID)})
 	usingFips, err := c.iptablesFipsLister.List(selector)
 	if err != nil {
 		klog.Errorf("failed to get fips, %v", err)
@@ -294,7 +300,7 @@ func (c *Controller) fipTryUseEip(fipName, eipV4IP string) error {
 	}
 	for _, uf := range usingFips {
 		if uf.Name != fipName {
-			err = fmt.Errorf("%s is using by the other fip %s", eipV4IP, uf.Name)
+			err = fmt.Errorf("%s is using by the other fip %s", eip.Status.IP, uf.Name)
 			klog.Error(err)
 			return err
 		}
@@ -335,9 +341,9 @@ func (c *Controller) fipTryUseEip(fipName, eipV4IP string) error {
 //     Steps strictly ordered to maintain all 4 dimensions:
 //     a. patchFipStatus(ready=false)  (mark dimension 2 dirty; crash leaves a visible not-ready signal)
 //     b. finalDeleteFipInPod  (clean dimension 1 with old values from Status)
-//     c. createFipInPod  (create dimension 1 with new values from Spec+EIP)
-//     d. patchFipStatus  (update dimension 2 to match new iptables rule, mark ready=true)
-//     e. patchFipLabel   (update dimension 3 to match new EIP)
+//     c. patchFipLabel   (swap dimension 3 once the old rule is gone, before the new one exists)
+//     d. createFipInPod  (create dimension 1 with new values from Spec+EIP)
+//     e. patchFipStatus  (update dimension 2 to match new iptables rule, mark ready=true)
 //     f. patchEipStatus  (update dimension 4 on new EIP)
 //     g. resetOldEip     (async clean dimension 4 on old EIP, if EIP changed)
 //     If any step fails, returns error to retry. Iptables operations are idempotent.
@@ -385,13 +391,13 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 		return err
 	}
 
-	eip, err := c.GetEip(cachedFip.Spec.EIP)
+	eip, err := c.getBindableEip(cachedFip.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
 		return err
 	}
 
-	if err = c.fipTryUseEip(key, eip.Spec.V4ip); err != nil {
+	if err = c.fipTryUseEip(key, eip); err != nil {
 		err = fmt.Errorf("failed to update fip %s, %w", key, err)
 		klog.Error(err)
 		return err
@@ -445,6 +451,13 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 		if err = c.finalDeleteFipInPod(key, cachedFip); err != nil {
 			return err
 		}
+		// Swap the claim between the two pod operations: the old EIP stays claimed until its rule is
+		// gone, and the new one is claimed before its rule exists. The in-use check counts this label,
+		// so either edge would let a concurrent release drop a finalizer with a live rule behind it.
+		if err = c.patchFipLabel(key, eip); err != nil {
+			klog.Errorf("failed to update label for fip %s, %v", key, err)
+			return err
+		}
 		if err = c.createFipInPod(eip.Spec.NatGwDp, newV4ip, newInternalIP); err != nil {
 			klog.Errorf("failed to create fip %s, %v", key, err)
 			return err
@@ -453,14 +466,13 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 			klog.Errorf("failed to patch status for fip %s, %v", key, err)
 			return err
 		}
-		if err = c.patchFipLabel(key, eip); err != nil {
-			klog.Errorf("failed to update label for fip %s, %v", key, err)
-			return err
-		}
 		if err = c.patchEipStatus(cachedFip.Spec.EIP, "", "", "", true); err != nil {
 			klog.Errorf("failed to patch fip use eip %s, %v", key, err)
 			return err
 		}
+		// Same refresh the add path schedules: patchEipStatus read the new EIP's nat off the
+		// informer, which may not carry the label patched moments ago.
+		c.resetIptablesEipQueue.AddAfter(cachedFip.Spec.EIP, 3*time.Second)
 		// Reset old EIP after all 4 dimensions are updated.
 		// This must NOT be in enqueue — async reset there could race with handler's
 		// patchEipStatus, causing the old EIP's nat label to be cleared before the
@@ -540,6 +552,10 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 		klog.Error(err)
 		return err
 	}
+	// The key may have been queued while the object was still live; the update queue owns cleanup.
+	if !dnat.DeletionTimestamp.IsZero() {
+		return nil
+	}
 
 	if vpcNatEnabled != "true" {
 		return errors.New("iptables nat gw not enable")
@@ -559,7 +575,7 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 		return err
 	}
 
-	eip, err := c.GetEip(dnat.Spec.EIP)
+	eip, err := c.getBindableEip(dnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
 		return err
@@ -573,6 +589,13 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 	// leaving unmanaged iptables rules in the gateway pod.
 	if err = c.handleAddIptablesDnatFinalizer(key); err != nil {
 		klog.Errorf("failed to handle add finalizer for dnat, %v", err)
+		return err
+	}
+
+	// Claim the EIP before touching the gateway pod: the EIP in-use check counts this label, so a
+	// claim written only after the rules exist can be missed by a concurrent EIP release.
+	if err = c.patchDnatLabel(key, eip); err != nil {
+		klog.Errorf("failed to patch label for dnat %s, %v", key, err)
 		return err
 	}
 
@@ -603,17 +626,12 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 		klog.Errorf("failed to patch status for dnat %s, %v", key, err)
 		return err
 	}
-	// label too long cause error
-	if err = c.patchDnatLabel(key, eip); err != nil {
-		klog.Errorf("failed to patch label for dnat %s, %v", key, err)
-		return err
-	}
 	if err = c.patchEipStatus(dnat.Spec.EIP, "", "", "", true); err != nil {
 		// refresh eip nats
 		klog.Errorf("failed to patch dnat use eip %s, %v", key, err)
 		return err
 	}
-	// patchDnatLabel updated the DNAT's EipV4IpLabel via the API, but the informer cache
+	// patchDnatLabel updated the DNAT's EipUIDLabel via the API, but the informer cache
 	// may not have synced yet when patchEipStatus called getIptablesEipNat above, causing
 	// it to miss the DNAT and leave EIP.Status.Nat stale. Schedule a delayed reset.
 	c.resetIptablesEipQueue.AddAfter(dnat.Spec.EIP, 3*time.Second)
@@ -682,7 +700,7 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 		return err
 	}
 
-	eip, err := c.GetEip(cachedDnat.Spec.EIP)
+	eip, err := c.getBindableEip(cachedDnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
 		return err
@@ -749,6 +767,13 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 		if err = c.finalDeleteDnatInPod(key, cachedDnat); err != nil {
 			return err
 		}
+		// Swap the claim between the two pod operations: the old EIP stays claimed until its rule is
+		// gone, and the new one is claimed before its rule exists. The in-use check counts this label,
+		// so either edge would let a concurrent release drop a finalizer with a live rule behind it.
+		if err = c.patchDnatLabel(key, eip); err != nil {
+			klog.Errorf("failed to patch label for dnat %s, %v", key, err)
+			return err
+		}
 
 		switch cachedDnat.Spec.Type {
 		case kubeovnv1.DnatRuleTypeShare:
@@ -776,14 +801,13 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 			klog.Errorf("failed to patch status for dnat %s, %v", key, err)
 			return err
 		}
-		if err = c.patchDnatLabel(key, eip); err != nil {
-			klog.Errorf("failed to patch label for dnat %s, %v", key, err)
-			return err
-		}
 		if err = c.patchEipStatus(cachedDnat.Spec.EIP, "", "", "", true); err != nil {
 			klog.Errorf("failed to patch dnat use eip %s, %v", key, err)
 			return err
 		}
+		// Same refresh the add path schedules: patchEipStatus read the new EIP's nat off the
+		// informer, which may not carry the label patched moments ago.
+		c.resetIptablesEipQueue.AddAfter(cachedDnat.Spec.EIP, 3*time.Second)
 		// Reset old EIP after all 4 dimensions are updated.
 		// This must NOT be in enqueue — async reset there could race with handler's
 		// patchEipStatus, causing the old EIP's nat label to be cleared before the
@@ -886,6 +910,10 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 		klog.Error(err)
 		return err
 	}
+	// The key may have been queued while the object was still live; the update queue owns cleanup.
+	if !snat.DeletionTimestamp.IsZero() {
+		return nil
+	}
 
 	if vpcNatEnabled != "true" {
 		return errors.New("iptables nat gw not enable")
@@ -905,7 +933,7 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 		return err
 	}
 
-	eip, err := c.GetEip(snat.Spec.EIP)
+	eip, err := c.getBindableEip(snat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
 		return err
@@ -924,6 +952,14 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 		klog.Errorf("failed to handle add finalizer for snat, %v", err)
 		return err
 	}
+
+	// Claim the EIP before touching the gateway pod: the EIP in-use check counts this label, so a
+	// claim written only after the rules exist can be missed by a concurrent EIP release.
+	if err = c.patchSnatLabel(key, eip); err != nil {
+		klog.Errorf("failed to patch label for snat %s, %v", key, err)
+		return err
+	}
+
 	if err = c.createSnatInPod(eip.Spec.NatGwDp, eip.Status.IP, v4Cidr); err != nil {
 		klog.Errorf("failed to create snat, %v", err)
 		return err
@@ -932,16 +968,12 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 		klog.Errorf("failed to update status for snat %s, %v", key, err)
 		return err
 	}
-	if err = c.patchSnatLabel(key, eip); err != nil {
-		klog.Errorf("failed to patch label for snat %s, %v", key, err)
-		return err
-	}
 	if err = c.patchEipStatus(snat.Spec.EIP, "", "", "", true); err != nil {
 		// refresh eip nats
 		klog.Errorf("failed to patch snat use eip %s, %v", key, err)
 		return err
 	}
-	// patchSnatLabel updated the SNAT's EipV4IpLabel via the API, but the informer cache
+	// patchSnatLabel updated the SNAT's EipUIDLabel via the API, but the informer cache
 	// may not have synced yet when patchEipStatus called getIptablesEipNat above, causing
 	// it to silently miss the SNAT and leave EIP.Status.Nat stale. Schedule a delayed reset
 	// so that after the informer syncs the label, the EIP nat status is corrected.
@@ -1004,7 +1036,7 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		return err
 	}
 
-	eip, err := c.GetEip(cachedSnat.Spec.EIP)
+	eip, err := c.getBindableEip(cachedSnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
 		return err
@@ -1066,6 +1098,13 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		if err = c.finalDeleteSnatInPod(key, cachedSnat); err != nil {
 			return err
 		}
+		// Swap the claim between the two pod operations: the old EIP stays claimed until its rule is
+		// gone, and the new one is claimed before its rule exists. The in-use check counts this label,
+		// so either edge would let a concurrent release drop a finalizer with a live rule behind it.
+		if err = c.patchSnatLabel(key, eip); err != nil {
+			klog.Errorf("failed to patch label for snat %s, %v", key, err)
+			return err
+		}
 		if err = c.createSnatInPod(eip.Spec.NatGwDp, newV4ip, newV4Cidr); err != nil {
 			klog.Errorf("failed to create snat %s, %v", key, err)
 			return err
@@ -1074,14 +1113,13 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 			klog.Errorf("failed to patch status for snat %s, %v", key, err)
 			return err
 		}
-		if err = c.patchSnatLabel(key, eip); err != nil {
-			klog.Errorf("failed to patch label for snat %s, %v", key, err)
-			return err
-		}
 		if err = c.patchEipStatus(cachedSnat.Spec.EIP, "", "", "", true); err != nil {
 			klog.Errorf("failed to patch snat use eip %s, %v", key, err)
 			return err
 		}
+		// Same refresh the add path schedules: patchEipStatus read the new EIP's nat off the
+		// informer, which may not carry the label patched moments ago.
+		c.resetIptablesEipQueue.AddAfter(cachedSnat.Spec.EIP, 3*time.Second)
 		// Reset old EIP after all 4 dimensions are updated.
 		// This must NOT be in enqueue — async reset there could race with handler's
 		// patchEipStatus, causing the old EIP's nat label to be cleared before the
@@ -1300,13 +1338,16 @@ func (c *Controller) patchFipLabel(key string, eip *kubeovnv1.IptablesEIP) error
 		fip.Labels = map[string]string{
 			util.VpcNatGatewayNameLabel: eip.Spec.NatGwDp,
 			util.EipV4IpLabel:           eip.Spec.V4ip,
+			util.EipUIDLabel:            string(eip.UID),
 		}
 		needUpdateLabel = true
 	} else if fip.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp ||
-		fip.Labels[util.EipV4IpLabel] != eip.Spec.V4ip {
+		fip.Labels[util.EipV4IpLabel] != eip.Spec.V4ip ||
+		fip.Labels[util.EipUIDLabel] != string(eip.UID) {
 		op = "replace"
 		fip.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
 		fip.Labels[util.EipV4IpLabel] = eip.Spec.V4ip
+		fip.Labels[util.EipUIDLabel] = string(eip.UID)
 		needUpdateLabel = true
 	}
 	if needUpdateLabel {
@@ -1506,15 +1547,18 @@ func (c *Controller) patchDnatLabel(key string, eip *kubeovnv1.IptablesEIP) erro
 			util.VpcNatGatewayNameLabel: eip.Spec.NatGwDp,
 			util.VpcDnatEPortLabel:      dnat.Spec.ExternalPort,
 			util.EipV4IpLabel:           eip.Spec.V4ip,
+			util.EipUIDLabel:            string(eip.UID),
 		}
 		needUpdateLabel = true
 	} else if dnat.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp ||
 		dnat.Labels[util.VpcDnatEPortLabel] != dnat.Spec.ExternalPort ||
-		dnat.Labels[util.EipV4IpLabel] != eip.Spec.V4ip {
+		dnat.Labels[util.EipV4IpLabel] != eip.Spec.V4ip ||
+		dnat.Labels[util.EipUIDLabel] != string(eip.UID) {
 		op = "replace"
 		dnat.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
 		dnat.Labels[util.VpcDnatEPortLabel] = dnat.Spec.ExternalPort
 		dnat.Labels[util.EipV4IpLabel] = eip.Spec.V4ip
+		dnat.Labels[util.EipUIDLabel] = string(eip.UID)
 		needUpdateLabel = true
 	}
 	if needUpdateLabel {
@@ -1647,13 +1691,16 @@ func (c *Controller) patchSnatLabel(key string, eip *kubeovnv1.IptablesEIP) erro
 		snat.Labels = map[string]string{
 			util.VpcNatGatewayNameLabel: eip.Spec.NatGwDp,
 			util.EipV4IpLabel:           eip.Spec.V4ip,
+			util.EipUIDLabel:            string(eip.UID),
 		}
 		needUpdateLabel = true
 	} else if snat.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp ||
-		snat.Labels[util.EipV4IpLabel] != eip.Spec.V4ip {
+		snat.Labels[util.EipV4IpLabel] != eip.Spec.V4ip ||
+		snat.Labels[util.EipUIDLabel] != string(eip.UID) {
 		op = "replace"
 		snat.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
 		snat.Labels[util.EipV4IpLabel] = eip.Spec.V4ip
+		snat.Labels[util.EipUIDLabel] = string(eip.UID)
 		needUpdateLabel = true
 	}
 	if needUpdateLabel {
@@ -1887,6 +1934,10 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 		klog.Warningf("dnat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
 	} else if cachedDnat.Spec.Type == kubeovnv1.DnatRuleTypeShare {
 		// Share type: rebuild nft rule with remaining backends, or delete if none are left
+		// TODO(#73): on a rebind this passes the new EIP while the rule being cleaned belongs to the
+		// old one, so getShareBackends collects siblings from the wrong EIP and the rebuilt map can
+		// drop or delete rules that are still in use. Fixing it needs the old EIP name kept in Status
+		// or an annotation; pre-existing, tracked separately from the terminating-binding work.
 		if err := c.cleanupShareDnatInPod(key, statusNatGwDp, cachedDnat.Spec.EIP, statusProtocol, statusV4ip, statusExternalPort, cachedDnat.Name); err != nil {
 			klog.Error(err)
 			firstErr = err
@@ -2191,6 +2242,9 @@ func (c *Controller) patchIptableInfo(name, natType, patchPayload string) error 
 	case "eip":
 		_, err = c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Patch(context.Background(), name,
 			types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{})
+	default:
+		// Silently writing nothing would strand the startup backfill until its poll deadline.
+		return fmt.Errorf("unknown nat type %s", natType)
 	}
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
