@@ -528,3 +528,94 @@ func TestSyncVpcNatGatewayCRSkipsTerminating(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, stored.Labels[util.QoSPolicyUIDLabel], "a terminating gateway establishes no binding")
 }
+
+// TestSyncNatUIDLabelsMigratesExistingBindings is the counterpart to the skip test: refusing to
+// stamp a terminating object must not drop a binding that is already programmed. An older
+// controller only wrote the address label, so on upgrade these rules carry no UID and the release
+// check, which selects on UID alone, would see the EIP as unreferenced.
+func TestSyncNatUIDLabelsMigratesExistingBindings(t *testing.T) {
+	now := metav1.Now()
+	fin := []string{util.KubeOVNControllerFinalizer}
+
+	dyingEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "dying-eip", UID: "dying-eip-uid", DeletionTimestamp: &now, Finalizers: fin},
+	}
+	dyingQoS := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "dying-qos", UID: "dying-qos-uid", DeletionTimestamp: &now, Finalizers: fin},
+	}
+	// Terminating rule whose old-style credential proves the rule reached the gateway pod.
+	dyingFip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "bound-fip",
+			DeletionTimestamp: &now,
+			Finalizers:        fin,
+			Labels:            map[string]string{util.EipV4IpLabel: "1.1.1.1"},
+		},
+		Spec: kubeovnv1.IptablesFIPRuleSpec{EIP: "dying-eip"},
+	}
+	// Live rule bound through status rather than the old label.
+	boundSnat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "bound-snat"},
+		Spec:       kubeovnv1.IptablesSnatRuleSpec{EIP: "dying-eip"},
+		Status:     kubeovnv1.IptablesSnatRuleStatus{V4ip: "1.1.1.1"},
+	}
+	// Live EIP already bound to a policy that is now terminating.
+	boundEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "bound-eip",
+			UID:    "bound-eip-uid",
+			Labels: map[string]string{util.QoSLabel: "dying-qos"},
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{QoSPolicy: "dying-qos"},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:       []*kubeovnv1.QoSPolicy{dyingQoS},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{dyingEip, boundEip},
+		IptablesFIPs:      []*kubeovnv1.IptablesFIPRule{dyingFip},
+		IptablesSnatRules: []*kubeovnv1.IptablesSnatRule{boundSnat},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.syncNatUIDLabels(t.Context()))
+
+	kc := c.config.KubeOvnClient.KubeovnV1()
+	fip, err := kc.IptablesFIPRules().Get(t.Context(), "bound-fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "dying-eip-uid", fip.Labels[util.EipUIDLabel], "a programmed rule must keep counting")
+
+	snat, err := kc.IptablesSnatRules().Get(t.Context(), "bound-snat", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "dying-eip-uid", snat.Labels[util.EipUIDLabel], "status proves the rule exists")
+
+	eip, err := kc.IptablesEIPs().Get(t.Context(), "bound-eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "dying-qos-uid", eip.Labels[util.QoSPolicyUIDLabel], "an established qos binding must migrate")
+}
+
+// TestSyncNatUIDLabelsClearsDroppedQoS covers the credential an interrupted run can strand. The
+// update handler only rewrites these labels when spec and status disagree, which they no longer
+// do once the reference is gone, so nothing else would ever stop counting this referrer.
+func TestSyncNatUIDLabelsClearsDroppedQoS(t *testing.T) {
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "eip",
+			UID:    "eip-uid",
+			Labels: map[string]string{util.QoSLabel: "gone-qos", util.QoSPolicyUIDLabel: "gone-qos-uid"},
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{QoSPolicy: ""},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.syncNatUIDLabels(t.Context()))
+
+	stored, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, stored.Labels[util.QoSLabel])
+	require.Empty(t, stored.Labels[util.QoSPolicyUIDLabel], "a dropped reference must stop counting")
+}

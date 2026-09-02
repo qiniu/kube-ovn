@@ -918,7 +918,17 @@ func (c *Controller) syncNatUIDLabels(ctx context.Context) error {
 	return c.waitNatLabelClaimsSynced(ctx, claims)
 }
 
-func (c *Controller) backfillEipUIDLabel(name, natType, eipName string, current map[string]string) (natLabelClaim, bool, error) {
+// natRuleBound reports whether the rule already has a programmed binding, either through the
+// address label an older controller wrote or through the status its own cleanup reads back.
+func natRuleBound(current map[string]string, statusV4ip string) bool {
+	return current[util.EipV4IpLabel] != "" || statusV4ip != ""
+}
+
+// backfillEipUIDLabel migrates an existing binding to the UID credential. bound separates that
+// from a reference that was never programmed: only the latter is refused when either side is
+// terminating, because a rule that is already in the gateway pod has to keep being counted no
+// matter which end is on its way out.
+func (c *Controller) backfillEipUIDLabel(name, natType, eipName string, bound bool, current map[string]string) (natLabelClaim, bool, error) {
 	eip, err := c.iptablesEipsLister.Get(eipName)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -928,9 +938,7 @@ func (c *Controller) backfillEipUIDLabel(name, natType, eipName string, current 
 		klog.Errorf("failed to get eip %s, %v", eipName, err)
 		return natLabelClaim{}, false, err
 	}
-	// Same reason as the QoS side: the normal writers refuse a terminating EIP, so backfilling a
-	// claim onto it would revive a reference the release path was about to stop counting.
-	if !eip.DeletionTimestamp.IsZero() {
+	if !bound && !eip.DeletionTimestamp.IsZero() {
 		klog.Warningf("skip syncing %s %s eip uid label, eip %s is terminating", natType, name, eipName)
 		return natLabelClaim{}, false, nil
 	}
@@ -953,10 +961,11 @@ func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, fip := range fips {
-		if !fip.DeletionTimestamp.IsZero() {
+		bound := natRuleBound(fip.Labels, fip.Status.V4ip)
+		if !bound && !fip.DeletionTimestamp.IsZero() {
 			continue
 		}
-		claim, ok, err := c.backfillEipUIDLabel(fip.Name, util.FipUsingEip, fip.Spec.EIP, fip.Labels)
+		claim, ok, err := c.backfillEipUIDLabel(fip.Name, util.FipUsingEip, fip.Spec.EIP, bound, fip.Labels)
 		if err != nil {
 			return nil, err
 		}
@@ -971,10 +980,11 @@ func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, dnat := range dnats {
-		if !dnat.DeletionTimestamp.IsZero() {
+		bound := natRuleBound(dnat.Labels, dnat.Status.V4ip)
+		if !bound && !dnat.DeletionTimestamp.IsZero() {
 			continue
 		}
-		claim, ok, err := c.backfillEipUIDLabel(dnat.Name, util.DnatUsingEip, dnat.Spec.EIP, dnat.Labels)
+		claim, ok, err := c.backfillEipUIDLabel(dnat.Name, util.DnatUsingEip, dnat.Spec.EIP, bound, dnat.Labels)
 		if err != nil {
 			return nil, err
 		}
@@ -989,10 +999,11 @@ func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, snat := range snats {
-		if !snat.DeletionTimestamp.IsZero() {
+		bound := natRuleBound(snat.Labels, snat.Status.V4ip)
+		if !bound && !snat.DeletionTimestamp.IsZero() {
 			continue
 		}
-		claim, ok, err := c.backfillEipUIDLabel(snat.Name, util.SnatUsingEip, snat.Spec.EIP, snat.Labels)
+		claim, ok, err := c.backfillEipUIDLabel(snat.Name, util.SnatUsingEip, snat.Spec.EIP, bound, snat.Labels)
 		if err != nil {
 			return nil, err
 		}
@@ -1003,9 +1014,22 @@ func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabel
 	return claims, nil
 }
 
-func (c *Controller) qosUIDLabels(kind, name, qosName string, current map[string]string) (map[string]string, string, bool, error) {
+// qosUIDLabels resolves the QoS credential a referrer should carry. bound marks a binding that is
+// already programmed, which has to keep being counted even while either end terminates; an
+// unbound reference is refused against a terminating policy the same way the normal writers do.
+func (c *Controller) qosUIDLabels(kind, name, qosName string, bound bool, current map[string]string) (map[string]string, string, bool, error) {
 	if qosName == "" {
-		return nil, "", false, nil
+		// An interrupted run can leave the credential behind after the reference is dropped, and
+		// nothing else revisits it: the update handler only touches the labels when the spec and
+		// the status disagree, which they no longer do.
+		if current[util.QoSLabel] == "" && current[util.QoSPolicyUIDLabel] == "" {
+			return nil, "", false, nil
+		}
+		klog.Warningf("clearing stale qos labels on %s %s, its qos reference is gone", kind, name)
+		newLabels := copyLabels(current)
+		delete(newLabels, util.QoSLabel)
+		delete(newLabels, util.QoSPolicyUIDLabel)
+		return newLabels, "", true, nil
 	}
 	qos, err := c.qosPoliciesLister.Get(qosName)
 	if err != nil {
@@ -1016,9 +1040,7 @@ func (c *Controller) qosUIDLabels(kind, name, qosName string, current map[string
 		klog.Errorf("failed to get qos %s, %v", qosName, err)
 		return nil, "", false, err
 	}
-	// The normal writers refuse this through getBindableQoSPolicy; stamping it here would hand a
-	// policy that was free to go a fresh referrer and keep it Terminating.
-	if !qos.DeletionTimestamp.IsZero() {
+	if !bound && !qos.DeletionTimestamp.IsZero() {
 		klog.Warningf("skip syncing %s %s qos uid label, qos %s is terminating", kind, name, qosName)
 		return nil, "", false, nil
 	}
@@ -1039,10 +1061,11 @@ func (c *Controller) backfillNatQoSUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, eip := range eips {
-		if !eip.DeletionTimestamp.IsZero() {
+		bound := eip.Labels[util.QoSLabel] != "" || eip.Status.QoSPolicy != ""
+		if !bound && !eip.DeletionTimestamp.IsZero() {
 			continue
 		}
-		newLabels, uid, ok, err := c.qosUIDLabels("eip", eip.Name, eip.Spec.QoSPolicy, eip.Labels)
+		newLabels, uid, ok, err := c.qosUIDLabels("eip", eip.Name, eip.Spec.QoSPolicy, bound, eip.Labels)
 		if err != nil {
 			return nil, err
 		}
@@ -1061,10 +1084,11 @@ func (c *Controller) backfillNatQoSUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, gw := range gws {
-		if !gw.DeletionTimestamp.IsZero() {
+		bound := gw.Labels[util.QoSLabel] != "" || gw.Status.QoSPolicy != ""
+		if !bound && !gw.DeletionTimestamp.IsZero() {
 			continue
 		}
-		newLabels, uid, ok, err := c.qosUIDLabels(natGwLabelType, gw.Name, gw.Spec.QoSPolicy, gw.Labels)
+		newLabels, uid, ok, err := c.qosUIDLabels(natGwLabelType, gw.Name, gw.Spec.QoSPolicy, bound, gw.Labels)
 		if err != nil {
 			return nil, err
 		}
