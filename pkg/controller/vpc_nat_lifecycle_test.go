@@ -246,44 +246,63 @@ func TestQoSPolicyReleaseReadsThroughAPI(t *testing.T) {
 	require.NotEmpty(t, stored.Finalizers, "the policy is still referenced and must keep its finalizer")
 }
 
-// TestFipRebindClaimsEipBeforeTouchingPod pins the claim ordering on the update path. The EIP
-// in-use check counts the UID label, so a rebind that programs the gateway pod first leaves a
-// window where a concurrent release sees the new EIP as unused.
-func TestFipRebindClaimsEipBeforeTouchingPod(t *testing.T) {
+// TestFipRebindSwapsClaimBetweenPodOperations pins the claim ordering on the rebind path. The EIP
+// in-use check counts the UID label, so the old EIP has to stay claimed until its rule is gone and
+// the new one has to be claimed before its rule exists; either edge lets a concurrent release drop
+// a finalizer with a live rule behind it.
+func TestFipRebindSwapsClaimBetweenPodOperations(t *testing.T) {
 	old := vpcNatEnabled
 	vpcNatEnabled = "true"
 	t.Cleanup(func() { vpcNatEnabled = old })
 
-	gw := fakeGw("gw")
-	eip := &kubeovnv1.IptablesEIP{
-		ObjectMeta: metav1.ObjectMeta{Name: "new-eip", UID: "new-uid"},
-		Spec:       kubeovnv1.IptablesEIPSpec{V4ip: "2.2.2.2", NatGwDp: "gw"},
-		Status:     kubeovnv1.IptablesEIPStatus{IP: "2.2.2.2"},
+	newFip := func(statusNatGwDp string) *kubeovnv1.IptablesFIPRule {
+		return &kubeovnv1.IptablesFIPRule{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "fip",
+				Labels: map[string]string{util.VpcNatGatewayNameLabel: "gw", util.EipV4IpLabel: "1.1.1.1", util.EipUIDLabel: "old-uid"},
+			},
+			Spec: kubeovnv1.IptablesFIPRuleSpec{EIP: "new-eip", InternalIP: "10.0.0.1"},
+			Status: kubeovnv1.IptablesFIPRuleStatus{
+				V4ip: "1.1.1.1", NatGwDp: statusNatGwDp, InternalIP: "10.0.0.1", Ready: true,
+			},
+		}
 	}
-	fip := &kubeovnv1.IptablesFIPRule{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "fip",
-			Labels: map[string]string{util.VpcNatGatewayNameLabel: "gw", util.EipV4IpLabel: "1.1.1.1", util.EipUIDLabel: "old-uid"},
-		},
-		Spec: kubeovnv1.IptablesFIPRuleSpec{EIP: "new-eip", InternalIP: "10.0.0.1"},
-		Status: kubeovnv1.IptablesFIPRuleStatus{
-			V4ip: "1.1.1.1", NatGwDp: "gw", InternalIP: "10.0.0.1", Ready: true,
-		},
+	setup := func(t *testing.T, fip *kubeovnv1.IptablesFIPRule) *Controller {
+		t.Helper()
+		eip := &kubeovnv1.IptablesEIP{
+			ObjectMeta: metav1.ObjectMeta{Name: "new-eip", UID: "new-uid"},
+			Spec:       kubeovnv1.IptablesEIPSpec{V4ip: "2.2.2.2", NatGwDp: "gw"},
+			Status:     kubeovnv1.IptablesEIPStatus{IP: "2.2.2.2"},
+		}
+		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+			VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("gw")},
+			IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+			IptablesFIPs:   []*kubeovnv1.IptablesFIPRule{fip},
+		})
+		require.NoError(t, err)
+		return fc.fakeController
 	}
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
-		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
-		IptablesFIPs:   []*kubeovnv1.IptablesFIPRule{fip},
+	storedLabel := func(t *testing.T, c *Controller) string {
+		t.Helper()
+		stored, err := c.config.KubeOvnClient.KubeovnV1().IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
+		require.NoError(t, err)
+		return stored.Labels[util.EipUIDLabel]
+	}
+
+	t.Run("old claim is kept while the old rule removal fails", func(t *testing.T) {
+		// Status points at the live gateway, whose pod is absent, so the removal errors out.
+		c := setup(t, newFip("gw"))
+		require.Error(t, c.handleUpdateIptablesFip("fip"))
+		require.Equal(t, "old-uid", storedLabel(t, c), "releasing the old EIP here would orphan its rule")
 	})
-	require.NoError(t, err)
-	c := fc.fakeController
 
-	// The gateway pod does not exist, so the rebind fails once it reaches the data plane.
-	require.Error(t, c.handleUpdateIptablesFip("fip"))
-
-	stored, err := c.config.KubeOvnClient.KubeovnV1().IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Equal(t, "new-uid", stored.Labels[util.EipUIDLabel], "the claim must survive a failed data-plane step")
+	t.Run("new claim is written before the new rule", func(t *testing.T) {
+		// Status points at a gateway that is already gone, so the removal is a no-op and the run
+		// gets as far as creating the new rule, which fails on the missing pod.
+		c := setup(t, newFip("retired-gw"))
+		require.Error(t, c.handleUpdateIptablesFip("fip"))
+		require.Equal(t, "new-uid", storedLabel(t, c), "the claim must land before the rule it covers")
+	})
 }
 
 // TestCreateOrUpdateEipCRClearsQoSLabels pins the update branch to the create branch: writing the

@@ -340,8 +340,8 @@ func (c *Controller) fipTryUseEip(fipName string, eip *kubeovnv1.IptablesEIP) er
 //     Old values come from Status; new values come from Spec + EIP CR.
 //     Steps strictly ordered to maintain all 4 dimensions:
 //     a. patchFipStatus(ready=false)  (mark dimension 2 dirty; crash leaves a visible not-ready signal)
-//     b. patchFipLabel   (claim dimension 3 on the new EIP before the pod is touched)
-//     c. finalDeleteFipInPod  (clean dimension 1 with old values from Status)
+//     b. finalDeleteFipInPod  (clean dimension 1 with old values from Status)
+//     c. patchFipLabel   (swap dimension 3 once the old rule is gone, before the new one exists)
 //     d. createFipInPod  (create dimension 1 with new values from Spec+EIP)
 //     e. patchFipStatus  (update dimension 2 to match new iptables rule, mark ready=true)
 //     f. patchEipStatus  (update dimension 4 on new EIP)
@@ -447,14 +447,15 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 				return err
 			}
 		}
-		// Claim the new EIP before touching the gateway pod, as the add path does: the EIP in-use
-		// check counts this label, so a claim written only after the rules exist can be missed.
-		if err = c.patchFipLabel(key, eip); err != nil {
-			klog.Errorf("failed to update label for fip %s, %v", key, err)
-			return err
-		}
 		// delete old rule; finalDeleteFipInPod resolves (natGwDp, v4ip) from Status
 		if err = c.finalDeleteFipInPod(key, cachedFip); err != nil {
+			return err
+		}
+		// Swap the claim between the two pod operations: the old EIP stays claimed until its rule is
+		// gone, and the new one is claimed before its rule exists. The in-use check counts this label,
+		// so either edge would let a concurrent release drop a finalizer with a live rule behind it.
+		if err = c.patchFipLabel(key, eip); err != nil {
+			klog.Errorf("failed to update label for fip %s, %v", key, err)
 			return err
 		}
 		if err = c.createFipInPod(eip.Spec.NatGwDp, newV4ip, newInternalIP); err != nil {
@@ -759,14 +760,15 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 				return err
 			}
 		}
-		// Claim the new EIP before touching the gateway pod, as the add path does: the EIP in-use
-		// check counts this label, so a claim written only after the rules exist can be missed.
-		if err = c.patchDnatLabel(key, eip); err != nil {
-			klog.Errorf("failed to patch label for dnat %s, %v", key, err)
-			return err
-		}
 		// delete old rule; finalDeleteDnatInPod resolves identity from Status
 		if err = c.finalDeleteDnatInPod(key, cachedDnat); err != nil {
+			return err
+		}
+		// Swap the claim between the two pod operations: the old EIP stays claimed until its rule is
+		// gone, and the new one is claimed before its rule exists. The in-use check counts this label,
+		// so either edge would let a concurrent release drop a finalizer with a live rule behind it.
+		if err = c.patchDnatLabel(key, eip); err != nil {
+			klog.Errorf("failed to patch label for dnat %s, %v", key, err)
 			return err
 		}
 
@@ -1086,14 +1088,15 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 				return err
 			}
 		}
-		// Claim the new EIP before touching the gateway pod, as the add path does: the EIP in-use
-		// check counts this label, so a claim written only after the rules exist can be missed.
-		if err = c.patchSnatLabel(key, eip); err != nil {
-			klog.Errorf("failed to patch label for snat %s, %v", key, err)
-			return err
-		}
 		// delete old rule; finalDeleteSnatInPod resolves identity from Status
 		if err = c.finalDeleteSnatInPod(key, cachedSnat); err != nil {
+			return err
+		}
+		// Swap the claim between the two pod operations: the old EIP stays claimed until its rule is
+		// gone, and the new one is claimed before its rule exists. The in-use check counts this label,
+		// so either edge would let a concurrent release drop a finalizer with a live rule behind it.
+		if err = c.patchSnatLabel(key, eip); err != nil {
+			klog.Errorf("failed to patch label for snat %s, %v", key, err)
 			return err
 		}
 		if err = c.createSnatInPod(eip.Spec.NatGwDp, newV4ip, newV4Cidr); err != nil {

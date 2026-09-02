@@ -164,9 +164,13 @@ Returning an error is enough, the work queues retry with backoff and never give 
 binding succeeds as soon as the tombstone is reclaimed.
 
 The check and the credential write are two calls against two different objects, so the pair is
-not atomic: the referenced object can start terminating in between. Writing the credential
-before any data-plane action, and reading it back from the API server rather than the informer
-cache on the release path, keeps that window from orphaning rules in a gateway pod. It does not
-make the two mutually exclusive. Closing the window completely means recording the reference on
-the referenced object itself under a resourceVersion precondition, which is a much larger change
-and is deliberately left for later.
+not atomic: the referenced object can start terminating in between. What keeps that window from
+orphaning rules in a gateway pod is that a rule is never programmed without a credential
+covering it: a new claim is written before the rule it covers exists, and an old claim is held
+until the rule it covers is gone. On a rebind that puts the swap between the two data-plane
+calls, not before both, since one label carries both claims. Where cleanup needs the referenced
+object to know what to undo, as `delEipQoS` does, the swap can only come after both. The release
+path reads the referrers back from the API server rather than the informer cache for the same
+reason. None of this makes the check and the write mutually exclusive. Closing the window
+completely means recording the reference on the referenced object itself under a resourceVersion
+precondition, which is a much larger change and is deliberately left for later.
