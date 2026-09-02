@@ -923,6 +923,12 @@ func (c *Controller) backfillEipUIDLabel(name, natType, eipName string, current 
 		klog.Errorf("failed to get eip %s, %v", eipName, err)
 		return natLabelClaim{}, false, err
 	}
+	// Same reason as the QoS side: the normal writers refuse a terminating EIP, so backfilling a
+	// claim onto it would revive a reference the release path was about to stop counting.
+	if !eip.DeletionTimestamp.IsZero() {
+		klog.Warningf("skip syncing %s %s eip uid label, eip %s is terminating", natType, name, eipName)
+		return natLabelClaim{}, false, nil
+	}
 	uid := string(eip.UID)
 	if current[util.EipUIDLabel] == uid {
 		return natLabelClaim{}, false, nil
@@ -942,6 +948,9 @@ func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, fip := range fips {
+		if !fip.DeletionTimestamp.IsZero() {
+			continue
+		}
 		claim, ok, err := c.backfillEipUIDLabel(fip.Name, util.FipUsingEip, fip.Spec.EIP, fip.Labels)
 		if err != nil {
 			return nil, err
@@ -957,6 +966,9 @@ func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, dnat := range dnats {
+		if !dnat.DeletionTimestamp.IsZero() {
+			continue
+		}
 		claim, ok, err := c.backfillEipUIDLabel(dnat.Name, util.DnatUsingEip, dnat.Spec.EIP, dnat.Labels)
 		if err != nil {
 			return nil, err
@@ -972,6 +984,9 @@ func (c *Controller) backfillNatEipUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, snat := range snats {
+		if !snat.DeletionTimestamp.IsZero() {
+			continue
+		}
 		claim, ok, err := c.backfillEipUIDLabel(snat.Name, util.SnatUsingEip, snat.Spec.EIP, snat.Labels)
 		if err != nil {
 			return nil, err
@@ -996,6 +1011,12 @@ func (c *Controller) qosUIDLabels(kind, name, qosName string, current map[string
 		klog.Errorf("failed to get qos %s, %v", qosName, err)
 		return nil, "", false, err
 	}
+	// The normal writers refuse this through getBindableQoSPolicy; stamping it here would hand a
+	// policy that was free to go a fresh referrer and keep it Terminating.
+	if !qos.DeletionTimestamp.IsZero() {
+		klog.Warningf("skip syncing %s %s qos uid label, qos %s is terminating", kind, name, qosName)
+		return nil, "", false, nil
+	}
 	uid := string(qos.UID)
 	if current[util.QoSLabel] == qosName && current[util.QoSPolicyUIDLabel] == uid {
 		return nil, "", false, nil
@@ -1013,6 +1034,9 @@ func (c *Controller) backfillNatQoSUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, eip := range eips {
+		if !eip.DeletionTimestamp.IsZero() {
+			continue
+		}
 		newLabels, uid, ok, err := c.qosUIDLabels("eip", eip.Name, eip.Spec.QoSPolicy, eip.Labels)
 		if err != nil {
 			return nil, err
@@ -1032,6 +1056,9 @@ func (c *Controller) backfillNatQoSUIDLabels(claims []natLabelClaim) ([]natLabel
 		return nil, err
 	}
 	for _, gw := range gws {
+		if !gw.DeletionTimestamp.IsZero() {
+			continue
+		}
 		newLabels, uid, ok, err := c.qosUIDLabels(natGwLabelType, gw.Name, gw.Spec.QoSPolicy, gw.Labels)
 		if err != nil {
 			return nil, err

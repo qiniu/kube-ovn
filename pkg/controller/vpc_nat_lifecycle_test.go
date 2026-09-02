@@ -356,3 +356,137 @@ func TestPatchIptableInfoRejectsUnknownType(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorContains(t, fc.fakeController.patchIptableInfo("name", "bogus", "[]"), "unknown nat type")
 }
+
+// TestSyncNatUIDLabelsSkipsTerminating keeps the startup backfill from writing credentials the
+// normal writers would refuse. Stamping a terminating policy or EIP revives a reference the
+// release path was about to stop counting, which is the deadlock this series removes.
+func TestSyncNatUIDLabelsSkipsTerminating(t *testing.T) {
+	now := metav1.Now()
+	fin := []string{util.KubeOVNControllerFinalizer}
+
+	dyingQoS := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "dying-qos", UID: "dying-qos-uid", DeletionTimestamp: &now, Finalizers: fin},
+	}
+	liveQoS := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "live-qos", UID: "live-qos-uid"}}
+	dyingEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "dying-eip", UID: "dying-eip-uid", DeletionTimestamp: &now, Finalizers: fin},
+	}
+	// Live referrer pointing at a terminating policy: the policy is free to go, so nothing may
+	// hand it a fresh claim.
+	liveEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "live-eip", UID: "live-eip-uid"},
+		Spec:       kubeovnv1.IptablesEIPSpec{QoSPolicy: "dying-qos"},
+	}
+	// Terminating referrer pointing at a live policy: it establishes no new binding.
+	dyingFip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "dying-fip", DeletionTimestamp: &now, Finalizers: fin},
+		Spec:       kubeovnv1.IptablesFIPRuleSpec{EIP: "live-eip"},
+	}
+	// Live referrer pointing at a terminating EIP.
+	liveSnat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "live-snat"},
+		Spec:       kubeovnv1.IptablesSnatRuleSpec{EIP: "dying-eip"},
+	}
+	dyingGw := fakeGw("dying-gw")
+	dyingGw.DeletionTimestamp = &now
+	dyingGw.Finalizers = fin
+	dyingGw.Spec.QoSPolicy = "live-qos"
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:       []*kubeovnv1.QoSPolicy{dyingQoS, liveQoS},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{dyingEip, liveEip},
+		IptablesFIPs:      []*kubeovnv1.IptablesFIPRule{dyingFip},
+		IptablesSnatRules: []*kubeovnv1.IptablesSnatRule{liveSnat},
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{dyingGw},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.syncNatUIDLabels(t.Context()))
+
+	kc := c.config.KubeOvnClient.KubeovnV1()
+	eip, err := kc.IptablesEIPs().Get(t.Context(), "live-eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, eip.Labels[util.QoSPolicyUIDLabel], "a terminating policy must not gain a referrer")
+
+	fip, err := kc.IptablesFIPRules().Get(t.Context(), "dying-fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, fip.Labels[util.EipUIDLabel], "a terminating referrer establishes no binding")
+
+	snat, err := kc.IptablesSnatRules().Get(t.Context(), "live-snat", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, snat.Labels[util.EipUIDLabel], "a terminating eip must not gain a referrer")
+
+	gw, err := kc.VpcNatGateways().Get(t.Context(), "dying-gw", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, gw.Labels[util.QoSPolicyUIDLabel], "a terminating gateway establishes no binding")
+}
+
+// TestEipCleanupSurvivesMissingSubnet keeps a gone external subnet from holding an EIP's
+// finalizer. The cleanup used to resolve the subnet before it even looked at DeletionTimestamp,
+// so an EIP outliving its subnet could never finish deleting.
+func TestEipCleanupSurvivesMissingSubnet(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "eip",
+			UID:               "eip-uid",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{util.KubeOVNControllerFinalizer},
+		},
+		// The subnet this points at is deliberately absent from the fixture.
+		Spec:   kubeovnv1.IptablesEIPSpec{ExternalSubnet: "gone-subnet", NatGwDp: "gw"},
+		Status: kubeovnv1.IptablesEIPStatus{IP: "1.1.1.1"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.handleUpdateIptablesEip("eip"))
+
+	stored, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, stored.Finalizers, "an unreferenced eip must release even without its subnet")
+}
+
+// TestPatchEipLabelClearsDroppedQoS pins the other half of the exempt-path rule: the recorded UID
+// is preserved only while the EIP still points at the policy. Dropping the reference must clear
+// both labels, or the policy keeps counting a referrer that no longer refers to it.
+func TestPatchEipLabelClearsDroppedQoS(t *testing.T) {
+	now := metav1.Now()
+	dying := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "qos",
+			UID:               "qos-uid",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{util.KubeOVNControllerFinalizer},
+		},
+	}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "eip",
+			Labels: map[string]string{util.QoSLabel: "qos", util.QoSPolicyUIDLabel: "qos-uid"},
+		},
+		// The reference is gone from the spec while the policy it named is still terminating.
+		Spec: kubeovnv1.IptablesEIPSpec{QoSPolicy: "", NatGwDp: "gw"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:  []*kubeovnv1.QoSPolicy{dying},
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.patchEipLabel("eip"))
+
+	stored, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, stored.Labels[util.QoSLabel])
+	require.Empty(t, stored.Labels[util.QoSPolicyUIDLabel], "a dropped reference must stop counting")
+}

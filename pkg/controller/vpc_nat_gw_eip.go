@@ -226,20 +226,8 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle update iptables eip %s", key)
 
-	subnetName := util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet)
-	subnet, err := c.subnetsLister.Get(subnetName)
-	if err != nil {
-		klog.Errorf("failed to get subnet %s: %v", subnetName, err)
-		return err
-	}
-
-	v4Cidr, _ := util.SplitStringIP(subnet.Spec.CIDRBlock)
-	if v4Cidr == "" {
-		err = fmt.Errorf("subnet %s does not support ipv4", subnet.Name)
-		klog.Error(err)
-		return err
-	}
-
+	// The cleanup path runs before the external subnet is resolved: a missing or malformed subnet
+	// must not hold the finalizer of an EIP that is already on its way out.
 	if !cachedEip.DeletionTimestamp.IsZero() {
 		klog.Infof("clean eip %q in pod", key)
 
@@ -258,15 +246,28 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 		}
 
 		if vpcNatEnabled == "true" {
-			v4ipCidr, err := util.GetIPAddrWithMask(cachedEip.Status.IP, v4Cidr)
-			if err != nil {
-				err = fmt.Errorf("failed to get eip %s with mask by cidr %s: %w", cachedEip.Status.IP, v4Cidr, err)
-				klog.Error(err)
+			var v4Cidr string
+			subnet, err := c.subnetsLister.Get(util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet))
+			switch {
+			case err == nil:
+				v4Cidr, _ = util.SplitStringIP(subnet.Spec.CIDRBlock)
+			case k8serrors.IsNotFound(err):
+				klog.Warningf("external subnet of eip %s is gone, skip cleaning its address in pod", key)
+			default:
+				klog.Errorf("failed to get external subnet of eip %s: %v", key, err)
 				return err
 			}
-			if err = c.deleteEipInPod(cachedEip.Spec.NatGwDp, v4ipCidr, c.natEipNamespace(cachedEip)); err != nil {
-				klog.Errorf("failed to clean eip '%s' in pod, %v", key, err)
-				return err
+			if v4Cidr != "" {
+				v4ipCidr, err := util.GetIPAddrWithMask(cachedEip.Status.IP, v4Cidr)
+				if err != nil {
+					err = fmt.Errorf("failed to get eip %s with mask by cidr %s: %w", cachedEip.Status.IP, v4Cidr, err)
+					klog.Error(err)
+					return err
+				}
+				if err = c.deleteEipInPod(cachedEip.Spec.NatGwDp, v4ipCidr, c.natEipNamespace(cachedEip)); err != nil {
+					klog.Errorf("failed to clean eip '%s' in pod, %v", key, err)
+					return err
+				}
 			}
 		}
 		if cachedEip.Status.QoSPolicy != "" {
@@ -287,6 +288,21 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 
 		return nil
 	}
+
+	subnetName := util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet)
+	subnet, err := c.subnetsLister.Get(subnetName)
+	if err != nil {
+		klog.Errorf("failed to get subnet %s: %v", subnetName, err)
+		return err
+	}
+
+	v4Cidr, _ := util.SplitStringIP(subnet.Spec.CIDRBlock)
+	if v4Cidr == "" {
+		err = fmt.Errorf("subnet %s does not support ipv4", subnet.Name)
+		klog.Error(err)
+		return err
+	}
+
 	klog.Infof("handle update eip %s", key)
 	// v6 ip address can not use upper case
 	if util.ContainsUppercase(cachedEip.Spec.V6ip) {
