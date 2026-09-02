@@ -470,6 +470,9 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 			klog.Errorf("failed to patch fip use eip %s, %v", key, err)
 			return err
 		}
+		// Same refresh the add path schedules: patchEipStatus read the new EIP's nat off the
+		// informer, which may not carry the label patched moments ago.
+		c.resetIptablesEipQueue.AddAfter(cachedFip.Spec.EIP, 3*time.Second)
 		// Reset old EIP after all 4 dimensions are updated.
 		// This must NOT be in enqueue — async reset there could race with handler's
 		// patchEipStatus, causing the old EIP's nat label to be cleared before the
@@ -802,6 +805,9 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 			klog.Errorf("failed to patch dnat use eip %s, %v", key, err)
 			return err
 		}
+		// Same refresh the add path schedules: patchEipStatus read the new EIP's nat off the
+		// informer, which may not carry the label patched moments ago.
+		c.resetIptablesEipQueue.AddAfter(cachedDnat.Spec.EIP, 3*time.Second)
 		// Reset old EIP after all 4 dimensions are updated.
 		// This must NOT be in enqueue — async reset there could race with handler's
 		// patchEipStatus, causing the old EIP's nat label to be cleared before the
@@ -1111,6 +1117,9 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 			klog.Errorf("failed to patch snat use eip %s, %v", key, err)
 			return err
 		}
+		// Same refresh the add path schedules: patchEipStatus read the new EIP's nat off the
+		// informer, which may not carry the label patched moments ago.
+		c.resetIptablesEipQueue.AddAfter(cachedSnat.Spec.EIP, 3*time.Second)
 		// Reset old EIP after all 4 dimensions are updated.
 		// This must NOT be in enqueue — async reset there could race with handler's
 		// patchEipStatus, causing the old EIP's nat label to be cleared before the
