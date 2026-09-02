@@ -871,6 +871,85 @@ func TestReadyEipAddReplayMarksUnavailableQoSNotReady(t *testing.T) {
 	require.False(t, storedEip.Status.Ready)
 }
 
+func TestNatRuleAddReplayRoutesCompleteStatusToUpdateWhenEipIsUnavailable(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip", UID: "new-eip-uid"},
+		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{IP: "1.1.1.1"},
+	}
+	readyFip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "ready-fip", Labels: map[string]string{util.EipUIDLabel: "new-eip-uid"}},
+		Spec:       kubeovnv1.IptablesFIPRuleSpec{EIP: "eip", InternalIP: "10.0.0.1"},
+		Status:     kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalIP: "10.0.0.1"},
+	}
+	staleFip := readyFip.DeepCopy()
+	staleFip.Name = "stale-fip"
+	staleFip.Status.Ready = false
+	staleFip.Labels[util.EipUIDLabel] = "old-eip-uid"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{fakeGw("gw")},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+		IptablesFIPs:   []*kubeovnv1.IptablesFIPRule{readyFip, staleFip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesFipQueue = newTypedRateLimitingQueue[string]("UnavailableEipFipUpdate", nil)
+	t.Cleanup(c.updateIptablesFipQueue.ShutDown)
+
+	require.NoError(t, c.handleAddIptablesFip("ready-fip"))
+	require.NoError(t, c.handleAddIptablesFip("stale-fip"))
+	require.Equal(t, 2, c.updateIptablesFipQueue.Len())
+	require.Error(t, c.handleUpdateIptablesFip("ready-fip"))
+	require.Error(t, c.handleUpdateIptablesFip("stale-fip"))
+	storedReadyFip, err := c.config.KubeOvnClient.KubeovnV1().IptablesFIPRules().Get(t.Context(), "ready-fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, storedReadyFip.Status.Ready)
+	storedStaleFip, err := c.config.KubeOvnClient.KubeovnV1().IptablesFIPRules().Get(t.Context(), "stale-fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, storedStaleFip.Status.Ready)
+	require.Equal(t, "old-eip-uid", storedStaleFip.Labels[util.EipUIDLabel], "an unavailable eip must not claim a new generation")
+}
+
+func TestReadyEipAddReplayRoutesFinalizerLossToUpdate(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: "qos-uid"},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
+		Status:     kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip", Labels: map[string]string{util.QoSPolicyUIDLabel: "qos-uid"}},
+		Spec:       kubeovnv1.IptablesEIPSpec{V4ip: "1.1.1.1", QoSPolicy: "qos"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: true, IP: "1.1.1.1", QoSPolicy: "qos"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:  []*kubeovnv1.QoSPolicy{qos},
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+		Subnets: []*kubeovnv1.Subnet{{
+			ObjectMeta: metav1.ObjectMeta{Name: util.GetExternalNetwork("")},
+			Spec:       kubeovnv1.SubnetSpec{CIDRBlock: "1.1.1.0/24"},
+		}},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("FinalizerLossEipUpdate", nil)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	require.NoError(t, c.handleAddIptablesEip("eip"))
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+	require.ErrorContains(t, c.handleUpdateIptablesEip("eip"), "first controller reconcile")
+	storedEip, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, storedEip.Status.Ready)
+}
+
 func TestTerminatingQoSPolicyReferenceReleaseClosesLifecycle(t *testing.T) {
 	old := vpcNatEnabled
 	vpcNatEnabled = "true"

@@ -69,7 +69,9 @@ func TestHandleAddOrUpdateVpcNatGwSkipsTerminating(t *testing.T) {
 }
 
 func TestVpcNatGatewayRejectsStaleQoSGenerationAfterReferenceIsDropped(t *testing.T) {
-	qos := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: types.UID("new-uid")}}
+	qos := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{
+		Name: "qos", UID: types.UID("new-uid"), Finalizers: []string{util.KubeOVNControllerFinalizer},
+	}}
 	gw := fakeGw("gw")
 	gw.Labels = map[string]string{util.QoSPolicyUIDLabel: "old-uid"}
 	gw.Status.QoSPolicy = "qos"
@@ -81,6 +83,21 @@ func TestVpcNatGatewayRejectsStaleQoSGenerationAfterReferenceIsDropped(t *testin
 
 	err = fc.fakeController.handleAddOrUpdateVpcNatGw("gw")
 	require.ErrorContains(t, err, "previous generation of qos policy qos")
+}
+
+func TestVpcNatGatewayRejectsQoSWithoutControllerFinalizer(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: types.UID("qos-uid")}}
+	gw := fakeGw("gw")
+	gw.Labels = map[string]string{util.QoSPolicyUIDLabel: "qos-uid"}
+	gw.Status.QoSPolicy = "qos"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{qos},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.handleAddOrUpdateVpcNatGw("gw")
+	require.ErrorContains(t, err, "before its first controller reconcile")
 }
 
 // TestHandleInitVpcNatGwSkipsTerminating pins the same guard on the init path, which pod update

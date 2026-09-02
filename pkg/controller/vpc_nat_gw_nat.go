@@ -231,12 +231,16 @@ func (c *Controller) handleAddIptablesFip(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle add iptables fip %s", key)
 
-	if fip.Status.Ready && fip.Status.V4ip != "" {
-		if eip, getErr := c.iptablesEipsLister.Get(fip.Spec.EIP); getErr == nil && fip.Labels[util.EipUIDLabel] == string(eip.UID) {
+	if fip.Status.V4ip != "" && fip.Status.NatGwDp != "" && fip.Status.InternalIP != "" {
+		eip, getErr := c.getBindableEip(fip.Spec.EIP)
+		if getErr != nil || fip.Status.V4ip != eip.Status.IP || fip.Status.NatGwDp != eip.Spec.NatGwDp ||
+			fip.Status.InternalIP != fip.Spec.InternalIP || fip.Labels[util.EipUIDLabel] != string(eip.UID) {
+			c.updateIptablesFipQueue.Add(key)
 			return nil
 		}
-		c.updateIptablesFipQueue.Add(key)
-		return nil
+		if fip.Status.Ready {
+			return nil
+		}
 	}
 	klog.V(3).Infof("handle add fip %s", key)
 
@@ -574,12 +578,19 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle add iptables dnat rule %s", key)
 
-	if dnat.Status.Ready && dnat.Status.V4ip != "" {
-		if eip, getErr := c.iptablesEipsLister.Get(dnat.Spec.EIP); getErr == nil && dnat.Labels[util.EipUIDLabel] == string(eip.UID) {
+	if dnat.Status.V4ip != "" && dnat.Status.NatGwDp != "" && dnat.Status.Protocol != "" &&
+		dnat.Status.ExternalPort != "" && dnat.Status.InternalIP != "" && dnat.Status.InternalPort != "" {
+		eip, getErr := c.getBindableEip(dnat.Spec.EIP)
+		if getErr != nil || dnat.Status.V4ip != eip.Status.IP || dnat.Status.NatGwDp != eip.Spec.NatGwDp ||
+			dnat.Status.Protocol != dnat.Spec.Protocol || dnat.Status.ExternalPort != dnat.Spec.ExternalPort ||
+			dnat.Status.InternalIP != dnat.Spec.InternalIP || dnat.Status.InternalPort != dnat.Spec.InternalPort ||
+			dnat.Labels[util.EipUIDLabel] != string(eip.UID) {
+			c.updateIptablesDnatRuleQueue.Add(key)
 			return nil
 		}
-		c.updateIptablesDnatRuleQueue.Add(key)
-		return nil
+		if dnat.Status.Ready {
+			return nil
+		}
 	}
 	klog.V(3).Infof("handle add iptables dnat %s", key)
 
@@ -941,12 +952,18 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle add iptables snat rule %s", key)
 
-	if snat.Status.Ready && snat.Status.V4ip != "" {
-		if eip, getErr := c.iptablesEipsLister.Get(snat.Spec.EIP); getErr == nil && snat.Labels[util.EipUIDLabel] == string(eip.UID) {
+	if snat.Status.V4ip != "" && snat.Status.NatGwDp != "" && snat.Status.InternalCIDR != "" {
+		eip, getErr := c.getBindableEip(snat.Spec.EIP)
+		statusV4Cidr, _ := util.SplitStringIP(snat.Status.InternalCIDR)
+		specV4Cidr, _ := util.SplitStringIP(snat.Spec.InternalCIDR)
+		if getErr != nil || snat.Status.V4ip != eip.Status.IP || snat.Status.NatGwDp != eip.Spec.NatGwDp ||
+			statusV4Cidr != specV4Cidr || snat.Labels[util.EipUIDLabel] != string(eip.UID) {
+			c.updateIptablesSnatRuleQueue.Add(key)
 			return nil
 		}
-		c.updateIptablesSnatRuleQueue.Add(key)
-		return nil
+		if snat.Status.Ready {
+			return nil
+		}
 	}
 	klog.V(3).Infof("handle add iptables snat %s", key)
 

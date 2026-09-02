@@ -208,6 +208,10 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 			c.updateIptablesEipQueue.Add(key)
 			return nil
 		}
+		if !controllerutil.ContainsFinalizer(qos, util.KubeOVNControllerFinalizer) {
+			c.updateIptablesEipQueue.Add(key)
+			return nil
+		}
 		if cachedEip.Labels[util.QoSPolicyUIDLabel] == string(qos.UID) {
 			return nil
 		}
@@ -438,6 +442,14 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 				}
 			}
 			return err
+		}
+		if !controllerutil.ContainsFinalizer(desiredQoS, util.KubeOVNControllerFinalizer) {
+			if cachedEip.Status.Ready {
+				if patchErr := c.patchEipStatus(key, "", "", "", false); patchErr != nil {
+					return fmt.Errorf("failed to mark eip %s not ready after its qos policy lost the controller finalizer: %w", key, patchErr)
+				}
+			}
+			return fmt.Errorf("qos policy %s is not ready; wait for its first controller reconcile before referencing it", cachedEip.Spec.QoSPolicy)
 		}
 		uidMatches := cachedEip.Labels[util.QoSPolicyUIDLabel] == string(desiredQoS.UID)
 		if uidMatches && !cachedEip.Status.Ready && cachedEip.Status.Redo == "" && cachedEip.Status.IP != "" {

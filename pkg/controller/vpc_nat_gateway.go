@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/request"
@@ -379,7 +380,16 @@ func (c *Controller) rejectStaleVpcNatGwQoSGeneration(gw *kubeovnv1.VpcNatGatewa
 		return nil
 	}
 	qos, err := c.qosPoliciesLister.Get(gw.Status.QoSPolicy)
-	if err == nil && gw.Labels[util.QoSPolicyUIDLabel] != string(qos.UID) {
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !controllerutil.ContainsFinalizer(qos, util.KubeOVNControllerFinalizer) {
+		return fmt.Errorf("vpc nat gateway %s references qos policy %s before its first controller reconcile", gw.Name, gw.Status.QoSPolicy)
+	}
+	if gw.Labels[util.QoSPolicyUIDLabel] != string(qos.UID) {
 		return fmt.Errorf("vpc nat gateway %s references a previous generation of qos policy %s; remove or rebind it before applying the new generation", gw.Name, gw.Status.QoSPolicy)
 	}
 	return nil

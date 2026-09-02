@@ -178,8 +178,8 @@ plane before advancing Status, while continuing to block new bindings.
 Route incomplete Status to add, complete but mismatched Status to update, and replay a matching
 not-ready identity idempotently on recovery. A same-name dependency is converged only when its UID
 credential matches the current generation; rebind a mismatch only when the old data plane can be
-cleaned, and ignore invalidation events from an older generation once the referrer carries the newer UID. Skip terminating and converged
-referrers. On restart,
+cleaned, and ignore invalidation events from an older generation once the referrer carries the
+newer UID. Skip terminating and converged referrers. On restart,
 each referrer's initial Add enqueues its key while caches synchronize; workers consume queued keys
 only after all required caches sync. Use dependency Add replay only where it provides a required
 readiness or invalidation notification. Keep rate-limited retry as fallback. Tests must cover usable
