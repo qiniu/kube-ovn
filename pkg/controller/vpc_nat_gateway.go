@@ -335,6 +335,11 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	}
 
 	// Handle QoS update (independent of StatefulSet changes)
+	if gw.Spec.QoSPolicy != "" && gw.Status.QoSPolicy == gw.Spec.QoSPolicy {
+		if _, err = c.getAvailableQoSPolicy(gw.Spec.QoSPolicy); err != nil {
+			return err
+		}
+	}
 	if gw.Spec.QoSPolicy != gw.Status.QoSPolicy {
 		if gw.Status.QoSPolicy != "" {
 			if err = c.execNatGwQoS(gw, gw.Status.QoSPolicy, QoSDel); err != nil {
@@ -1480,6 +1485,9 @@ func (c *Controller) patchNatGwStatus(key string) error {
 
 func (c *Controller) execNatGwQoS(gw *kubeovnv1.VpcNatGateway, qos, operation string) error {
 	qosPolicy, err := c.qosPoliciesLister.Get(qos)
+	if operation == QoSAdd {
+		qosPolicy, err = c.getBindableQoSPolicy(qos)
+	}
 	if err != nil {
 		klog.Errorf("get qos policy %s failed: %v", qos, err)
 		return err

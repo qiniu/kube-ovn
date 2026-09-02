@@ -394,6 +394,11 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 	eip, err := c.getBindableEip(cachedFip.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if cachedFip.Status.Ready {
+			if patchErr := c.patchFipStatus(key, "", "", "", "", false); patchErr != nil {
+				return fmt.Errorf("failed to mark fip %s not ready after its eip became unavailable: %w", key, patchErr)
+			}
+		}
 		return err
 	}
 
@@ -703,6 +708,11 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 	eip, err := c.getBindableEip(cachedDnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if cachedDnat.Status.Ready {
+			if patchErr := c.patchDnatStatus(key, "", "", "", "", false); patchErr != nil {
+				return fmt.Errorf("failed to mark dnat %s not ready after its eip became unavailable: %w", key, patchErr)
+			}
+		}
 		return err
 	}
 	if dup, err := c.isDnatDuplicated(eip.Spec.NatGwDp, cachedDnat.Spec.EIP, cachedDnat.Name, cachedDnat.Spec.ExternalPort, cachedDnat.Spec.Protocol, cachedDnat.Spec.Type); dup || err != nil {
@@ -1039,6 +1049,11 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 	eip, err := c.getBindableEip(cachedSnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if cachedSnat.Status.Ready {
+			if patchErr := c.patchSnatStatus(key, "", "", "", "", false); patchErr != nil {
+				return fmt.Errorf("failed to mark snat %s not ready after its eip became unavailable: %w", key, patchErr)
+			}
+		}
 		return err
 	}
 

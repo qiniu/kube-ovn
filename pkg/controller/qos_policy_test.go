@@ -1,13 +1,178 @@
 package controller
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/util"
 )
+
+type failingEipLister struct{}
+
+func (failingEipLister) List(labels.Selector) ([]*kubeovnv1.IptablesEIP, error) {
+	return nil, errors.New("eip lister failed")
+}
+
+func (failingEipLister) Get(string) (*kubeovnv1.IptablesEIP, error) {
+	return nil, errors.New("eip lister failed")
+}
+
+func TestQoSPolicyReferrersWaitForStatusInformerUpdate(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "late-qos"},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-eip"},
+		Spec:       kubeovnv1.IptablesEIPSpec{QoSPolicy: "late-qos"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:  []*kubeovnv1.QoSPolicy{qos},
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.addIptablesEipQueue = newTypedRateLimitingQueue[string]("AddIptablesEip", nil)
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
+	c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("AddOrUpdateVpcNatGw", nil)
+	t.Cleanup(c.addIptablesEipQueue.ShutDown)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+	t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+
+	require.NoError(t, c.handleAddQoSPolicy("late-qos"))
+	require.Zero(t, c.addIptablesEipQueue.Len(), "the lister still exposes the previous qos status")
+
+	updated, err := c.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(t.Context(), "late-qos", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.True(t, qosPolicyStatusMatchesSpec(updated))
+	c.enqueueUpdateQoSPolicy(qos, updated)
+	require.Equal(t, 1, c.addIptablesEipQueue.Len(), "the reconciled status update wakes the referrer")
+}
+
+func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
+	oldQos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos", Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
+		Status:     kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip"},
+		Spec:       kubeovnv1.IptablesEIPSpec{QoSPolicy: "qos"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: true, IP: "1.1.1.1", QoSPolicy: "qos"},
+	}
+	gw := &kubeovnv1.VpcNatGateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw"},
+		Spec:       kubeovnv1.VpcNatGatewaySpec{QoSPolicy: "qos"},
+		Status:     kubeovnv1.VpcNatGatewayStatus{QoSPolicy: "qos"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateQoSPolicyQueue = newTypedRateLimitingQueue[string]("UpdateQoSPolicy", nil)
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
+	c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("AddOrUpdateVpcNatGw", nil)
+	t.Cleanup(c.updateQoSPolicyQueue.ShutDown)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+	t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+
+	t.Run("terminating is authoritative invalidation", func(t *testing.T) {
+		newQos := oldQos.DeepCopy()
+		now := metav1.Now()
+		newQos.DeletionTimestamp = &now
+		c.enqueueUpdateQoSPolicy(oldQos, newQos)
+		require.Equal(t, 1, c.updateQoSPolicyQueue.Len())
+		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("terminating add replay notifies referrers", func(t *testing.T) {
+		c.updateQoSPolicyQueue = newTypedRateLimitingQueue[string]("TerminatingAddQoS", nil)
+		c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("TerminatingAddEip", nil)
+		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("TerminatingAddGw", nil)
+		t.Cleanup(c.updateQoSPolicyQueue.ShutDown)
+		t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+		qos := oldQos.DeepCopy()
+		now := metav1.Now()
+		qos.DeletionTimestamp = &now
+		c.enqueueAddQoSPolicy(qos)
+		require.Equal(t, 1, c.updateQoSPolicyQueue.Len())
+		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("finalizer removal invalidates referrers", func(t *testing.T) {
+		c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("FinalizerEip", nil)
+		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("FinalizerGw", nil)
+		t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+		newQos := oldQos.DeepCopy()
+		newQos.Finalizers = nil
+		c.enqueueUpdateQoSPolicy(oldQos, newQos)
+		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("eip list failure does not block gateway notification", func(t *testing.T) {
+		originalLister := c.iptablesEipsLister
+		t.Cleanup(func() { c.iptablesEipsLister = originalLister })
+		c.iptablesEipsLister = failingEipLister{}
+		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("ListFailureGw", nil)
+		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+		err := c.enqueueQoSPolicyReferrers("qos", false)
+		require.ErrorContains(t, err, "eip lister failed")
+		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("pending spec keeps the established data plane valid", func(t *testing.T) {
+		c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("PendingSpecEip", nil)
+		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("PendingSpecGw", nil)
+		t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+		newQos := oldQos.DeepCopy()
+		newQos.Spec.BandwidthLimitRules = kubeovnv1.QoSPolicyBandwidthLimitRules{{Name: "new-rule"}}
+		c.enqueueUpdateQoSPolicy(oldQos, newQos)
+		require.Zero(t, c.updateIptablesEipQueue.Len())
+		require.Zero(t, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("terminating after a pending spec still invalidates", func(t *testing.T) {
+		c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("PendingDeleteEip", nil)
+		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("PendingDeleteGw", nil)
+		t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+		pendingQos := oldQos.DeepCopy()
+		pendingQos.Spec.BandwidthLimitRules = kubeovnv1.QoSPolicyBandwidthLimitRules{{Name: "new-rule"}}
+		deletingQos := pendingQos.DeepCopy()
+		now := metav1.Now()
+		deletingQos.DeletionTimestamp = &now
+		c.enqueueUpdateQoSPolicy(pendingQos, deletingQos)
+		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("delete event notifies referrers", func(t *testing.T) {
+		c.delQoSPolicyQueue = newTypedRateLimitingQueue[string]("DeleteQoSPolicy", nil)
+		c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("DeletedQoSEip", nil)
+		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("DeletedQoSGw", nil)
+		t.Cleanup(c.delQoSPolicyQueue.ShutDown)
+		t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+		c.enqueueDelQoSPolicy(oldQos)
+		require.Equal(t, 1, c.delQoSPolicyQueue.Len())
+		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+}
 
 func TestValidateRateValue(t *testing.T) {
 	t.Parallel()

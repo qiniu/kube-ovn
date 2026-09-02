@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"reflect"
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -13,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	cli "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -474,12 +477,27 @@ func validateQoSPolicyRef(ctx context.Context, reader cli.Reader, qosPolicy stri
 	}
 	qos := &ovnv1.QoSPolicy{}
 	if err := reader.Get(ctx, types.NamespacedName{Name: qosPolicy}, qos); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return fmt.Errorf("qos policy %s does not exist; create it before referencing it: %w", qosPolicy, err)
+		}
 		return err
 	}
 	if !qos.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("qos policy %s is terminating", qosPolicy)
+		return fmt.Errorf("qos policy %s is terminating; wait for its deletion to complete before referencing it", qosPolicy)
+	}
+	if !controllerutil.ContainsFinalizer(qos, util.KubeOVNControllerFinalizer) || !webhookQoSPolicyStatusMatchesSpec(qos) {
+		return fmt.Errorf("qos policy %s is not ready; wait for its controller status to match the spec before referencing it", qosPolicy)
 	}
 	return nil
+}
+
+func webhookQoSPolicyStatusMatchesSpec(qos *ovnv1.QoSPolicy) bool {
+	specRules := append(ovnv1.QoSPolicyBandwidthLimitRules(nil), qos.Spec.BandwidthLimitRules...)
+	statusRules := append(ovnv1.QoSPolicyBandwidthLimitRules(nil), qos.Status.BandwidthLimitRules...)
+	sort.Slice(specRules, func(i, j int) bool { return specRules[i].Name < specRules[j].Name })
+	sort.Slice(statusRules, func(i, j int) bool { return statusRules[i].Name < statusRules[j].Name })
+	return qos.Spec.Shared == qos.Status.Shared && qos.Spec.BindingType == qos.Status.BindingType &&
+		reflect.DeepEqual(specRules, statusRules)
 }
 
 func (v *ValidatingHook) getNatGwNamePrefix(ctx context.Context) (string, error) {

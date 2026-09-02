@@ -62,7 +62,15 @@ func TestValidateQoSPolicyRef(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, ovnv1.AddToScheme(scheme))
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-		&ovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "live-qos"}},
+		&ovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{
+			Name:       "live-qos",
+			Finalizers: []string{util.KubeOVNControllerFinalizer},
+		}},
+		&ovnv1.QoSPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: "pending-qos", Finalizers: []string{util.KubeOVNControllerFinalizer}},
+			Spec:       ovnv1.QoSPolicySpec{BindingType: ovnv1.QoSBindingTypeEIP},
+		},
+		&ovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "new-qos"}},
 		&ovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{
 			Name:              "dying-qos",
 			DeletionTimestamp: &now,
@@ -78,13 +86,24 @@ func TestValidateQoSPolicyRef(t *testing.T) {
 		require.NoError(t, validateQoSPolicyRef(t.Context(), reader, "live-qos"))
 	})
 
+	t.Run("policy without controller reconcile is rejected", func(t *testing.T) {
+		require.ErrorContains(t, validateQoSPolicyRef(t.Context(), reader, "new-qos"), "not ready")
+	})
+
+	t.Run("policy with stale status is rejected", func(t *testing.T) {
+		require.ErrorContains(t, validateQoSPolicyRef(t.Context(), reader, "pending-qos"), "not ready")
+	})
+
 	t.Run("missing policy is rejected", func(t *testing.T) {
 		err := validateQoSPolicyRef(t.Context(), reader, "missing-qos")
 		require.Error(t, err)
 		require.True(t, k8serrors.IsNotFound(err))
+		require.ErrorContains(t, err, "create it before referencing it")
 	})
 
 	t.Run("terminating policy is rejected", func(t *testing.T) {
-		require.ErrorContains(t, validateQoSPolicyRef(t.Context(), reader, "dying-qos"), "terminating")
+		err := validateQoSPolicyRef(t.Context(), reader, "dying-qos")
+		require.ErrorContains(t, err, "terminating")
+		require.ErrorContains(t, err, "wait for its deletion to complete")
 	})
 }

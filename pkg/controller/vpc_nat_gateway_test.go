@@ -86,6 +86,43 @@ func TestHandleInitVpcNatGwSkipsTerminating(t *testing.T) {
 	require.NoError(t, fc.fakeController.handleInitVpcNatGw("dying-gw"))
 }
 
+func TestExecNatGwQoSWaitsForQoSPolicyStatus(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-qos"},
+		Spec: kubeovnv1.QoSPolicySpec{
+			Shared:      true,
+			BindingType: kubeovnv1.QoSBindingTypeNatGw,
+		},
+	}
+	gw := fakeGw("gw")
+	gw.Spec.QoSPolicy = "pending-qos"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{qos},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.execNatGwQoS(gw, "pending-qos", QoSAdd)
+	require.ErrorContains(t, err, "status to match the spec")
+}
+
+func TestExecNatGwQoSAllowsCleanupOfTerminatingPolicy(t *testing.T) {
+	now := metav1.Now()
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "dying-qos", DeletionTimestamp: &now},
+		Spec:       kubeovnv1.QoSPolicySpec{Shared: true, BindingType: kubeovnv1.QoSBindingTypeNatGw},
+		Status:     kubeovnv1.QoSPolicyStatus{Shared: true, BindingType: kubeovnv1.QoSBindingTypeNatGw},
+	}
+	gw := fakeGw("gw")
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies: []*kubeovnv1.QoSPolicy{qos},
+	})
+	require.NoError(t, err)
+
+	// No bandwidth rules means no pod lookup is needed; this isolates the cleanup guard.
+	require.NoError(t, fc.fakeController.execNatGwQoS(gw, "dying-qos", QoSDel))
+}
+
 func TestIsVpcNatGwChanged(t *testing.T) {
 	tests := []struct {
 		name     string
