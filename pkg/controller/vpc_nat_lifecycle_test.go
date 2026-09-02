@@ -490,3 +490,41 @@ func TestPatchEipLabelClearsDroppedQoS(t *testing.T) {
 	require.Empty(t, stored.Labels[util.QoSLabel])
 	require.Empty(t, stored.Labels[util.QoSPolicyUIDLabel], "a dropped reference must stop counting")
 }
+
+// TestSyncVpcNatGatewayCRSkipsTerminating closes the same hole as the backfill on the other
+// startup path: updateCrdNatGwLabels resolves a live policy and stamps its UID, so a gateway
+// already being deleted would hand the policy a referrer that outlives the reconcile.
+func TestSyncVpcNatGatewayCRSkipsTerminating(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	gw := fakeGw("dying-gw")
+	gw.DeletionTimestamp = &now
+	gw.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	gw.Spec.QoSPolicy = "live-qos"
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{{ObjectMeta: metav1.ObjectMeta{Name: "live-qos", UID: "live-qos-uid"}}},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		ConfigMaps: []*corev1.ConfigMap{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: util.VpcNatGatewayConfig, Namespace: "kube-system"},
+				Data:       map[string]string{"enable-vpc-nat-gw": "true"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: util.VpcNatConfig, Namespace: "kube-system"},
+				Data:       map[string]string{"image": "kubeovn/vpc-nat-gateway:test"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.syncVpcNatGatewayCR())
+
+	stored, err := c.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(t.Context(), "dying-gw", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, stored.Labels[util.QoSPolicyUIDLabel], "a terminating gateway establishes no binding")
+}

@@ -792,6 +792,11 @@ func (c *Controller) syncVpcNatGatewayCR() error {
 	}
 
 	for _, gw := range gws {
+		// Same rule as the backfill above: a gateway on its way out must not stamp a fresh claim on
+		// the policy it names, and its own deletion path owns whatever credential it still carries.
+		if !gw.DeletionTimestamp.IsZero() {
+			continue
+		}
 		// Passing an empty policy here would blank the QoS credential the in-use check counts,
 		// undoing the backfill for every gateway right after the workers started.
 		if err := c.updateCrdNatGwLabels(gw.Name, gw.Spec.QoSPolicy); err != nil {

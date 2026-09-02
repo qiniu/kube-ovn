@@ -250,7 +250,9 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			subnet, err := c.subnetsLister.Get(util.GetExternalNetwork(cachedEip.Spec.ExternalSubnet))
 			switch {
 			case err == nil:
-				v4Cidr, _ = util.SplitStringIP(subnet.Spec.CIDRBlock)
+				if v4Cidr, _ = util.SplitStringIP(subnet.Spec.CIDRBlock); v4Cidr == "" {
+					klog.Warningf("external subnet of eip %s has no ipv4 cidr, skip cleaning its address in pod", key)
+				}
 			case k8serrors.IsNotFound(err):
 				klog.Warningf("external subnet of eip %s is gone, skip cleaning its address in pod", key)
 			default:
