@@ -254,6 +254,8 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 					klog.Warningf("external subnet of eip %s has no ipv4 cidr, skip cleaning its address in pod", key)
 				}
 			case k8serrors.IsNotFound(err):
+				// Only reachable if the subnet's finalizer was forced off: it holds while any
+				// address is allocated, and this EIP is one of them.
 				klog.Warningf("external subnet of eip %s is gone, skip cleaning its address in pod", key)
 			default:
 				klog.Errorf("failed to get external subnet of eip %s: %v", key, err)
