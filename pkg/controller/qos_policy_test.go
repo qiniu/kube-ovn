@@ -112,13 +112,16 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 	})
 
 	t.Run("finalizer removal invalidates referrers", func(t *testing.T) {
+		c.updateQoSPolicyQueue = newTypedRateLimitingQueue[string]("FinalizerQoS", nil)
 		c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("FinalizerEip", nil)
 		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("FinalizerGw", nil)
+		t.Cleanup(c.updateQoSPolicyQueue.ShutDown)
 		t.Cleanup(c.updateIptablesEipQueue.ShutDown)
 		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
 		newQos := oldQos.DeepCopy()
 		newQos.Finalizers = nil
 		c.enqueueUpdateQoSPolicy(oldQos, newQos)
+		require.Equal(t, 1, c.updateQoSPolicyQueue.Len())
 		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
 		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
@@ -211,6 +214,21 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestUpdateQoSPolicyRestoresMissingControllerFinalizer(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos"},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
+		Status:     kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{QoSPolicies: []*kubeovnv1.QoSPolicy{qos}})
+	require.NoError(t, err)
+
+	require.NoError(t, fc.fakeController.handleUpdateQoSPolicy("qos"))
+	stored, err := fc.fakeController.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(t.Context(), "qos", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, stored.Finalizers, util.KubeOVNControllerFinalizer)
 }
 
 func TestValidateRateValue(t *testing.T) {

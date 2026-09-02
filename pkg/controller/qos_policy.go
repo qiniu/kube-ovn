@@ -144,6 +144,7 @@ func (c *Controller) enqueueUpdateQoSPolicy(oldObj, newObj any) {
 		if err := c.enqueueQoSPolicyReferrers(oldQos, false); err != nil {
 			klog.Errorf("failed to enqueue referrers after qos policy %s lost its finalizer: %v", key, err)
 		}
+		c.updateQoSPolicyQueue.Add(key)
 		return
 	}
 	// Wake referrers only after the informer observes the reconciled status. Enqueuing directly

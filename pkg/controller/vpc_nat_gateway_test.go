@@ -97,7 +97,7 @@ func TestVpcNatGatewayRejectsQoSWithoutControllerFinalizer(t *testing.T) {
 	require.NoError(t, err)
 
 	err = fc.fakeController.handleAddOrUpdateVpcNatGw("gw")
-	require.ErrorContains(t, err, "before its first controller reconcile")
+	require.ErrorContains(t, err, "waiting for qos policy qos controller reconcile")
 }
 
 // TestHandleInitVpcNatGwSkipsTerminating pins the same guard on the init path, which pod update
