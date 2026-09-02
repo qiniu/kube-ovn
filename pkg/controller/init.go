@@ -920,6 +920,12 @@ func (c *Controller) syncNatUIDLabels(ctx context.Context) error {
 
 // natRuleBound reports whether the rule already has a programmed binding, either through the
 // address label an older controller wrote or through the status its own cleanup reads back.
+//
+// Both signals can be stale on their own: a crash between the label write and createInPod leaves
+// a label with no rule, and a crash between createInPod and the status patch leaves a rule with no
+// status. Accepting either errs towards counting a rule that may not exist, which blocks an EIP
+// release until the rule's owner is reconciled or deleted. The opposite error, missing a rule that
+// does exist, releases the EIP for good and strands the rule.
 func natRuleBound(current map[string]string, statusV4ip string) bool {
 	return current[util.EipV4IpLabel] != "" || statusV4ip != ""
 }
