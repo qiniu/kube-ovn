@@ -246,6 +246,49 @@ func TestUpdateQoSPolicyRestoresMissingControllerFinalizer(t *testing.T) {
 	require.Contains(t, stored.Finalizers, util.KubeOVNControllerFinalizer)
 }
 
+func TestUpdateQoSPolicyAllowsInitialStatusInitialization(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos"},
+		Spec: kubeovnv1.QoSPolicySpec{
+			BindingType: kubeovnv1.QoSBindingTypeEIP,
+			BandwidthLimitRules: kubeovnv1.QoSPolicyBandwidthLimitRules{
+				{Name: "eip-egress", Direction: kubeovnv1.QoSDirectionEgress},
+			},
+		},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{QoSPolicies: []*kubeovnv1.QoSPolicy{qos}})
+	require.NoError(t, err)
+
+	require.NoError(t, fc.fakeController.handleUpdateQoSPolicy("qos"))
+	stored, err := fc.fakeController.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(t.Context(), "qos", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, qos.Spec.BindingType, stored.Status.BindingType)
+	require.Equal(t, qos.Spec.BandwidthLimitRules, stored.Status.BandwidthLimitRules)
+}
+
+func TestUpdateQoSPolicyRejectsInitializedBindingTypeChange(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos"},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeNatGw, Shared: true},
+		Status:     kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{QoSPolicies: []*kubeovnv1.QoSPolicy{qos}})
+	require.NoError(t, err)
+
+	require.ErrorContains(t, fc.fakeController.handleUpdateQoSPolicy("qos"), "not support qos qos change shared")
+}
+
+func TestUpdateQoSPolicyValidatesInitialStatusInitialization(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos"},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeNatGw},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{QoSPolicies: []*kubeovnv1.QoSPolicy{qos}})
+	require.NoError(t, err)
+
+	require.ErrorContains(t, fc.fakeController.handleUpdateQoSPolicy("qos"), "not shared")
+}
+
 func TestQoSPolicyFinalizerLossEnqueuesAndRestores(t *testing.T) {
 	oldQos := &kubeovnv1.QoSPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: "qos", Finalizers: []string{util.KubeOVNControllerFinalizer}},
