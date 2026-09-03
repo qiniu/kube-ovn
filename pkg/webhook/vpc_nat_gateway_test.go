@@ -13,6 +13,31 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+func TestValidateIptablesDnatProtocol(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		protocol string
+		wantErr  bool
+	}{
+		{protocol: "tcp"},
+		{protocol: "udp"},
+		{protocol: "TCP", wantErr: true},
+		{protocol: "UDP", wantErr: true},
+		{protocol: "Tcp", wantErr: true},
+		{protocol: "icmp", wantErr: true},
+	} {
+		t.Run(test.protocol, func(t *testing.T) {
+			err := validateIptablesDnatProtocol(test.protocol)
+			if test.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "must be lowercase")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 // TestEipUIDSelectorIsolatesGenerations pins admission to the same credential the controller's
 // in-use check counts. Two EIPs can carry the same address, so selecting by address made the
 // webhook block a deletion because of a rule belonging to a different EIP.
