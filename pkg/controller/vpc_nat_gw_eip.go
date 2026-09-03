@@ -45,8 +45,8 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 		errs = append(errs, fmt.Errorf("failed to list fips referencing eip %s: %w", eip.Name, err))
 	} else {
 		for _, fip := range fips {
-			if fip.DeletionTimestamp.IsZero() && fip.Spec.EIP == eip.Name {
-				boundUID := fip.Labels[util.EipUIDLabel]
+			boundUID := fip.Labels[util.EipUIDLabel]
+			if fip.DeletionTimestamp.IsZero() && (fip.Spec.EIP == eip.Name || (!usable && boundUID == eipUID)) {
 				if !usable && boundUID != "" && boundUID != eipUID {
 					continue
 				}
@@ -67,8 +67,8 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 		errs = append(errs, fmt.Errorf("failed to list dnats referencing eip %s: %w", eip.Name, err))
 	} else {
 		for _, dnat := range dnats {
-			if dnat.DeletionTimestamp.IsZero() && dnat.Spec.EIP == eip.Name {
-				boundUID := dnat.Labels[util.EipUIDLabel]
+			boundUID := dnat.Labels[util.EipUIDLabel]
+			if dnat.DeletionTimestamp.IsZero() && (dnat.Spec.EIP == eip.Name || (!usable && boundUID == eipUID)) {
 				if !usable && boundUID != "" && boundUID != eipUID {
 					continue
 				}
@@ -91,8 +91,8 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 		errs = append(errs, fmt.Errorf("failed to list snats referencing eip %s: %w", eip.Name, err))
 	} else {
 		for _, snat := range snats {
-			if snat.DeletionTimestamp.IsZero() && snat.Spec.EIP == eip.Name {
-				boundUID := snat.Labels[util.EipUIDLabel]
+			boundUID := snat.Labels[util.EipUIDLabel]
+			if snat.DeletionTimestamp.IsZero() && (snat.Spec.EIP == eip.Name || (!usable && boundUID == eipUID)) {
 				if !usable && boundUID != "" && boundUID != eipUID {
 					continue
 				}

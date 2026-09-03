@@ -582,6 +582,322 @@ func TestNatRulesBecomeNotReadyWhenEipIsUnavailable(t *testing.T) {
 	require.Equal(t, "1.1.1.1", storedSnat.Status.V4ip)
 }
 
+func TestNatRulesReleaseClaimWhenEipIsDeleting(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	deletingEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip", UID: "eip-uid", DeletionTimestamp: &now, Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gone-gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: false, IP: "1.1.1.1"},
+	}
+	goneEip := deletingEip.DeepCopy()
+	goneEip.Name = "gone-eip"
+	fip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "fip",
+			Labels:      eipClaimLabels("gone-gw", "1.1.1.1", "", "eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "eip"},
+		},
+		Spec:   kubeovnv1.IptablesFIPRuleSpec{EIP: "eip", InternalIP: "10.0.0.1"},
+		Status: kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gone-gw", InternalIP: "10.0.0.1"},
+	}
+	dnat := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "dnat",
+			Labels:      eipClaimLabels("gone-gw", "1.1.1.1", "80", "eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "eip"},
+		},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip", Protocol: "tcp", ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+		Status: kubeovnv1.IptablesDnatRuleStatus{
+			Ready: true, V4ip: "1.1.1.1", NatGwDp: "gone-gw", Protocol: "tcp",
+			ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+	}
+	snat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "snat",
+			Labels:      eipClaimLabels("gone-gw", "1.1.1.1", "", "eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "eip"},
+		},
+		Spec:   kubeovnv1.IptablesSnatRuleSpec{EIP: "eip", InternalCIDR: "10.0.0.0/24"},
+		Status: kubeovnv1.IptablesSnatRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gone-gw", InternalCIDR: "10.0.0.0/24"},
+	}
+	goneFip := fip.DeepCopy()
+	goneFip.Name = "gone-fip"
+	goneFip.Spec.EIP = "gone-eip"
+	goneFip.Annotations[util.VpcEipAnnotation] = "gone-eip"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{deletingEip},
+		IptablesFIPs:      []*kubeovnv1.IptablesFIPRule{fip, goneFip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{dnat},
+		IptablesSnatRules: []*kubeovnv1.IptablesSnatRule{snat},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	require.NoError(t, c.handleUpdateIptablesFip("fip"))
+	require.NoError(t, c.handleUpdateIptablesFip("gone-fip"))
+	require.NoError(t, c.handleUpdateIptablesDnatRule("dnat"))
+	require.NoError(t, c.handleUpdateIptablesSnatRule("snat"))
+	require.Equal(t, 2, c.updateIptablesEipQueue.Len())
+	item, shutdown := c.updateIptablesEipQueue.Get()
+	require.False(t, shutdown)
+	require.Equal(t, "eip", item)
+	c.updateIptablesEipQueue.Done(item)
+	c.updateIptablesEipQueue.Forget(item)
+	item, shutdown = c.updateIptablesEipQueue.Get()
+	require.False(t, shutdown)
+	require.Equal(t, "gone-eip", item)
+	c.updateIptablesEipQueue.Done(item)
+	c.updateIptablesEipQueue.Forget(item)
+
+	kc := c.config.KubeOvnClient.KubeovnV1()
+	storedFip, err := kc.IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedFip.Status.Ready, storedFip.Labels, storedFip.Annotations)
+	storedGoneFip, err := kc.IptablesFIPRules().Get(t.Context(), "gone-fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedGoneFip.Status.Ready, storedGoneFip.Labels, storedGoneFip.Annotations)
+	storedDnat, err := kc.IptablesDnatRules().Get(t.Context(), "dnat", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedDnat.Status.Ready, storedDnat.Labels, storedDnat.Annotations)
+	storedSnat, err := kc.IptablesSnatRules().Get(t.Context(), "snat", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedSnat.Status.Ready, storedSnat.Labels, storedSnat.Annotations)
+}
+
+func TestNatRuleReleaseUsesBoundEipWhenSpecReboundToMissingEip(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	oldEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-eip", UID: "old-eip-uid", DeletionTimestamp: &now, Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gone-gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: false, IP: "1.1.1.1"},
+	}
+	fip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "fip",
+			Labels:      eipClaimLabels("gone-gw", "1.1.1.1", "", "old-eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "old-eip"},
+		},
+		Spec:   kubeovnv1.IptablesFIPRuleSpec{EIP: "missing-new-eip", InternalIP: "10.0.0.1"},
+		Status: kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gone-gw", InternalIP: "10.0.0.1"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{oldEip},
+		IptablesFIPs: []*kubeovnv1.IptablesFIPRule{fip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	require.NoError(t, c.handleUpdateIptablesFip("fip"))
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+	item, shutdown := c.updateIptablesEipQueue.Get()
+	require.False(t, shutdown)
+	require.Equal(t, "old-eip", item)
+	c.updateIptablesEipQueue.Done(item)
+	c.updateIptablesEipQueue.Forget(item)
+
+	storedFip, err := c.config.KubeOvnClient.KubeovnV1().IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedFip.Status.Ready, storedFip.Labels, storedFip.Annotations)
+}
+
+func TestNatRulesReleaseClaimWhenNatDisabled(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "false"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip", UID: "eip-uid", DeletionTimestamp: &now, Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: false, IP: "1.1.1.1"},
+	}
+	fip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "fip",
+			Labels:      eipClaimLabels("gw", "1.1.1.1", "", "eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "eip"},
+		},
+		Spec:   kubeovnv1.IptablesFIPRuleSpec{EIP: "eip", InternalIP: "10.0.0.1"},
+		Status: kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalIP: "10.0.0.1"},
+	}
+	dnat := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "dnat",
+			Labels:      eipClaimLabels("gw", "1.1.1.1", "80", "eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "eip"},
+		},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip", Protocol: "tcp", ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+		Status: kubeovnv1.IptablesDnatRuleStatus{
+			Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", Protocol: "tcp",
+			ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+	}
+	snat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "snat",
+			Labels:      eipClaimLabels("gw", "1.1.1.1", "", "eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "eip"},
+		},
+		Spec:   kubeovnv1.IptablesSnatRuleSpec{EIP: "eip", InternalCIDR: "10.0.0.0/24"},
+		Status: kubeovnv1.IptablesSnatRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalCIDR: "10.0.0.0/24"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{eip},
+		IptablesFIPs:      []*kubeovnv1.IptablesFIPRule{fip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{dnat},
+		IptablesSnatRules: []*kubeovnv1.IptablesSnatRule{snat},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	require.NoError(t, c.handleUpdateIptablesFip("fip"))
+	require.NoError(t, c.handleUpdateIptablesDnatRule("dnat"))
+	require.NoError(t, c.handleUpdateIptablesSnatRule("snat"))
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+
+	kc := c.config.KubeOvnClient.KubeovnV1()
+	storedFip, err := kc.IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedFip.Status.Ready, storedFip.Labels, storedFip.Annotations)
+	storedDnat, err := kc.IptablesDnatRules().Get(t.Context(), "dnat", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedDnat.Status.Ready, storedDnat.Labels, storedDnat.Annotations)
+	storedSnat, err := kc.IptablesSnatRules().Get(t.Context(), "snat", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimReleased(t, storedSnat.Status.Ready, storedSnat.Labels, storedSnat.Annotations)
+}
+
+func TestNatRulesMoveClaimWhenOldEipIsDeletingDuringRebind(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	oldEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-eip", UID: "old-eip-uid", DeletionTimestamp: &now, Finalizers: []string{util.KubeOVNControllerFinalizer}},
+		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "old-gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: false, IP: "1.1.1.1"},
+	}
+	newEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "new-eip", UID: "new-eip-uid"},
+		Spec:       kubeovnv1.IptablesEIPSpec{V4ip: "2.2.2.2", NatGwDp: "new-gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: true, IP: "2.2.2.2"},
+	}
+	fip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "fip",
+			Labels:      eipClaimLabels("old-gw", "1.1.1.1", "", "old-eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "old-eip"},
+		},
+		Spec:   kubeovnv1.IptablesFIPRuleSpec{EIP: "new-eip", InternalIP: "10.0.0.1"},
+		Status: kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "old-gw", InternalIP: "10.0.0.1"},
+	}
+	dnat := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "dnat",
+			Labels:      eipClaimLabels("old-gw", "1.1.1.1", "80", "old-eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "old-eip"},
+		},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "new-eip", Protocol: "tcp", ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+		Status: kubeovnv1.IptablesDnatRuleStatus{
+			Ready: true, V4ip: "1.1.1.1", NatGwDp: "old-gw", Protocol: "tcp",
+			ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+	}
+	snat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "snat",
+			Labels:      eipClaimLabels("old-gw", "1.1.1.1", "", "old-eip-uid"),
+			Annotations: map[string]string{util.VpcEipAnnotation: "old-eip"},
+		},
+		Spec:   kubeovnv1.IptablesSnatRuleSpec{EIP: "new-eip", InternalCIDR: "10.0.0.0/24"},
+		Status: kubeovnv1.IptablesSnatRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "old-gw", InternalCIDR: "10.0.0.0/24"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{fakeGw("new-gw")},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{oldEip, newEip},
+		IptablesFIPs:      []*kubeovnv1.IptablesFIPRule{fip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{dnat},
+		IptablesSnatRules: []*kubeovnv1.IptablesSnatRule{snat},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesEip", nil)
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	require.Error(t, c.handleUpdateIptablesFip("fip"))
+	require.Error(t, c.handleUpdateIptablesDnatRule("dnat"))
+	require.Error(t, c.handleUpdateIptablesSnatRule("snat"))
+	require.Equal(t, 1, c.updateIptablesEipQueue.Len())
+	item, shutdown := c.updateIptablesEipQueue.Get()
+	require.False(t, shutdown)
+	require.Equal(t, "old-eip", item)
+	c.updateIptablesEipQueue.Done(item)
+	c.updateIptablesEipQueue.Forget(item)
+
+	kc := c.config.KubeOvnClient.KubeovnV1()
+	storedFip, err := kc.IptablesFIPRules().Get(t.Context(), "fip", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimMoved(t, storedFip.Labels, storedFip.Annotations)
+	storedDnat, err := kc.IptablesDnatRules().Get(t.Context(), "dnat", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimMoved(t, storedDnat.Labels, storedDnat.Annotations)
+	storedSnat, err := kc.IptablesSnatRules().Get(t.Context(), "snat", metav1.GetOptions{})
+	require.NoError(t, err)
+	assertEipClaimMoved(t, storedSnat.Labels, storedSnat.Annotations)
+}
+
+func eipClaimLabels(gateway, v4ip, externalPort, uid string) map[string]string {
+	labels := map[string]string{
+		util.VpcNatGatewayNameLabel: gateway,
+		util.EipV4IpLabel:           v4ip,
+		util.EipUIDLabel:            uid,
+	}
+	if externalPort != "" {
+		labels[util.VpcDnatEPortLabel] = externalPort
+	}
+	return labels
+}
+
+func assertEipClaimReleased(t *testing.T, ready bool, labels, annotations map[string]string) {
+	t.Helper()
+	require.False(t, ready)
+	require.NotContains(t, labels, util.VpcNatGatewayNameLabel)
+	require.NotContains(t, labels, util.VpcDnatEPortLabel)
+	require.NotContains(t, labels, util.EipV4IpLabel)
+	require.NotContains(t, labels, util.EipUIDLabel)
+	require.NotContains(t, annotations, util.VpcEipAnnotation)
+}
+
+func assertEipClaimMoved(t *testing.T, labels, annotations map[string]string) {
+	t.Helper()
+	require.Equal(t, "new-eip-uid", labels[util.EipUIDLabel])
+	require.Equal(t, "2.2.2.2", labels[util.EipV4IpLabel])
+	require.Equal(t, "new-gw", labels[util.VpcNatGatewayNameLabel])
+	require.Equal(t, "new-eip", annotations[util.VpcEipAnnotation])
+}
+
 func TestNatRuleAddWaitsForEipReady(t *testing.T) {
 	old := vpcNatEnabled
 	vpcNatEnabled = "true"
@@ -1014,6 +1330,54 @@ func TestTerminatingQoSPolicyReferenceReleaseClosesLifecycle(t *testing.T) {
 	require.Empty(t, storedEip.Status.QoSPolicy)
 	require.Empty(t, storedEip.Labels[util.QoSPolicyUIDLabel])
 
+	require.NoError(t, c.handleUpdateQoSPolicy("qos"))
+	storedQos, err := c.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(t.Context(), "qos", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, storedQos.Finalizers)
+}
+
+func TestDeletingEipReleasesQoSPolicyFinalizerAfterEipDisappears(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "false"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	now := metav1.Now()
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "qos",
+			UID:               "qos-uid",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{util.KubeOVNControllerFinalizer},
+		},
+		Spec:   kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeEIP},
+		Status: kubeovnv1.QoSPolicyStatus{BindingType: kubeovnv1.QoSBindingTypeEIP},
+	}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "eip",
+			UID:               "eip-uid",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{util.KubeOVNControllerFinalizer},
+			Labels:            map[string]string{util.QoSLabel: "qos", util.QoSPolicyUIDLabel: "qos-uid"},
+		},
+		Spec:   kubeovnv1.IptablesEIPSpec{QoSPolicy: "qos", NatGwDp: "gw"},
+		Status: kubeovnv1.IptablesEIPStatus{Ready: true, IP: "1.1.1.1", QoSPolicy: "qos"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:  []*kubeovnv1.QoSPolicy{qos},
+		IptablesEIPs: []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+
+	require.NoError(t, c.handleUpdateIptablesEip("eip"))
+	storedEip, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, storedEip.Finalizers)
+	require.Equal(t, "qos", storedEip.Labels[util.QoSLabel], "deleting eip does not need an extra self-label patch")
+	require.Equal(t, "qos", storedEip.Status.QoSPolicy, "deleting eip does not need an extra self-status patch")
+
+	require.NoError(t, c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Delete(t.Context(), "eip", metav1.DeleteOptions{}))
 	require.NoError(t, c.handleUpdateQoSPolicy("qos"))
 	storedQos, err := c.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(t.Context(), "qos", metav1.GetOptions{})
 	require.NoError(t, err)
