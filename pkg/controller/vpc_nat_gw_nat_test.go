@@ -639,6 +639,17 @@ func TestGetShareBackends(t *testing.T) {
 	assert.ElementsMatch(t, []string{"10.0.0.1:8080", "10.0.0.2:8080"}, backends)
 }
 
+func TestDnatCleanupEipName(t *testing.T) {
+	t.Parallel()
+
+	dnat := shareDnat("dnat", "gw", "new-eip", "80", "tcp", "10.0.0.1", "8080", kubeovnv1.DnatRuleTypeShare)
+	dnat.Annotations = map[string]string{util.VpcEipAnnotation: "old-eip"}
+	assert.Equal(t, "old-eip", dnatCleanupEipName(dnat), "rebind cleanup must use the old EIP sibling set")
+
+	dnat.Annotations = nil
+	assert.Equal(t, "new-eip", dnatCleanupEipName(dnat), "legacy rules fall back to the current spec EIP")
+}
+
 func TestIsDnatDuplicated(t *testing.T) {
 	t.Parallel()
 

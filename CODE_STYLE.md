@@ -163,6 +163,35 @@ These rules make the check correct:
 Returning an error is enough, the work queues retry with backoff and never give up, so the
 binding succeeds as soon as the tombstone is reclaimed.
 
+Dependency recovery must be event-driven. A referrer cannot become Ready until its dependency
+exists, is not terminating, and its required data plane is ready. The dependency's informer event
+wakes pending referrers only after authoritative state reaches the cache; an API `UpdateStatus`
+success does not make the new Status immediately visible. Zero-value Spec and Status may match
+before the first reconcile, so use a persistent marker such as the controller finalizer when that
+distinction matters.
+
+An authoritative usable-to-unusable transition also wakes established referrers. They stop new
+data-plane writes, retain cleanup identity, and report not Ready until recovery. A pending Spec
+update is not invalidation while old Status still describes a working data plane: update that data
+plane before advancing Status, while continuing to block new bindings.
+
+Route incomplete Status to add, complete but mismatched Status to update, and replay a matching
+not-ready identity idempotently on recovery. A same-name dependency is converged only when its UID
+credential matches the current generation; rebind a mismatch only when the old data plane can be
+cleaned, and ignore invalidation events from an older generation once the referrer carries the
+newer UID. Skip terminating and converged referrers. On restart,
+each referrer's initial Add enqueues its key while caches synchronize; workers consume queued keys
+only after all required caches sync. Use dependency Add replay only where it provides a required
+readiness or invalidation notification. Keep rate-limited retry as fallback. Tests must cover usable
+and unusable transitions, add/update routing, cleanup identity, termination, restart, and the
+API/cache gap.
+
+Startup backfill fills only missing UID credentials; it must not overwrite a different UID and hide
+a same-name generation mismatch. A reconciler may rebind only when it can clean the previously
+applied data plane. For example, a VPC NAT Gateway cannot delete QoS rules from a force-deleted,
+same-name policy using the new policy's rule list; without a persisted old-rule snapshot, leave the
+gateway un-converged and require deleting and recreating the gateway.
+
 The check and the credential write are two calls against two different objects, so the pair is
 not atomic: the referenced object can start terminating in between. What keeps that window from
 orphaning rules in a gateway pod is that a rule is never programmed without a credential

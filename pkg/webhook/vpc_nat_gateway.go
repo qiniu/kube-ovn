@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	cli "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -474,10 +475,16 @@ func validateQoSPolicyRef(ctx context.Context, reader cli.Reader, qosPolicy stri
 	}
 	qos := &ovnv1.QoSPolicy{}
 	if err := reader.Get(ctx, types.NamespacedName{Name: qosPolicy}, qos); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return fmt.Errorf("qos policy %s does not exist; create it before referencing it: %w", qosPolicy, err)
+		}
 		return err
 	}
 	if !qos.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("qos policy %s is terminating", qosPolicy)
+		return fmt.Errorf("qos policy %s is terminating; wait for its deletion to complete before referencing it", qosPolicy)
+	}
+	if !controllerutil.ContainsFinalizer(qos, util.KubeOVNControllerFinalizer) || !qos.StatusMatchesSpec() {
+		return fmt.Errorf("qos policy %s is not ready; wait for its controller status to match the spec before referencing it", qosPolicy)
 	}
 	return nil
 }

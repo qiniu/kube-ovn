@@ -231,9 +231,16 @@ func (c *Controller) handleAddIptablesFip(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle add iptables fip %s", key)
 
-	if fip.Status.Ready && fip.Status.V4ip != "" {
-		// already ok
-		return nil
+	if fip.Status.V4ip != "" && fip.Status.NatGwDp != "" && fip.Status.InternalIP != "" {
+		eip, getErr := c.getBindableEip(fip.Spec.EIP)
+		if getErr != nil || fip.Status.V4ip != eip.Status.IP || fip.Status.NatGwDp != eip.Spec.NatGwDp ||
+			fip.Status.InternalIP != fip.Spec.InternalIP || fip.Labels[util.EipUIDLabel] != string(eip.UID) {
+			c.updateIptablesFipQueue.Add(key)
+			return nil
+		}
+		if fip.Status.Ready {
+			return nil
+		}
 	}
 	klog.V(3).Infof("handle add fip %s", key)
 
@@ -394,6 +401,11 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 	eip, err := c.getBindableEip(cachedFip.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if cachedFip.Status.Ready {
+			if patchErr := c.patchFipStatus(key, "", "", "", "", false); patchErr != nil {
+				return fmt.Errorf("failed to mark fip %s not ready after its eip became unavailable: %w", key, patchErr)
+			}
+		}
 		return err
 	}
 
@@ -436,7 +448,8 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 		return nil
 	}
 
-	if oldV4ip != newV4ip || cachedFip.Status.InternalIP != newInternalIP {
+	if oldV4ip != newV4ip || cachedFip.Status.NatGwDp != eip.Spec.NatGwDp ||
+		cachedFip.Status.InternalIP != newInternalIP || cachedFip.Labels[util.EipUIDLabel] != string(eip.UID) {
 		// Mark FIP as not ready before starting the update.
 		// This ensures that if the controller crashes or the update fails midway,
 		// the resource will be left in a non-ready state, indicating a potential inconsistency.
@@ -565,9 +578,19 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle add iptables dnat rule %s", key)
 
-	if dnat.Status.Ready && dnat.Status.V4ip != "" {
-		// already ok
-		return nil
+	if dnat.Status.V4ip != "" && dnat.Status.NatGwDp != "" && dnat.Status.Protocol != "" &&
+		dnat.Status.ExternalPort != "" && dnat.Status.InternalIP != "" && dnat.Status.InternalPort != "" {
+		eip, getErr := c.getBindableEip(dnat.Spec.EIP)
+		if getErr != nil || dnat.Status.V4ip != eip.Status.IP || dnat.Status.NatGwDp != eip.Spec.NatGwDp ||
+			dnat.Status.Protocol != dnat.Spec.Protocol || dnat.Status.ExternalPort != dnat.Spec.ExternalPort ||
+			dnat.Status.InternalIP != dnat.Spec.InternalIP || dnat.Status.InternalPort != dnat.Spec.InternalPort ||
+			dnat.Labels[util.EipUIDLabel] != string(eip.UID) {
+			c.updateIptablesDnatRuleQueue.Add(key)
+			return nil
+		}
+		if dnat.Status.Ready {
+			return nil
+		}
 	}
 	klog.V(3).Infof("handle add iptables dnat %s", key)
 
@@ -703,6 +726,11 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 	eip, err := c.getBindableEip(cachedDnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if cachedDnat.Status.Ready {
+			if patchErr := c.patchDnatStatus(key, "", "", "", "", false); patchErr != nil {
+				return fmt.Errorf("failed to mark dnat %s not ready after its eip became unavailable: %w", key, patchErr)
+			}
+		}
 		return err
 	}
 	if dup, err := c.isDnatDuplicated(eip.Spec.NatGwDp, cachedDnat.Spec.EIP, cachedDnat.Name, cachedDnat.Spec.ExternalPort, cachedDnat.Spec.Protocol, cachedDnat.Spec.Type); dup || err != nil {
@@ -751,8 +779,9 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 		return nil
 	}
 
-	if oldV4ip != newV4ip || oldProtocol != newProtocol || oldExternalPort != newExternalPort ||
-		cachedDnat.Status.InternalIP != newInternalIP || cachedDnat.Status.InternalPort != newInternalPort {
+	if oldV4ip != newV4ip || cachedDnat.Status.NatGwDp != eip.Spec.NatGwDp ||
+		oldProtocol != newProtocol || oldExternalPort != newExternalPort || cachedDnat.Status.InternalIP != newInternalIP ||
+		cachedDnat.Status.InternalPort != newInternalPort || cachedDnat.Labels[util.EipUIDLabel] != string(eip.UID) {
 		// Mark DNAT as not ready before starting the update.
 		// This ensures that if the controller crashes or the update fails midway,
 		// the resource will be left in a non-ready state, indicating a potential inconsistency.
@@ -923,9 +952,18 @@ func (c *Controller) handleAddIptablesSnatRule(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle add iptables snat rule %s", key)
 
-	if snat.Status.Ready && snat.Status.V4ip != "" {
-		// already ok
-		return nil
+	if snat.Status.V4ip != "" && snat.Status.NatGwDp != "" && snat.Status.InternalCIDR != "" {
+		eip, getErr := c.getBindableEip(snat.Spec.EIP)
+		statusV4Cidr, _ := util.SplitStringIP(snat.Status.InternalCIDR)
+		specV4Cidr, _ := util.SplitStringIP(snat.Spec.InternalCIDR)
+		if getErr != nil || snat.Status.V4ip != eip.Status.IP || snat.Status.NatGwDp != eip.Spec.NatGwDp ||
+			statusV4Cidr != specV4Cidr || snat.Labels[util.EipUIDLabel] != string(eip.UID) {
+			c.updateIptablesSnatRuleQueue.Add(key)
+			return nil
+		}
+		if snat.Status.Ready {
+			return nil
+		}
 	}
 	klog.V(3).Infof("handle add iptables snat %s", key)
 
@@ -1039,6 +1077,11 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 	eip, err := c.getBindableEip(cachedSnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if cachedSnat.Status.Ready {
+			if patchErr := c.patchSnatStatus(key, "", "", "", "", false); patchErr != nil {
+				return fmt.Errorf("failed to mark snat %s not ready after its eip became unavailable: %w", key, patchErr)
+			}
+		}
 		return err
 	}
 
@@ -1083,7 +1126,8 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 		return nil
 	}
 
-	if oldV4ip != newV4ip || oldV4Cidr != newV4Cidr {
+	if oldV4ip != newV4ip || cachedSnat.Status.NatGwDp != eip.Spec.NatGwDp || oldV4Cidr != newV4Cidr ||
+		cachedSnat.Labels[util.EipUIDLabel] != string(eip.UID) {
 		// Mark SNAT as not ready before starting the update.
 		// This ensures that if the controller crashes or the update fails midway,
 		// the resource will be left in a non-ready state, indicating a potential inconsistency.
@@ -1934,11 +1978,7 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 		klog.Warningf("dnat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
 	} else if cachedDnat.Spec.Type == kubeovnv1.DnatRuleTypeShare {
 		// Share type: rebuild nft rule with remaining backends, or delete if none are left
-		// TODO(#73): on a rebind this passes the new EIP while the rule being cleaned belongs to the
-		// old one, so getShareBackends collects siblings from the wrong EIP and the rebuilt map can
-		// drop or delete rules that are still in use. Fixing it needs the old EIP name kept in Status
-		// or an annotation; pre-existing, tracked separately from the terminating-binding work.
-		if err := c.cleanupShareDnatInPod(key, statusNatGwDp, cachedDnat.Spec.EIP, statusProtocol, statusV4ip, statusExternalPort, cachedDnat.Name); err != nil {
+		if err := c.cleanupShareDnatInPod(key, statusNatGwDp, dnatCleanupEipName(cachedDnat), statusProtocol, statusV4ip, statusExternalPort, cachedDnat.Name); err != nil {
 			klog.Error(err)
 			firstErr = err
 		}
@@ -1987,6 +2027,13 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 		}
 	}
 	return firstErr
+}
+
+func dnatCleanupEipName(dnat *kubeovnv1.IptablesDnatRule) string {
+	if eipName := dnat.Annotations[util.VpcEipAnnotation]; eipName != "" {
+		return eipName
+	}
+	return dnat.Spec.EIP
 }
 
 // finalDeleteSnatInPod resolves (natGwDp, v4ip, v4Cidr) from the SNAT CR's Status,

@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/request"
@@ -239,6 +240,9 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	if !gw.DeletionTimestamp.IsZero() {
 		return nil
 	}
+	if err = c.rejectStaleVpcNatGwQoSGeneration(gw); err != nil {
+		return err
+	}
 
 	// create nat gw statefulset
 	c.vpcNatGwKeyMutex.LockKey(key)
@@ -335,7 +339,14 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	}
 
 	// Handle QoS update (independent of StatefulSet changes)
-	if gw.Spec.QoSPolicy != gw.Status.QoSPolicy {
+	var desiredQoS *kubeovnv1.QoSPolicy
+	if gw.Spec.QoSPolicy != "" && gw.Status.QoSPolicy == gw.Spec.QoSPolicy {
+		if desiredQoS, err = c.getAvailableQoSPolicy(gw.Spec.QoSPolicy); err != nil {
+			return err
+		}
+	}
+	qosUIDMismatch := desiredQoS != nil && gw.Labels[util.QoSPolicyUIDLabel] != string(desiredQoS.UID)
+	if gw.Spec.QoSPolicy != gw.Status.QoSPolicy || qosUIDMismatch {
 		if gw.Status.QoSPolicy != "" {
 			if err = c.execNatGwQoS(gw, gw.Status.QoSPolicy, QoSDel); err != nil {
 				klog.Errorf("failed to del qos for nat gw %s, %v", key, err)
@@ -364,6 +375,26 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	return backfillErr
 }
 
+func (c *Controller) rejectStaleVpcNatGwQoSGeneration(gw *kubeovnv1.VpcNatGateway) error {
+	if gw.Status.QoSPolicy == "" || gw.Labels[util.QoSPolicyUIDLabel] == "" {
+		return nil
+	}
+	qos, err := c.qosPoliciesLister.Get(gw.Status.QoSPolicy)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !controllerutil.ContainsFinalizer(qos, util.KubeOVNControllerFinalizer) {
+		return fmt.Errorf("vpc nat gateway %s is waiting for qos policy %s controller reconcile to restore its finalizer", gw.Name, gw.Status.QoSPolicy)
+	}
+	if gw.Labels[util.QoSPolicyUIDLabel] != string(qos.UID) {
+		return fmt.Errorf("vpc nat gateway %s references a previous generation of qos policy %s; delete and recreate the gateway before applying the new generation", gw.Name, gw.Status.QoSPolicy)
+	}
+	return nil
+}
+
 func (c *Controller) handleInitVpcNatGw(key string) error {
 	gw, err := c.vpcNatGatewayLister.Get(key)
 	if err != nil {
@@ -373,8 +404,8 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		klog.Error(err)
 		return err
 	}
-	// Terminating pods still produce update events that land here, and this path both programs the
-	// pod and writes the gateway's QoS credential.
+	// A terminating gateway can still be queued by pod update events, but this path both programs
+	// the pod and writes the gateway's QoS credential.
 	if !gw.DeletionTimestamp.IsZero() {
 		return nil
 	}
@@ -1479,7 +1510,13 @@ func (c *Controller) patchNatGwStatus(key string) error {
 }
 
 func (c *Controller) execNatGwQoS(gw *kubeovnv1.VpcNatGateway, qos, operation string) error {
-	qosPolicy, err := c.qosPoliciesLister.Get(qos)
+	var qosPolicy *kubeovnv1.QoSPolicy
+	var err error
+	if operation == QoSAdd {
+		qosPolicy, err = c.getBindableQoSPolicy(qos)
+	} else {
+		qosPolicy, err = c.qosPoliciesLister.Get(qos)
+	}
 	if err != nil {
 		klog.Errorf("get qos policy %s failed: %v", qos, err)
 		return err

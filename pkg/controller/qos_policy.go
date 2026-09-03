@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -29,10 +30,74 @@ func (c *Controller) enqueueAddQoSPolicy(obj any) {
 	// can be released; handleAddQoSPolicy does not process terminating policies. This also covers
 	// controller restart, where the informer re-lists objects already in their final state.
 	if enqueueUpdateIfTerminating(c.updateQoSPolicyQueue, key, "qos", qos.DeletionTimestamp) {
+		if err := c.enqueueQoSPolicyReferrers(qos, false); err != nil {
+			klog.Errorf("failed to enqueue referrers of terminating qos policy %s: %v", key, err)
+		}
 		return
 	}
 	klog.V(3).Infof("enqueue add qos policy %s", key)
 	c.addQoSPolicyQueue.Add(key)
+}
+
+// enqueueQoSPolicyReferrers wakes pending bindings when usable, or every live referrer when the
+// policy is authoritatively unavailable.
+func (c *Controller) enqueueQoSPolicyReferrers(qos *kubeovnv1.QoSPolicy, usable bool) error {
+	var errs []error
+	qosName := qos.Name
+	qosUID := string(qos.UID)
+	scanEips := func() {
+		eips, err := c.iptablesEipsLister.List(labels.Everything())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to list eips referencing qos policy %s: %w", qosName, err))
+			return
+		}
+		for _, eip := range eips {
+			if eip.DeletionTimestamp.IsZero() && eip.Spec.QoSPolicy == qosName {
+				boundUID := eip.Labels[util.QoSPolicyUIDLabel]
+				if !usable && boundUID != "" && boundUID != qosUID {
+					continue
+				}
+				switch {
+				case eip.Status.IP == "":
+					c.addIptablesEipQueue.Add(eip.Name)
+				case !usable || !eip.Status.Ready || eip.Status.QoSPolicy != qosName || boundUID != qosUID:
+					c.updateIptablesEipQueue.Add(eip.Name)
+				}
+			}
+		}
+	}
+
+	scanGateways := func() {
+		gateways, err := c.vpcNatGatewayLister.List(labels.Everything())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to list vpc nat gateways referencing qos policy %s: %w", qosName, err))
+			return
+		}
+		for _, gateway := range gateways {
+			boundUID := gateway.Labels[util.QoSPolicyUIDLabel]
+			if gateway.DeletionTimestamp.IsZero() && gateway.Spec.QoSPolicy == qosName &&
+				(usable || boundUID == "" || boundUID == qosUID) &&
+				(!usable || gateway.Status.QoSPolicy != qosName || boundUID != qosUID) {
+				c.addOrUpdateVpcNatGatewayQueue.Add(gateway.Name)
+			}
+		}
+	}
+
+	if qos.Spec.BindingType == qos.Status.BindingType {
+		switch qos.Status.BindingType {
+		case kubeovnv1.QoSBindingTypeEIP:
+			scanEips()
+		case kubeovnv1.QoSBindingTypeNatGw:
+			scanGateways()
+		default:
+			scanEips()
+			scanGateways()
+		}
+	} else {
+		scanEips()
+		scanGateways()
+	}
+	return errors.Join(errs...)
 }
 
 // enqueueQoSPolicyRelease re-enqueues a QoS policy whose QoSLabel a referencing resource (EIP or
@@ -49,44 +114,50 @@ func (c *Controller) enqueueQoSPolicyRelease(oldLabels, newLabels map[string]str
 	}
 }
 
-func compareQoSPolicyBandwidthLimitRules(oldObj, newObj kubeovnv1.QoSPolicyBandwidthLimitRules) bool {
-	if len(oldObj) != len(newObj) {
-		return false
-	}
-
-	// Sort both slices by Name for order-independent comparison
-	// We need to sort copies to avoid mutating the original slices
-	sortedOld := make(kubeovnv1.QoSPolicyBandwidthLimitRules, len(oldObj))
-	sortedNew := make(kubeovnv1.QoSPolicyBandwidthLimitRules, len(newObj))
-	copy(sortedOld, oldObj)
-	copy(sortedNew, newObj)
-
-	sort.Slice(sortedOld, func(i, j int) bool {
-		return sortedOld[i].Name < sortedOld[j].Name
-	})
-	sort.Slice(sortedNew, func(i, j int) bool {
-		return sortedNew[i].Name < sortedNew[j].Name
-	})
-	return reflect.DeepEqual(sortedOld, sortedNew)
+func qosPolicyStatusMatchesSpec(qos *kubeovnv1.QoSPolicy) bool {
+	return qos.StatusMatchesSpec()
 }
 
-func (c *Controller) enqueueUpdateQoSPolicy(_, newObj any) {
+func qosPolicyUsable(qos *kubeovnv1.QoSPolicy) bool {
+	return qos.DeletionTimestamp.IsZero() &&
+		controllerutil.ContainsFinalizer(qos, util.KubeOVNControllerFinalizer) &&
+		qosPolicyStatusMatchesSpec(qos)
+}
+
+func (c *Controller) enqueueUpdateQoSPolicy(oldObj, newObj any) {
+	oldQos := oldObj.(*kubeovnv1.QoSPolicy)
 	newQos := newObj.(*kubeovnv1.QoSPolicy)
 	key := cache.MetaObjectToName(newQos).String()
 	if !newQos.DeletionTimestamp.IsZero() {
+		if err := c.enqueueQoSPolicyReferrers(newQos, false); err != nil {
+			klog.Errorf("failed to enqueue referrers of terminating qos policy %s: %v", key, err)
+		}
 		klog.V(3).Infof("enqueue update to clean qos %s", key)
 		c.updateQoSPolicyQueue.Add(key)
 		return
 	}
-	// Compare newQos.Status with newQos.Spec to check if reconciliation is needed
-	// Using oldQos.Status would cause false positives when handleAddQoSPolicy patches status
-	if newQos.Status.Shared != newQos.Spec.Shared ||
-		newQos.Status.BindingType != newQos.Spec.BindingType ||
-		!compareQoSPolicyBandwidthLimitRules(newQos.Status.BandwidthLimitRules,
-			newQos.Spec.BandwidthLimitRules) {
-		klog.V(3).Infof("enqueue update qos %s", key)
+	if qosPolicyUsable(oldQos) && !controllerutil.ContainsFinalizer(newQos, util.KubeOVNControllerFinalizer) {
+		if err := c.enqueueQoSPolicyReferrers(oldQos, false); err != nil {
+			klog.Errorf("failed to enqueue referrers after qos policy %s lost its finalizer: %v", key, err)
+		}
 		c.updateQoSPolicyQueue.Add(key)
 		return
+	}
+	// Wake referrers only after the informer observes the reconciled status. Enqueuing directly
+	// after UpdateStatus returns would let an EIP read and apply the previous rules from the cache.
+	if qosPolicyUsable(newQos) {
+		if !qosPolicyUsable(oldQos) {
+			if err := c.enqueueQoSPolicyReferrers(newQos, true); err != nil {
+				klog.Errorf("failed to enqueue referrers of qos policy %s: %v", key, err)
+			}
+		}
+		return
+	}
+
+	// Compare newQos.Status with newQos.Spec to check if reconciliation is needed.
+	if !qosPolicyStatusMatchesSpec(newQos) {
+		klog.V(3).Infof("enqueue update qos %s", key)
+		c.updateQoSPolicyQueue.Add(key)
 	}
 }
 
@@ -110,6 +181,9 @@ func (c *Controller) enqueueDelQoSPolicy(obj any) {
 	key := cache.MetaObjectToName(qos).String()
 	klog.V(3).Infof("enqueue delete qos policy %s", key)
 	c.delQoSPolicyQueue.Add(key)
+	if err := c.enqueueQoSPolicyReferrers(qos, false); err != nil {
+		klog.Errorf("failed to enqueue referrers of deleted qos policy %s: %v", key, err)
+	}
 }
 
 func (c *Controller) handleAddQoSPolicy(key string) error {
@@ -142,11 +216,12 @@ func (c *Controller) handleAddQoSPolicy(key string) error {
 		return sortedNewRules[i].Name < sortedNewRules[j].Name
 	})
 
-	if reflect.DeepEqual(cachedQoS.Status.BandwidthLimitRules,
-		sortedNewRules) &&
-		cachedQoS.Status.Shared == cachedQoS.Spec.Shared &&
-		cachedQoS.Status.BindingType == cachedQoS.Spec.BindingType {
-		// already ok
+	if qosPolicyUsable(cachedQoS) {
+		return nil
+	}
+	if qosPolicyStatusMatchesSpec(cachedQoS) {
+		// The finalizer patch above produces the informer event that proves this generation has
+		// completed its first reconcile; that event wakes the referrers.
 		return nil
 	}
 	klog.V(3).Infof("handle add qos %s", key)

@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -67,6 +68,38 @@ func TestHandleAddOrUpdateVpcNatGwSkipsTerminating(t *testing.T) {
 	require.NoError(t, fc.fakeController.handleAddOrUpdateVpcNatGw("dying-gw"))
 }
 
+func TestVpcNatGatewayRejectsStaleQoSGenerationAfterReferenceIsDropped(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{
+		Name: "qos", UID: types.UID("new-uid"), Finalizers: []string{util.KubeOVNControllerFinalizer},
+	}}
+	gw := fakeGw("gw")
+	gw.Labels = map[string]string{util.QoSPolicyUIDLabel: "old-uid"}
+	gw.Status.QoSPolicy = "qos"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{qos},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.handleAddOrUpdateVpcNatGw("gw")
+	require.ErrorContains(t, err, "previous generation of qos policy qos")
+}
+
+func TestVpcNatGatewayRejectsQoSWithoutControllerFinalizer(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{ObjectMeta: metav1.ObjectMeta{Name: "qos", UID: types.UID("qos-uid")}}
+	gw := fakeGw("gw")
+	gw.Labels = map[string]string{util.QoSPolicyUIDLabel: "qos-uid"}
+	gw.Status.QoSPolicy = "qos"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{qos},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.handleAddOrUpdateVpcNatGw("gw")
+	require.ErrorContains(t, err, "waiting for qos policy qos controller reconcile")
+}
+
 // TestHandleInitVpcNatGwSkipsTerminating pins the same guard on the init path, which pod update
 // events keep feeding while the gateway pod is still terminating.
 func TestHandleInitVpcNatGwSkipsTerminating(t *testing.T) {
@@ -84,6 +117,43 @@ func TestHandleInitVpcNatGwSkipsTerminating(t *testing.T) {
 	require.NoError(t, err)
 	// Without the guard this reaches getNatGwPod and fails on the already gone pod.
 	require.NoError(t, fc.fakeController.handleInitVpcNatGw("dying-gw"))
+}
+
+func TestExecNatGwQoSWaitsForQoSPolicyStatus(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-qos"},
+		Spec: kubeovnv1.QoSPolicySpec{
+			Shared:      true,
+			BindingType: kubeovnv1.QoSBindingTypeNatGw,
+		},
+	}
+	gw := fakeGw("gw")
+	gw.Spec.QoSPolicy = "pending-qos"
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies:    []*kubeovnv1.QoSPolicy{qos},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.execNatGwQoS(gw, "pending-qos", QoSAdd)
+	require.ErrorContains(t, err, "status to match the spec")
+}
+
+func TestExecNatGwQoSAllowsCleanupOfTerminatingPolicy(t *testing.T) {
+	now := metav1.Now()
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "dying-qos", DeletionTimestamp: &now},
+		Spec:       kubeovnv1.QoSPolicySpec{Shared: true, BindingType: kubeovnv1.QoSBindingTypeNatGw},
+		Status:     kubeovnv1.QoSPolicyStatus{Shared: true, BindingType: kubeovnv1.QoSBindingTypeNatGw},
+	}
+	gw := fakeGw("gw")
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		QoSPolicies: []*kubeovnv1.QoSPolicy{qos},
+	})
+	require.NoError(t, err)
+
+	// No bandwidth rules means no pod lookup is needed; this isolates the cleanup guard.
+	require.NoError(t, fc.fakeController.execNatGwQoS(gw, "dying-qos", QoSDel))
 }
 
 func TestIsVpcNatGwChanged(t *testing.T) {

@@ -3,6 +3,8 @@ package v1
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,6 +67,18 @@ type QoSPolicyBandwidthLimitRule struct {
 }
 
 type QoSPolicyBandwidthLimitRules []QoSPolicyBandwidthLimitRule
+
+func (q *QoSPolicy) StatusMatchesSpec() bool {
+	if q.Status.Shared != q.Spec.Shared || q.Status.BindingType != q.Spec.BindingType ||
+		len(q.Status.BandwidthLimitRules) != len(q.Spec.BandwidthLimitRules) {
+		return false
+	}
+	statusRules := append(QoSPolicyBandwidthLimitRules(nil), q.Status.BandwidthLimitRules...)
+	specRules := append(QoSPolicyBandwidthLimitRules(nil), q.Spec.BandwidthLimitRules...)
+	sort.Slice(statusRules, func(i, j int) bool { return statusRules[i].Name < statusRules[j].Name })
+	sort.Slice(specRules, func(i, j int) bool { return specRules[i].Name < specRules[j].Name })
+	return reflect.DeepEqual(statusRules, specRules)
+}
 
 func (s QoSPolicyBandwidthLimitRules) Strings() string {
 	var resultNames []string
