@@ -544,6 +544,10 @@ func (c *Controller) handleUpdateQoSPolicy(key string) error {
 		return err
 	}
 
+	if qosPolicyStatusUninitialized(cachedQos) {
+		return nil
+	}
+
 	if cachedQos.Status.Shared != cachedQos.Spec.Shared ||
 		cachedQos.Status.BindingType != cachedQos.Spec.BindingType {
 		err := fmt.Errorf("not support qos %s change shared", key)
@@ -607,6 +611,10 @@ func (c *Controller) handleUpdateQoSPolicy(key string) error {
 		}
 	}
 	return nil
+}
+
+func qosPolicyStatusUninitialized(qos *kubeovnv1.QoSPolicy) bool {
+	return qos.Status.BindingType == "" && !qos.Status.Shared && len(qos.Status.BandwidthLimitRules) == 0
 }
 
 func (c *Controller) handleDelQoSPolicy(key string) error {
