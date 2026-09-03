@@ -97,7 +97,12 @@ func (c *Controller) enqueueUpdateIptablesDnatRule(oldObj, newObj any) {
 		c.updateIptablesDnatRuleQueue.Add(key)
 		return
 	}
-	if newDnat.Spec.EIP == "" || newDnat.Spec.ExternalPort == "" || newDnat.Spec.Protocol == "" ||
+	if newDnat.Spec.Protocol != util.ProtocolTCP && newDnat.Spec.Protocol != util.ProtocolUDP {
+		klog.Warningf("enqueue invalid dnat %s for protocol validation: %q", key, newDnat.Spec.Protocol)
+		c.updateIptablesDnatRuleQueue.Add(key)
+		return
+	}
+	if newDnat.Spec.EIP == "" || newDnat.Spec.ExternalPort == "" ||
 		newDnat.Spec.InternalIP == "" || newDnat.Spec.InternalPort == "" {
 		klog.Warningf("skip enqueue dnat %s: incomplete spec (eip=%q, externalPort=%q, protocol=%q, internalIP=%q, internalPort=%q)",
 			key, newDnat.Spec.EIP, newDnat.Spec.ExternalPort, newDnat.Spec.Protocol, newDnat.Spec.InternalIP, newDnat.Spec.InternalPort)
@@ -2456,8 +2461,8 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		klog.Error(err)
 		return err
 	}
-	if err = util.ValidateProtocol(dnat.Spec.Protocol); err != nil {
-		err = fmt.Errorf("%s: invalid protocol %q: %w", dnat.Name, dnat.Spec.Protocol, err)
+	if dnat.Spec.Protocol != util.ProtocolTCP && dnat.Spec.Protocol != util.ProtocolUDP {
+		err = fmt.Errorf("%s: invalid protocol %q: protocol must be lowercase tcp or udp", dnat.Name, dnat.Spec.Protocol)
 		klog.Error(err)
 		return err
 	}

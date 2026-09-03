@@ -204,7 +204,22 @@ func TestValidateDnat(t *testing.T) {
 			errMsg:  "invalid protocol",
 		},
 		{
-			name: "uppercase TCP protocol",
+			name: "mixed-case protocol",
+			dnat: &kubeovnv1.IptablesDnatRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-dnat"},
+				Spec: kubeovnv1.IptablesDnatRuleSpec{
+					EIP:          "test-eip",
+					ExternalPort: "80",
+					InternalPort: "8080",
+					InternalIP:   "10.0.0.1",
+					Protocol:     "Tcp",
+				},
+			},
+			wantErr: true,
+			errMsg:  "lowercase tcp or udp",
+		},
+		{
+			name: "uppercase protocol",
 			dnat: &kubeovnv1.IptablesDnatRule{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-dnat"},
 				Spec: kubeovnv1.IptablesDnatRuleSpec{
@@ -215,21 +230,8 @@ func TestValidateDnat(t *testing.T) {
 					Protocol:     "TCP",
 				},
 			},
-			wantErr: false,
-		},
-		{
-			name: "uppercase UDP protocol",
-			dnat: &kubeovnv1.IptablesDnatRule{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-dnat"},
-				Spec: kubeovnv1.IptablesDnatRuleSpec{
-					EIP:          "test-eip",
-					ExternalPort: "80",
-					InternalPort: "8080",
-					InternalIP:   "10.0.0.1",
-					Protocol:     "UDP",
-				},
-			},
-			wantErr: false,
+			wantErr: true,
+			errMsg:  "lowercase tcp or udp",
 		},
 		{
 			name: "invalid IPv6 internalIP - not supported",
@@ -751,6 +753,26 @@ func TestEnqueueAddIptablesDnatRule(t *testing.T) {
 		&kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Name: "live-dnat"}},
 		&kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Name: "terminating-dnat", DeletionTimestamp: &now}},
 	)
+}
+
+func TestEnqueueUpdateIptablesDnatRuleRejectsUppercaseProtocol(t *testing.T) {
+	t.Parallel()
+	queue := newTypedRateLimitingQueue[string]("UpdateIptablesDnat", nil)
+	t.Cleanup(queue.ShutDown)
+	c := &Controller{updateIptablesDnatRuleQueue: queue}
+	oldDnat := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "dnat"},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip", ExternalPort: "80", InternalPort: "8080", InternalIP: "10.0.0.1", Protocol: "TCP",
+		},
+	}
+	newDnat := oldDnat.DeepCopy()
+
+	c.enqueueUpdateIptablesDnatRule(oldDnat, newDnat)
+	item, shutdown := queue.Get()
+	require.False(t, shutdown)
+	require.Equal(t, "dnat", item)
+	queue.Done(item)
 }
 
 func TestEnqueueAddIptablesSnatRule(t *testing.T) {

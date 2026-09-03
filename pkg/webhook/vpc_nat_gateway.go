@@ -576,6 +576,13 @@ func (v *ValidatingHook) validateIptablesEIPIPFields(ctx context.Context, eip *o
 	return nil
 }
 
+func validateIptablesDnatProtocol(protocol string) error {
+	if protocol != util.ProtocolTCP && protocol != util.ProtocolUDP {
+		return fmt.Errorf("invalid iptable protocol: %s,supported params: \"tcp\", \"udp\"; protocol must be lowercase", protocol)
+	}
+	return nil
+}
+
 func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.IptablesDnatRule) error {
 	if dnat.Spec.EIP == "" {
 		return errors.New("parameter \"eip\" cannot be empty")
@@ -607,9 +614,7 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 		return err
 	}
 
-	if !strings.EqualFold(dnat.Spec.Protocol, "tcp") &&
-		!strings.EqualFold(dnat.Spec.Protocol, "udp") {
-		err := fmt.Errorf("invalid iptable protocol: %s,supported params: \"tcp\", \"udp\"", dnat.Spec.Protocol)
+	if err := validateIptablesDnatProtocol(dnat.Spec.Protocol); err != nil {
 		return err
 	}
 
