@@ -204,6 +204,21 @@ func TestValidateDnat(t *testing.T) {
 			errMsg:  "invalid protocol",
 		},
 		{
+			name: "mixed-case protocol",
+			dnat: &kubeovnv1.IptablesDnatRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-dnat"},
+				Spec: kubeovnv1.IptablesDnatRuleSpec{
+					EIP:          "test-eip",
+					ExternalPort: "80",
+					InternalPort: "8080",
+					InternalIP:   "10.0.0.1",
+					Protocol:     "Tcp",
+				},
+			},
+			wantErr: true,
+			errMsg:  "lowercase tcp or udp",
+		},
+		{
 			name: "uppercase protocol",
 			dnat: &kubeovnv1.IptablesDnatRule{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-dnat"},

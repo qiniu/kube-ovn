@@ -2461,8 +2461,7 @@ func (c *Controller) validateDnatRule(dnat *kubeovnv1.IptablesDnatRule) error {
 		klog.Error(err)
 		return err
 	}
-	if err = util.ValidateProtocol(dnat.Spec.Protocol); err != nil ||
-		(dnat.Spec.Protocol != util.ProtocolTCP && dnat.Spec.Protocol != util.ProtocolUDP) {
+	if dnat.Spec.Protocol != util.ProtocolTCP && dnat.Spec.Protocol != util.ProtocolUDP {
 		err = fmt.Errorf("%s: invalid protocol %q: protocol must be lowercase tcp or udp", dnat.Name, dnat.Spec.Protocol)
 		klog.Error(err)
 		return err
