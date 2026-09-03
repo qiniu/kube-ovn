@@ -260,6 +260,10 @@ func TestUpdateQoSPolicyAllowsInitialStatusInitialization(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, fc.fakeController.handleUpdateQoSPolicy("qos"))
+	stored, err := fc.fakeController.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(t.Context(), "qos", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, qos.Spec.BindingType, stored.Status.BindingType)
+	require.Equal(t, qos.Spec.BandwidthLimitRules, stored.Status.BandwidthLimitRules)
 }
 
 func TestUpdateQoSPolicyRejectsInitializedBindingTypeChange(t *testing.T) {
@@ -272,6 +276,17 @@ func TestUpdateQoSPolicyRejectsInitializedBindingTypeChange(t *testing.T) {
 	require.NoError(t, err)
 
 	require.ErrorContains(t, fc.fakeController.handleUpdateQoSPolicy("qos"), "not support qos qos change shared")
+}
+
+func TestUpdateQoSPolicyValidatesInitialStatusInitialization(t *testing.T) {
+	qos := &kubeovnv1.QoSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "qos"},
+		Spec:       kubeovnv1.QoSPolicySpec{BindingType: kubeovnv1.QoSBindingTypeNatGw},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{QoSPolicies: []*kubeovnv1.QoSPolicy{qos}})
+	require.NoError(t, err)
+
+	require.ErrorContains(t, fc.fakeController.handleUpdateQoSPolicy("qos"), "not shared")
 }
 
 func TestQoSPolicyFinalizerLossEnqueuesAndRestores(t *testing.T) {

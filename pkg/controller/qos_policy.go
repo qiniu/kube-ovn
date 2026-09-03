@@ -494,6 +494,7 @@ func (c *Controller) handleUpdateQoSPolicy(key string) error {
 	c.vpcNatGwKeyMutex.LockKey(key)
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(key) }()
 	klog.Infof("handle update QoS policy %s", key)
+	hadControllerFinalizer := controllerutil.ContainsFinalizer(cachedQos, util.KubeOVNControllerFinalizer)
 
 	// should delete
 	if !cachedQos.DeletionTimestamp.IsZero() {
@@ -544,8 +545,13 @@ func (c *Controller) handleUpdateQoSPolicy(key string) error {
 		return err
 	}
 
-	if qosPolicyStatusUninitialized(cachedQos) {
-		return nil
+	if !hadControllerFinalizer && qosPolicyStatusUninitialized(cachedQos) {
+		if err := c.validateQosPolicy(cachedQos); err != nil {
+			return err
+		}
+		sortedRules := append(kubeovnv1.QoSPolicyBandwidthLimitRules(nil), cachedQos.Spec.BandwidthLimitRules...)
+		sort.Slice(sortedRules, func(i, j int) bool { return sortedRules[i].Name < sortedRules[j].Name })
+		return c.patchQoSStatus(key, cachedQos.Spec.Shared, cachedQos.Spec.BindingType, sortedRules)
 	}
 
 	if cachedQos.Status.Shared != cachedQos.Spec.Shared ||
