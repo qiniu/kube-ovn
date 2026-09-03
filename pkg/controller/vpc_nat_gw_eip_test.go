@@ -336,6 +336,52 @@ func TestEipReferrerGenerationsAreIsolated(t *testing.T) {
 	}
 }
 
+func TestEipInvalidationWakesRulesBoundByUIDAfterSpecRebind(t *testing.T) {
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "old-eip", UID: types.UID("old-eip-uid")},
+		Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: "gw"},
+		Status:     kubeovnv1.IptablesEIPStatus{Ready: false, IP: "1.1.1.1"},
+	}
+	fip := &kubeovnv1.IptablesFIPRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "fip", Labels: map[string]string{util.EipUIDLabel: "old-eip-uid"}},
+		Spec:       kubeovnv1.IptablesFIPRuleSpec{EIP: "new-eip", InternalIP: "10.0.0.1"},
+		Status:     kubeovnv1.IptablesFIPRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalIP: "10.0.0.1"},
+	}
+	dnat := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "dnat", Labels: map[string]string{util.EipUIDLabel: "old-eip-uid"}},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "new-eip", Protocol: "tcp", ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+		Status: kubeovnv1.IptablesDnatRuleStatus{
+			Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", Protocol: "tcp",
+			ExternalPort: "80", InternalIP: "10.0.0.2", InternalPort: "8080",
+		},
+	}
+	snat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{Name: "snat", Labels: map[string]string{util.EipUIDLabel: "old-eip-uid"}},
+		Spec:       kubeovnv1.IptablesSnatRuleSpec{EIP: "new-eip", InternalCIDR: "10.0.0.0/24"},
+		Status:     kubeovnv1.IptablesSnatRuleStatus{Ready: true, V4ip: "1.1.1.1", NatGwDp: "gw", InternalCIDR: "10.0.0.0/24"},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesFIPs:      []*kubeovnv1.IptablesFIPRule{fip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{dnat},
+		IptablesSnatRules: []*kubeovnv1.IptablesSnatRule{snat},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.updateIptablesFipQueue = newTypedRateLimitingQueue[string]("UpdateIptablesFip", nil)
+	c.updateIptablesDnatRuleQueue = newTypedRateLimitingQueue[string]("UpdateIptablesDnat", nil)
+	c.updateIptablesSnatRuleQueue = newTypedRateLimitingQueue[string]("UpdateIptablesSnat", nil)
+	t.Cleanup(c.updateIptablesFipQueue.ShutDown)
+	t.Cleanup(c.updateIptablesDnatRuleQueue.ShutDown)
+	t.Cleanup(c.updateIptablesSnatRuleQueue.ShutDown)
+
+	require.NoError(t, c.enqueueIptablesEipReferrers(eip, false))
+	require.Equal(t, 1, c.updateIptablesFipQueue.Len())
+	require.Equal(t, 1, c.updateIptablesDnatRuleQueue.Len())
+	require.Equal(t, 1, c.updateIptablesSnatRuleQueue.Len())
+}
+
 func TestReadyEipAddReplayDoesNotScanReferrers(t *testing.T) {
 	eip := &kubeovnv1.IptablesEIP{
 		ObjectMeta: metav1.ObjectMeta{Name: "eip"},

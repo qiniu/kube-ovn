@@ -391,6 +391,13 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 	klog.V(3).Infof("handle update fip %s", key)
 	// add or update should make sure vpc nat enabled
 	if vpcNatEnabled != "true" {
+		if released, releaseErr := c.releaseDeletedEipRef(
+			key, util.FipUsingEip, cachedFip.Spec.EIP, cachedFip.Labels, cachedFip.Annotations,
+			func() error { return c.finalDeleteFipInPod(key, cachedFip) },
+			func() error { return c.patchFipStatus(key, "", "", "", "", false) },
+		); released || releaseErr != nil {
+			return releaseErr
+		}
 		return errors.New("iptables nat gw not enable")
 	}
 
@@ -401,6 +408,13 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 	eip, err := c.getBindableEip(cachedFip.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if released, releaseErr := c.releaseDeletedEipRef(
+			key, util.FipUsingEip, cachedFip.Spec.EIP, cachedFip.Labels, cachedFip.Annotations,
+			func() error { return c.finalDeleteFipInPod(key, cachedFip) },
+			func() error { return c.patchFipStatus(key, "", "", "", "", false) },
+		); released || releaseErr != nil {
+			return releaseErr
+		}
 		if cachedFip.Status.Ready {
 			if patchErr := c.patchFipStatus(key, "", "", "", "", false); patchErr != nil {
 				return fmt.Errorf("failed to mark fip %s not ready after its eip became unavailable: %w", key, patchErr)
@@ -471,6 +485,7 @@ func (c *Controller) handleUpdateIptablesFip(key string) error {
 			klog.Errorf("failed to update label for fip %s, %v", key, err)
 			return err
 		}
+		c.enqueueDeletingOldIptablesEip(cachedFip.Annotations[util.VpcEipAnnotation], cachedFip.Spec.EIP)
 		if err = c.createFipInPod(eip.Spec.NatGwDp, newV4ip, newInternalIP); err != nil {
 			klog.Errorf("failed to create fip %s, %v", key, err)
 			return err
@@ -716,6 +731,13 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 	// isDnatDuplicated lister scan (matching handleAddIptablesDnatRule) so we do not scan when
 	// the NAT GW is disabled.
 	if vpcNatEnabled != "true" {
+		if released, releaseErr := c.releaseDeletedEipRef(
+			key, util.DnatUsingEip, cachedDnat.Spec.EIP, cachedDnat.Labels, cachedDnat.Annotations,
+			func() error { return c.finalDeleteDnatInPod(key, cachedDnat) },
+			func() error { return c.patchDnatStatus(key, "", "", "", "", false) },
+		); released || releaseErr != nil {
+			return releaseErr
+		}
 		return errors.New("iptables nat gw not enable")
 	}
 
@@ -726,6 +748,13 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 	eip, err := c.getBindableEip(cachedDnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if released, releaseErr := c.releaseDeletedEipRef(
+			key, util.DnatUsingEip, cachedDnat.Spec.EIP, cachedDnat.Labels, cachedDnat.Annotations,
+			func() error { return c.finalDeleteDnatInPod(key, cachedDnat) },
+			func() error { return c.patchDnatStatus(key, "", "", "", "", false) },
+		); released || releaseErr != nil {
+			return releaseErr
+		}
 		if cachedDnat.Status.Ready {
 			if patchErr := c.patchDnatStatus(key, "", "", "", "", false); patchErr != nil {
 				return fmt.Errorf("failed to mark dnat %s not ready after its eip became unavailable: %w", key, patchErr)
@@ -803,6 +832,7 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 			klog.Errorf("failed to patch label for dnat %s, %v", key, err)
 			return err
 		}
+		c.enqueueDeletingOldIptablesEip(cachedDnat.Annotations[util.VpcEipAnnotation], cachedDnat.Spec.EIP)
 
 		switch cachedDnat.Spec.Type {
 		case kubeovnv1.DnatRuleTypeShare:
@@ -1077,6 +1107,13 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 	eip, err := c.getBindableEip(cachedSnat.Spec.EIP)
 	if err != nil {
 		klog.Errorf("failed to get eip, %v", err)
+		if released, releaseErr := c.releaseDeletedEipRef(
+			key, util.SnatUsingEip, cachedSnat.Spec.EIP, cachedSnat.Labels, cachedSnat.Annotations,
+			func() error { return c.finalDeleteSnatInPod(key, cachedSnat) },
+			func() error { return c.patchSnatStatus(key, "", "", "", "", false) },
+		); released || releaseErr != nil {
+			return releaseErr
+		}
 		if cachedSnat.Status.Ready {
 			if patchErr := c.patchSnatStatus(key, "", "", "", "", false); patchErr != nil {
 				return fmt.Errorf("failed to mark snat %s not ready after its eip became unavailable: %w", key, patchErr)
@@ -1149,6 +1186,7 @@ func (c *Controller) handleUpdateIptablesSnatRule(key string) error {
 			klog.Errorf("failed to patch label for snat %s, %v", key, err)
 			return err
 		}
+		c.enqueueDeletingOldIptablesEip(cachedSnat.Annotations[util.VpcEipAnnotation], cachedSnat.Spec.EIP)
 		if err = c.createSnatInPod(eip.Spec.NatGwDp, newV4ip, newV4Cidr); err != nil {
 			klog.Errorf("failed to create snat %s, %v", key, err)
 			return err
@@ -1419,6 +1457,87 @@ func (c *Controller) patchFipLabel(key string, eip *kubeovnv1.IptablesEIP) error
 		}
 	}
 	return nil
+}
+
+func (c *Controller) releaseDeletedEipRef(
+	key, natType, eipName string,
+	currentLabels, currentAnnotations map[string]string,
+	deleteInPod func() error,
+	markNotReady func() error,
+) (bool, error) {
+	boundEipName := boundIptablesEipName(eipName, currentAnnotations)
+	deleted, err := c.eipDeletedOrDeleting(boundEipName)
+	if err != nil || !deleted {
+		return false, err
+	}
+	if vpcNatEnabled == "true" {
+		if err := deleteInPod(); err != nil {
+			return true, err
+		}
+	}
+	if err := markNotReady(); err != nil {
+		return true, err
+	}
+	if err := c.releaseIptablesEipClaim(key, natType, currentLabels, currentAnnotations); err != nil {
+		return true, err
+	}
+	if c.updateIptablesEipQueue != nil {
+		c.updateIptablesEipQueue.Add(boundEipName)
+	}
+	return true, nil
+}
+
+func boundIptablesEipName(specEipName string, annotations map[string]string) string {
+	if eipName := annotations[util.VpcEipAnnotation]; eipName != "" {
+		return eipName
+	}
+	return specEipName
+}
+
+func (c *Controller) eipDeletedOrDeleting(eipName string) (bool, error) {
+	eip, err := c.iptablesEipsLister.Get(eipName)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return !eip.DeletionTimestamp.IsZero(), nil
+}
+
+func (c *Controller) releaseIptablesEipClaim(key, natType string, currentLabels, currentAnnotations map[string]string) error {
+	labels := copyLabels(currentLabels)
+	delete(labels, util.VpcNatGatewayNameLabel)
+	delete(labels, util.VpcDnatEPortLabel)
+	delete(labels, util.EipV4IpLabel)
+	delete(labels, util.EipUIDLabel)
+	if len(labels) != len(currentLabels) {
+		if err := c.updateIptableLabels(key, patchLabelsOp(currentLabels), natType, labels); err != nil {
+			return err
+		}
+	}
+	annotations := copyLabels(currentAnnotations)
+	delete(annotations, util.VpcEipAnnotation)
+	if len(annotations) != len(currentAnnotations) {
+		if err := c.updateIptableAnnotations(key, patchLabelsOp(currentAnnotations), natType, annotations); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) enqueueDeletingOldIptablesEip(oldEipName, currentEipName string) {
+	if oldEipName == "" || oldEipName == currentEipName || c.updateIptablesEipQueue == nil {
+		return
+	}
+	deleted, err := c.eipDeletedOrDeleting(oldEipName)
+	if err != nil {
+		klog.Errorf("failed to check old eip %s deletion state: %v", oldEipName, err)
+		return
+	}
+	if deleted {
+		c.updateIptablesEipQueue.Add(oldEipName)
+	}
 }
 
 func (c *Controller) syncIptablesSnatFinalizer(cl client.Client) error {
