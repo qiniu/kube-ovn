@@ -92,7 +92,7 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 		c.enqueueUpdateQoSPolicy(oldQos, newQos)
 		require.Equal(t, 1, c.updateQoSPolicyQueue.Len())
 		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
-		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+		require.Zero(t, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
 
 	t.Run("terminating add replay notifies referrers", func(t *testing.T) {
@@ -108,7 +108,7 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 		c.enqueueAddQoSPolicy(qos)
 		require.Equal(t, 1, c.updateQoSPolicyQueue.Len())
 		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
-		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+		require.Zero(t, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
 
 	t.Run("finalizer removal invalidates referrers", func(t *testing.T) {
@@ -123,17 +123,32 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 		c.enqueueUpdateQoSPolicy(oldQos, newQos)
 		require.Equal(t, 1, c.updateQoSPolicyQueue.Len())
 		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
-		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+		require.Zero(t, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
 
-	t.Run("eip list failure does not block gateway notification", func(t *testing.T) {
+	t.Run("mismatched binding type falls back to both scans", func(t *testing.T) {
 		originalLister := c.iptablesEipsLister
 		t.Cleanup(func() { c.iptablesEipsLister = originalLister })
 		c.iptablesEipsLister = failingEipLister{}
 		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("ListFailureGw", nil)
 		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
-		err := c.enqueueQoSPolicyReferrers(oldQos, false)
+		mismatchedQos := oldQos.DeepCopy()
+		mismatchedQos.Spec.BindingType = kubeovnv1.QoSBindingTypeNatGw
+		err := c.enqueueQoSPolicyReferrers(mismatchedQos, false)
 		require.ErrorContains(t, err, "eip lister failed")
+		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+	})
+
+	t.Run("nat gw binding type scans only gateways", func(t *testing.T) {
+		c.updateIptablesEipQueue = newTypedRateLimitingQueue[string]("NatGwTypeEip", nil)
+		c.addOrUpdateVpcNatGatewayQueue = newTypedRateLimitingQueue[string]("NatGwTypeGw", nil)
+		t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+		t.Cleanup(c.addOrUpdateVpcNatGatewayQueue.ShutDown)
+		qos := oldQos.DeepCopy()
+		qos.Spec.BindingType = kubeovnv1.QoSBindingTypeNatGw
+		qos.Status.BindingType = kubeovnv1.QoSBindingTypeNatGw
+		require.NoError(t, c.enqueueQoSPolicyReferrers(qos, false))
+		require.Zero(t, c.updateIptablesEipQueue.Len())
 		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
 
@@ -161,7 +176,7 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 		deletingQos.DeletionTimestamp = &now
 		c.enqueueUpdateQoSPolicy(pendingQos, deletingQos)
 		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
-		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+		require.Zero(t, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
 
 	t.Run("delete event notifies referrers", func(t *testing.T) {
@@ -174,7 +189,7 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 		c.enqueueDelQoSPolicy(oldQos)
 		require.Equal(t, 1, c.delQoSPolicyQueue.Len())
 		require.Equal(t, 1, c.updateIptablesEipQueue.Len())
-		require.Equal(t, 1, c.addOrUpdateVpcNatGatewayQueue.Len())
+		require.Zero(t, c.addOrUpdateVpcNatGatewayQueue.Len())
 	})
 
 	t.Run("same-name generations are isolated by uid", func(t *testing.T) {
@@ -210,7 +225,7 @@ func TestQoSPolicyInvalidationEnqueuesEstablishedReferrers(t *testing.T) {
 
 				require.NoError(t, c.enqueueQoSPolicyReferrers(tc.eventQos, tc.usable))
 				require.Equal(t, tc.wantQueued, c.updateIptablesEipQueue.Len())
-				require.Equal(t, tc.wantQueued, c.addOrUpdateVpcNatGatewayQueue.Len())
+				require.Zero(t, c.addOrUpdateVpcNatGatewayQueue.Len())
 			})
 		}
 	})

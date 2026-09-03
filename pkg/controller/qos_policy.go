@@ -45,10 +45,12 @@ func (c *Controller) enqueueQoSPolicyReferrers(qos *kubeovnv1.QoSPolicy, usable 
 	var errs []error
 	qosName := qos.Name
 	qosUID := string(qos.UID)
-	eips, err := c.iptablesEipsLister.List(labels.Everything())
-	if err != nil {
-		errs = append(errs, fmt.Errorf("failed to list eips referencing qos policy %s: %w", qosName, err))
-	} else {
+	scanEips := func() {
+		eips, err := c.iptablesEipsLister.List(labels.Everything())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to list eips referencing qos policy %s: %w", qosName, err))
+			return
+		}
 		for _, eip := range eips {
 			if eip.DeletionTimestamp.IsZero() && eip.Spec.QoSPolicy == qosName {
 				boundUID := eip.Labels[util.QoSPolicyUIDLabel]
@@ -65,10 +67,12 @@ func (c *Controller) enqueueQoSPolicyReferrers(qos *kubeovnv1.QoSPolicy, usable 
 		}
 	}
 
-	gateways, err := c.vpcNatGatewayLister.List(labels.Everything())
-	if err != nil {
-		errs = append(errs, fmt.Errorf("failed to list vpc nat gateways referencing qos policy %s: %w", qosName, err))
-	} else {
+	scanGateways := func() {
+		gateways, err := c.vpcNatGatewayLister.List(labels.Everything())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to list vpc nat gateways referencing qos policy %s: %w", qosName, err))
+			return
+		}
 		for _, gateway := range gateways {
 			boundUID := gateway.Labels[util.QoSPolicyUIDLabel]
 			if gateway.DeletionTimestamp.IsZero() && gateway.Spec.QoSPolicy == qosName &&
@@ -77,6 +81,21 @@ func (c *Controller) enqueueQoSPolicyReferrers(qos *kubeovnv1.QoSPolicy, usable 
 				c.addOrUpdateVpcNatGatewayQueue.Add(gateway.Name)
 			}
 		}
+	}
+
+	if qos.Spec.BindingType == qos.Status.BindingType {
+		switch qos.Status.BindingType {
+		case kubeovnv1.QoSBindingTypeEIP:
+			scanEips()
+		case kubeovnv1.QoSBindingTypeNatGw:
+			scanGateways()
+		default:
+			scanEips()
+			scanGateways()
+		}
+	} else {
+		scanEips()
+		scanGateways()
 	}
 	return errors.Join(errs...)
 }
