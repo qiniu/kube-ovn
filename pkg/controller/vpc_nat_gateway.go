@@ -404,8 +404,8 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		klog.Error(err)
 		return err
 	}
-	// Terminating pods still produce update events that land here, and this path both programs the
-	// pod and writes the gateway's QoS credential.
+	// A terminating gateway can still be queued by pod update events, but this path both programs
+	// the pod and writes the gateway's QoS credential.
 	if !gw.DeletionTimestamp.IsZero() {
 		return nil
 	}
@@ -1510,9 +1510,12 @@ func (c *Controller) patchNatGwStatus(key string) error {
 }
 
 func (c *Controller) execNatGwQoS(gw *kubeovnv1.VpcNatGateway, qos, operation string) error {
-	qosPolicy, err := c.qosPoliciesLister.Get(qos)
+	var qosPolicy *kubeovnv1.QoSPolicy
+	var err error
 	if operation == QoSAdd {
 		qosPolicy, err = c.getBindableQoSPolicy(qos)
+	} else {
+		qosPolicy, err = c.qosPoliciesLister.Get(qos)
 	}
 	if err != nil {
 		klog.Errorf("get qos policy %s failed: %v", qos, err)
