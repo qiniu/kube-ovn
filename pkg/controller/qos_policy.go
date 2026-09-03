@@ -95,31 +95,8 @@ func (c *Controller) enqueueQoSPolicyRelease(oldLabels, newLabels map[string]str
 	}
 }
 
-func compareQoSPolicyBandwidthLimitRules(oldObj, newObj kubeovnv1.QoSPolicyBandwidthLimitRules) bool {
-	if len(oldObj) != len(newObj) {
-		return false
-	}
-
-	// Sort both slices by Name for order-independent comparison
-	// We need to sort copies to avoid mutating the original slices
-	sortedOld := make(kubeovnv1.QoSPolicyBandwidthLimitRules, len(oldObj))
-	sortedNew := make(kubeovnv1.QoSPolicyBandwidthLimitRules, len(newObj))
-	copy(sortedOld, oldObj)
-	copy(sortedNew, newObj)
-
-	sort.Slice(sortedOld, func(i, j int) bool {
-		return sortedOld[i].Name < sortedOld[j].Name
-	})
-	sort.Slice(sortedNew, func(i, j int) bool {
-		return sortedNew[i].Name < sortedNew[j].Name
-	})
-	return reflect.DeepEqual(sortedOld, sortedNew)
-}
-
 func qosPolicyStatusMatchesSpec(qos *kubeovnv1.QoSPolicy) bool {
-	return qos.Status.Shared == qos.Spec.Shared &&
-		qos.Status.BindingType == qos.Spec.BindingType &&
-		compareQoSPolicyBandwidthLimitRules(qos.Status.BandwidthLimitRules, qos.Spec.BandwidthLimitRules)
+	return qos.StatusMatchesSpec()
 }
 
 func qosPolicyUsable(qos *kubeovnv1.QoSPolicy) bool {

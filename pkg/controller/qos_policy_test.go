@@ -877,7 +877,7 @@ func TestValidateDirection(t *testing.T) {
 	}
 }
 
-func TestCompareQoSPolicyBandwidthLimitRules(t *testing.T) {
+func TestQoSPolicyStatusMatchesSpec(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -927,7 +927,10 @@ func TestCompareQoSPolicyBandwidthLimitRules(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := compareQoSPolicyBandwidthLimitRules(tt.oldObj, tt.newObj)
+			got := (&kubeovnv1.QoSPolicy{
+				Spec:   kubeovnv1.QoSPolicySpec{BandwidthLimitRules: tt.newObj},
+				Status: kubeovnv1.QoSPolicyStatus{BandwidthLimitRules: tt.oldObj},
+			}).StatusMatchesSpec()
 			assert.Equal(t, tt.want, got)
 		})
 	}

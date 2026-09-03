@@ -1978,11 +1978,7 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 		klog.Warningf("dnat %s: skip status-based cleanup due to incomplete identity (v4ip=%q, natGwDp=%q)", key, statusV4ip, statusNatGwDp)
 	} else if cachedDnat.Spec.Type == kubeovnv1.DnatRuleTypeShare {
 		// Share type: rebuild nft rule with remaining backends, or delete if none are left
-		// TODO(#73): on a rebind this passes the new EIP while the rule being cleaned belongs to the
-		// old one, so getShareBackends collects siblings from the wrong EIP and the rebuilt map can
-		// drop or delete rules that are still in use. Fixing it needs the old EIP name kept in Status
-		// or an annotation; pre-existing, tracked separately from the terminating-binding work.
-		if err := c.cleanupShareDnatInPod(key, statusNatGwDp, cachedDnat.Spec.EIP, statusProtocol, statusV4ip, statusExternalPort, cachedDnat.Name); err != nil {
+		if err := c.cleanupShareDnatInPod(key, statusNatGwDp, dnatCleanupEipName(cachedDnat), statusProtocol, statusV4ip, statusExternalPort, cachedDnat.Name); err != nil {
 			klog.Error(err)
 			firstErr = err
 		}
@@ -2031,6 +2027,13 @@ func (c *Controller) finalDeleteDnatInPod(key string, cachedDnat *kubeovnv1.Ipta
 		}
 	}
 	return firstErr
+}
+
+func dnatCleanupEipName(dnat *kubeovnv1.IptablesDnatRule) string {
+	if eipName := dnat.Annotations[util.VpcEipAnnotation]; eipName != "" {
+		return eipName
+	}
+	return dnat.Spec.EIP
 }
 
 // finalDeleteSnatInPod resolves (natGwDp, v4ip, v4Cidr) from the SNAT CR's Status,
