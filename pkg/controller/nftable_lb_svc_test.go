@@ -1,0 +1,336 @@
+package controller
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+
+	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/util"
+)
+
+func Test_nftableLbSvcQualifies(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		svc      *v1.Service
+		expected bool
+	}{
+		{name: "loadbalancer with eip annotation", svc: &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.EipAnnotation: "eip0"}},
+			Spec:       v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		}, expected: true},
+		{name: "loadbalancer without eip annotation", svc: &v1.Service{
+			Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		}, expected: false},
+		{name: "clusterip with eip annotation", svc: &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.EipAnnotation: "eip0"}},
+			Spec:       v1.ServiceSpec{Type: v1.ServiceTypeClusterIP},
+		}, expected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.expected, nftableLbSvcQualifies(tt.svc))
+		})
+	}
+}
+
+func TestNftableLbEventHelpersRespectFeatureGate(t *testing.T) {
+	t.Parallel()
+
+	c := &Controller{config: &Configuration{EnableLb: true}}
+	require.NotPanics(t, func() {
+		c.enqueueNftableLbServicesForPod(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "pod"}})
+		c.enqueueNftableLbServicesForEIP("eip0")
+		c.enqueueNftableLbServicesForNatGw("gw")
+	})
+}
+
+func TestEnqueueNftableLbSvcOwnersFromRules(t *testing.T) {
+	t.Parallel()
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	for _, rule := range []*kubeovnv1.IptablesDnatRule{
+		{ObjectMeta: metav1.ObjectMeta{Name: "owned-a", Labels: map[string]string{util.NftableLbSvcNsLabel: "ns1", util.NftableLbSvcNameLabel: "svc1"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "owned-b", Labels: map[string]string{util.NftableLbSvcNsLabel: "ns1", util.NftableLbSvcNameLabel: "svc1"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "owned-c", Labels: map[string]string{util.NftableLbSvcNsLabel: "ns2", util.NftableLbSvcNameLabel: "svc2"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "manual"}, Spec: kubeovnv1.IptablesDnatRuleSpec{Type: kubeovnv1.DnatRuleTypeShare}},
+	} {
+		require.NoError(t, indexer.Add(rule))
+	}
+
+	c := &Controller{
+		config:                       &Configuration{EnableLb: true, EnableNftableLbSvc: true},
+		iptablesDnatRulesLister:      kubeovnlister.NewIptablesDnatRuleLister(indexer),
+		addOrUpdateNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateNftableLbSvc", nil),
+	}
+	t.Cleanup(c.addOrUpdateNftableLbSvcQueue.ShutDown)
+	require.NoError(t, c.enqueueNftableLbSvcOwnersFromRules())
+	require.Equal(t, 2, c.addOrUpdateNftableLbSvcQueue.Len())
+	owners := map[string]struct{}{}
+	for c.addOrUpdateNftableLbSvcQueue.Len() > 0 {
+		owner, _ := c.addOrUpdateNftableLbSvcQueue.Get()
+		owners[owner] = struct{}{}
+		c.addOrUpdateNftableLbSvcQueue.Done(owner)
+	}
+	require.Equal(t, map[string]struct{}{"ns1/svc1": {}, "ns2/svc2": {}}, owners)
+}
+
+func Test_nftableLbDnatRuleName(t *testing.T) {
+	t.Parallel()
+
+	a := nftableLbDnatRuleName("ns", "svc", "tcp", "80", "10.0.0.1", "8080")
+	b := nftableLbDnatRuleName("ns", "svc", "tcp", "80", "10.0.0.1", "8080")
+	require.Equal(t, a, b)
+	require.NotEqual(t, a, nftableLbDnatRuleName("ns", "svc", "tcp", "80", "10.0.0.2", "8080"))
+
+	longName := "this-is-a-very-long-service-name-that-exceeds-the-kubernetes-limit-for-sure"
+	got := nftableLbDnatRuleName("ns", longName, "tcp", "80", "10.0.0.1", "8080")
+	require.LessOrEqual(t, len(got), 63)
+	require.Empty(t, validation.IsDNS1123Subdomain(got))
+}
+
+func Test_nftableLbBackendResolver_missingTargetPod(t *testing.T) {
+	t.Parallel()
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	c := &Controller{podsLister: corelisters.NewPodLister(indexer)}
+	resolver := c.nftableLbBackendResolver(&v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "ns"}}, "gw-vpc")
+
+	ep := discoveryv1.Endpoint{
+		Addresses: []string{"10.0.0.1"},
+		TargetRef: &v1.ObjectReference{Kind: "Pod", Namespace: "ns", Name: "gone"},
+	}
+	ip, ok := resolver(ep)
+	require.False(t, ok)
+	require.Empty(t, ip)
+	ip, ok = resolver(discoveryv1.Endpoint{Addresses: []string{"10.0.0.2"}})
+	require.True(t, ok)
+	require.Equal(t, "10.0.0.2", ip)
+}
+
+func testNftableLbBackendIP(ep discoveryv1.Endpoint) (string, bool) {
+	ip := firstIPv4(ep.Addresses)
+	return ip, ip != ""
+}
+
+func Test_selectNftableLbBackendIPv4(t *testing.T) {
+	t.Parallel()
+
+	ip, ok := selectNftableLbBackendIPv4([]nftableLbNicCandidate{{ipv4: "10.0.0.1", vpc: "vpc1"}}, "vpc1")
+	require.True(t, ok)
+	require.Equal(t, "10.0.0.1", ip)
+	ip, ok = selectNftableLbBackendIPv4([]nftableLbNicCandidate{
+		{ipv4: "10.16.0.5", vpc: "ovn-cluster"}, {ipv4: "192.168.0.5", vpc: "vpc1"},
+	}, "vpc1")
+	require.True(t, ok)
+	require.Equal(t, "192.168.0.5", ip)
+	ip, ok = selectNftableLbBackendIPv4([]nftableLbNicCandidate{
+		{ipv4: "192.168.0.9", vpc: "vpc1"}, {ipv4: "192.168.0.3", vpc: "vpc1"},
+	}, "vpc1")
+	require.True(t, ok)
+	require.Equal(t, "192.168.0.3", ip)
+	_, ok = selectNftableLbBackendIPv4([]nftableLbNicCandidate{{ipv4: "10.16.0.5", vpc: "ovn-cluster"}}, "vpc1")
+	require.False(t, ok)
+	_, ok = selectNftableLbBackendIPv4([]nftableLbNicCandidate{{ipv4: "", vpc: "vpc1"}}, "vpc1")
+	require.False(t, ok)
+	_, ok = selectNftableLbBackendIPv4(nil, "vpc1")
+	require.False(t, ok)
+}
+
+func Test_firstIPv4(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "10.0.0.1", firstIPv4([]string{"fd00::1", "10.0.0.1"}))
+	require.Equal(t, "10.0.0.1", firstIPv4([]string{"10.0.0.1"}))
+	require.Empty(t, firstIPv4([]string{"fd00::1"}))
+	require.Empty(t, firstIPv4(nil))
+}
+
+func Test_buildDesiredNftableLbDnatRules(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
+		Type:  v1.ServiceTypeLoadBalancer,
+		Ports: []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}, {Name: "sctp", Port: 90, Protocol: v1.ProtocolSCTP}},
+	}}
+	endpointSlices := []*discoveryv1.EndpointSlice{{
+		Ports: []discoveryv1.EndpointPort{{Name: new("http"), Port: new(int32(8080))}},
+		Endpoints: []discoveryv1.Endpoint{
+			{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}},
+			{Addresses: []string{"10.0.0.2"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}},
+			{Addresses: []string{"10.0.0.3"}, Conditions: discoveryv1.EndpointConditions{Ready: new(false)}},
+			{Addresses: []string{"fd00::1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}},
+		},
+	}}
+
+	desired := buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP)
+	require.Len(t, desired, 2)
+	backends := make(map[string]*kubeovnv1.IptablesDnatRule)
+	for _, rule := range desired {
+		require.Equal(t, "eip0", rule.Spec.EIP)
+		require.Equal(t, "80", rule.Spec.ExternalPort)
+		require.Equal(t, "8080", rule.Spec.InternalPort)
+		require.Equal(t, "tcp", rule.Spec.Protocol)
+		require.Equal(t, kubeovnv1.DnatRuleTypeShare, rule.Spec.Type)
+		require.Equal(t, "default", rule.Labels[util.NftableLbSvcNsLabel])
+		require.Equal(t, "web", rule.Labels[util.NftableLbSvcNameLabel])
+		backends[rule.Spec.InternalIP] = rule
+	}
+	require.Contains(t, backends, "10.0.0.1")
+	require.Contains(t, backends, "10.0.0.2")
+	require.NotContains(t, backends, "10.0.0.3")
+	require.NotContains(t, backends, "fd00::1")
+}
+
+func Test_buildDesiredNftableLbDnatRules_unnamedPort(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
+		Type: v1.ServiceTypeLoadBalancer, Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP}},
+	}}
+	endpointSlices := []*discoveryv1.EndpointSlice{{
+		Ports:     []discoveryv1.EndpointPort{{Port: new(int32(8080))}},
+		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
+	}}
+	require.Len(t, buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP), 1)
+}
+
+func Test_buildDesiredNftableLbDnatRules_noMatchingPort(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
+		Type: v1.ServiceTypeLoadBalancer, Ports: []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
+	}}
+	endpointSlices := []*discoveryv1.EndpointSlice{{
+		Ports:     []discoveryv1.EndpointPort{{Name: new("other"), Port: new(int32(8080))}},
+		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
+	}}
+	require.Empty(t, buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP))
+}
+
+func Test_buildDesiredNftableLbDnatRules_sessionAffinity(t *testing.T) {
+	t.Parallel()
+
+	endpointSlices := []*discoveryv1.EndpointSlice{{
+		Ports:     []discoveryv1.EndpointPort{{Name: new("http"), Port: new(int32(8080))}},
+		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
+	}}
+	ports := []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}}
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
+		Type: v1.ServiceTypeLoadBalancer, Ports: ports, SessionAffinity: v1.ServiceAffinityClientIP,
+		SessionAffinityConfig: &v1.SessionAffinityConfig{ClientIP: &v1.ClientIPConfig{TimeoutSeconds: new(int32(600))}},
+	}}
+	desired := buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP)
+	require.Len(t, desired, 1)
+	for _, rule := range desired {
+		require.Equal(t, kubeovnv1.DnatSessionAffinityClientIP, rule.Spec.SessionAffinity)
+		require.Equal(t, int32(600), rule.Spec.SessionAffinityTimeoutSeconds)
+	}
+
+	svc.Spec.SessionAffinity = v1.ServiceAffinityNone
+	svc.Spec.SessionAffinityConfig = nil
+	desired = buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP)
+	require.Len(t, desired, 1)
+	for _, rule := range desired {
+		require.Equal(t, kubeovnv1.DnatSessionAffinityNone, rule.Spec.SessionAffinity)
+		require.Zero(t, rule.Spec.SessionAffinityTimeoutSeconds)
+	}
+}
+
+func Test_nftableLbSvcOwnerKey(t *testing.T) {
+	t.Parallel()
+
+	owned := &kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		util.NftableLbSvcNsLabel: "default", util.NftableLbSvcNameLabel: "web",
+	}}}
+	require.Equal(t, "default/web", nftableLbSvcOwnerKey(owned))
+	for _, labels := range []map[string]string{
+		{util.NftableLbSvcNsLabel: "default"}, {util.NftableLbSvcNameLabel: "web"},
+	} {
+		require.Empty(t, nftableLbSvcOwnerKey(&kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Labels: labels}}))
+	}
+	require.Empty(t, nftableLbSvcOwnerKey(&kubeovnv1.IptablesDnatRule{}))
+}
+
+func Test_nftableLbDnatIdentity(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "eip0/80/tcp", nftableLbDnatIdentity("eip0", "80", "TCP"))
+	require.Equal(t, nftableLbDnatIdentity("eip0", "80", "tcp"), nftableLbDnatIdentity("eip0", "80", "TCP"))
+	require.NotEqual(t, nftableLbDnatIdentity("eip0", "80", "tcp"), nftableLbDnatIdentity("eip0", "443", "tcp"))
+}
+
+func Test_nftableLbSvcIdentities(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{
+		{Port: 80, Protocol: v1.ProtocolTCP}, {Port: 53, Protocol: v1.ProtocolUDP}, {Port: 90, Protocol: v1.ProtocolSCTP},
+	}}}
+	require.ElementsMatch(t, []string{"eip0/80/tcp", "eip0/53/udp"}, nftableLbSvcIdentities(svc, "eip0"))
+}
+
+func TestResolveNftableLbConflictsWithNoReadyBackends(t *testing.T) {
+	t.Parallel()
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{IndexServiceByNftableLbEip: func(obj any) ([]string, error) {
+		svc, ok := obj.(*v1.Service)
+		if !ok || svc.Annotations[util.EipAnnotation] == "" {
+			return nil, nil
+		}
+		return []string{svc.Annotations[util.EipAnnotation]}, nil
+	}})
+	newService := func(namespace, name string) *v1.Service {
+		return &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Annotations: map[string]string{util.EipAnnotation: "eip0"}}, Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeLoadBalancer, Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP}},
+		}}
+	}
+	require.NoError(t, indexer.Add(newService("ns", "a-winner")))
+	loser := newService("ns", "z-loser")
+	require.NoError(t, indexer.Add(loser))
+
+	ruleIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	queue := newTypedRateLimitingQueue[string]("nftable-lb-conflict-test", nil)
+	t.Cleanup(queue.ShutDown)
+	controller := &Controller{
+		svcIndexer: indexer, iptablesDnatRulesLister: kubeovnlister.NewIptablesDnatRuleLister(ruleIndexer),
+		recorder: record.NewFakeRecorder(1), addOrUpdateNftableLbSvcQueue: queue,
+	}
+	conflicted, err := controller.resolveNftableLbConflicts(loser, "ns/z-loser", map[string]*kubeovnv1.IptablesDnatRule{})
+	require.NoError(t, err)
+	require.True(t, conflicted)
+}
+
+func Test_nftableLbDnatSpecEqual(t *testing.T) {
+	t.Parallel()
+
+	base := kubeovnv1.IptablesDnatRuleSpec{EIP: "eip0", ExternalPort: "80", Protocol: "tcp", InternalIP: "10.0.0.1", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare}
+	same := base
+	require.True(t, nftableLbDnatSpecEqual(&base, &same))
+	affinity := base
+	affinity.SessionAffinity = kubeovnv1.DnatSessionAffinityClientIP
+	affinity.SessionAffinityTimeoutSeconds = 600
+	require.False(t, nftableLbDnatSpecEqual(&base, &affinity))
+	eip := base
+	eip.EIP = "eip1"
+	require.False(t, nftableLbDnatSpecEqual(&base, &eip))
+}
+
+func Test_chooseNftableLbOwner(t *testing.T) {
+	t.Parallel()
+
+	require.Empty(t, chooseNftableLbOwner(map[string]struct{}{"": {}, "ns/a": {}, "ns/b": {}}))
+	require.Equal(t, "ns/a", chooseNftableLbOwner(map[string]struct{}{"ns/a": {}, "ns/b": {}}))
+	require.Equal(t, "ns/a", chooseNftableLbOwner(map[string]struct{}{"ns/b": {}, "ns/a": {}}))
+	require.Equal(t, "ns/only", chooseNftableLbOwner(map[string]struct{}{"ns/only": {}}))
+}
