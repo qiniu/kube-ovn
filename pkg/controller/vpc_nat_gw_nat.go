@@ -652,7 +652,8 @@ func (c *Controller) handleAddIptablesDnatRule(key string) error {
 		}
 		// Add current DNAT's backend
 		backends = append(backends, fmt.Sprintf("%s:%s", dnat.Spec.InternalIP, dnat.Spec.InternalPort))
-		if err = c.createNftDnatMapInPod(eip.Spec.NatGwDp, dnat.Spec.Protocol, eip.Status.IP, dnat.Spec.ExternalPort, backends); err != nil {
+		if err = c.createNftDnatMapInPod(eip.Spec.NatGwDp, dnat.Spec.Protocol, eip.Status.IP, dnat.Spec.ExternalPort,
+			backends, dnat.Spec.SessionAffinity, dnat.Spec.SessionAffinityTimeoutSeconds); err != nil {
 			klog.Errorf("failed to create nft dnat map, %v", err)
 			return err
 		}
@@ -848,7 +849,8 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 				return err
 			}
 			backends = append(backends, fmt.Sprintf("%s:%s", newInternalIP, newInternalPort))
-			if err = c.createNftDnatMapInPod(eip.Spec.NatGwDp, newProtocol, newV4ip, newExternalPort, backends); err != nil {
+			if err = c.createNftDnatMapInPod(eip.Spec.NatGwDp, newProtocol, newV4ip, newExternalPort,
+				backends, cachedDnat.Spec.SessionAffinity, cachedDnat.Spec.SessionAffinityTimeoutSeconds); err != nil {
 				klog.Errorf("failed to create nft dnat map for %s, %v", key, err)
 				return err
 			}
@@ -922,7 +924,9 @@ func (c *Controller) handleUpdateIptablesDnatRule(key string) error {
 				return err
 			}
 			backends = append(backends, fmt.Sprintf("%s:%s", cachedDnat.Status.InternalIP, cachedDnat.Status.InternalPort))
-			if err = c.createNftDnatMapInPod(cachedDnat.Status.NatGwDp, cachedDnat.Status.Protocol, cachedDnat.Status.V4ip, cachedDnat.Status.ExternalPort, backends); err != nil {
+			if err = c.createNftDnatMapInPod(cachedDnat.Status.NatGwDp, cachedDnat.Status.Protocol,
+				cachedDnat.Status.V4ip, cachedDnat.Status.ExternalPort, backends,
+				cachedDnat.Spec.SessionAffinity, cachedDnat.Spec.SessionAffinityTimeoutSeconds); err != nil {
 				klog.Errorf("failed to create nft dnat map for %s, %v", key, err)
 				return err
 			}
