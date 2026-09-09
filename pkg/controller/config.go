@@ -202,7 +202,7 @@ func ParseFlags() (*Configuration, error) {
 		argEnableEcmp                  = pflag.Bool("enable-ecmp", false, "Enable ecmp route for centralized subnet")
 		argKeepVMIP                    = pflag.Bool("keep-vm-ip", true, "Whether to keep ip for kubevirt pod when pod is rebuild")
 		argEnableLbSvc                 = pflag.Bool("enable-lb-svc", false, "Enable Pod-based LoadBalancer Service mode: the controller creates a dedicated Pod per LB Service to provide external IP connectivity via iptables NAT. Mutually exclusive with --enable-bgp-lb-vip")
-		argEnableNftableLbSvc          = pflag.Bool("enable-nftable-lb-svc", false, "Enable LoadBalancer Service backed by VPC NAT Gateway nftables share DNAT")
+		argEnableNftableLbSvc          = pflag.Bool("enable-nftable-lb-svc", true, "Enable LoadBalancer Service backed by VPC NAT Gateway nftables share DNAT")
 		argEnableBgpLbVip              = pflag.Bool("enable-bgp-lb-vip", false, "Enable BGP LB EIP mode: allocates a LoadBalancer external IP via a VIP CR (type=bgp_lb_vip) on a non-OVN subnet and announces it through the BGP speaker. No lb-svc Pod is created. Mutually exclusive with --enable-lb-svc")
 		argEnableOVNLBPreferLocal      = pflag.Bool("enable-ovn-lb-prefer-local", false, "Whether to support ovn loadbalancer prefer local")
 		argEnableMetrics               = pflag.Bool("enable-metrics", true, "Whether to support metrics query")

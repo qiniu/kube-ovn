@@ -70,7 +70,7 @@ func TestEnqueueNftableLbSvcOwnersFromRules(t *testing.T) {
 	}
 
 	c := &Controller{
-		config:                       &Configuration{EnableLb: true, EnableNftableLbSvc: true},
+		config:                       &Configuration{EnableLb: false, EnableNftableLbSvc: true},
 		iptablesDnatRulesLister:      kubeovnlister.NewIptablesDnatRuleLister(indexer),
 		addOrUpdateNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateNftableLbSvc", nil),
 	}
