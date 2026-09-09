@@ -194,6 +194,7 @@ func (c *Controller) enqueueAddPod(obj any) {
 	if p.Spec.HostNetwork {
 		return
 	}
+	c.enqueueNftableLbServicesForPod(p)
 
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(p.Namespace)
@@ -267,6 +268,7 @@ func (c *Controller) enqueueDeletePod(obj any) {
 	if p.Spec.HostNetwork {
 		return
 	}
+	c.enqueueNftableLbServicesForPod(p)
 
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(p.Namespace)
@@ -324,6 +326,7 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 	if newPod.Spec.HostNetwork || oldPod.ResourceVersion == newPod.ResourceVersion {
 		return
 	}
+	c.enqueueNftableLbServicesForPod(newPod)
 
 	podNets, err := c.getPodKubeovnNets(newPod)
 	if err != nil {

@@ -27,6 +27,15 @@ const (
 	NatGwStatefulSetNameMaxLength = validation.LabelValueMaxLength - statefulSetRevisionHashSuffixLength
 )
 
+func NftableLbSvcOwnerKey(labels map[string]string) string {
+	namespace := labels[NftableLbSvcNsLabel]
+	name := labels[NftableLbSvcNameLabel]
+	if namespace == "" || name == "" {
+		return ""
+	}
+	return namespace + "/" + name
+}
+
 // GenNatGwName returns the full name of a NAT gateway StatefulSet/Deployment
 func GenNatGwName(name string) string {
 	return GenNatGwNameWithPrefix(VpcNatGwNamePrefix, name)

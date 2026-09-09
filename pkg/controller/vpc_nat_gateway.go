@@ -115,6 +115,7 @@ func (c *Controller) resyncVpcNatGwConfig() {
 
 func (c *Controller) enqueueAddVpcNatGw(obj any) {
 	gw := obj.(*kubeovnv1.VpcNatGateway)
+	c.enqueueNftableLbServicesForNatGw(gw.Name)
 	if !gw.DeletionTimestamp.IsZero() {
 		c.enqueueDeleteVpcNatGw(gw)
 		return
@@ -135,6 +136,7 @@ func (c *Controller) enqueueAddOrUpdateVpcNatGwByName(gwName, reason string) {
 func (c *Controller) enqueueUpdateVpcNatGw(oldObj, newObj any) {
 	oldGw := oldObj.(*kubeovnv1.VpcNatGateway)
 	newGw := newObj.(*kubeovnv1.VpcNatGateway)
+	c.enqueueNftableLbServicesForNatGw(newGw.Name)
 	key := cache.MetaObjectToName(newGw).String()
 	if newGw.DeletionTimestamp.IsZero() {
 		klog.V(3).Infof("enqueue update vpc-nat-gw %s", key)
@@ -164,6 +166,7 @@ func (c *Controller) enqueueDeleteVpcNatGw(obj any) {
 		klog.Warningf("unexpected type: %T", obj)
 		return
 	}
+	c.enqueueNftableLbServicesForNatGw(gw.Name)
 
 	// Use "namespace/gwName" as the queue key so the delete handler knows where the STS lives.
 	natGwNs := gw.Spec.Namespace

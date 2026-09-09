@@ -67,7 +67,8 @@ const (
 	// bgpVipIndexName is the informer indexer key used to look up Services by their
 	// ovn.kubernetes.io/bgp-vip annotation value. Shared between controller.go (indexer
 	// registration) and vip.go (ByIndex call) so a rename is caught at compile time.
-	bgpVipIndexName = "bgpVipAnnotation"
+	bgpVipIndexName            = "bgpVipAnnotation"
+	IndexServiceByNftableLbEip = "byNftableLbEip"
 )
 
 // Controller is kube-ovn main controller that watch ns/pod/node/svc/ep and operate ovn
@@ -244,11 +245,13 @@ type Controller struct {
 	serviceSynced  cache.InformerSynced
 	// svcByBgpVipIndexer indexes Services by their ovn.kubernetes.io/bgp-vip annotation value,
 	// enabling O(k) lookup of Services bound to a specific bgp_lb_vip instead of a full list scan.
-	svcByBgpVipIndexer cache.Indexer
-	addServiceQueue    workqueue.TypedRateLimitingInterface[string]
-	deleteServiceQueue workqueue.TypedRateLimitingInterface[*vpcService]
-	updateServiceQueue workqueue.TypedRateLimitingInterface[*updateSvcObject]
-	svcKeyMutex        keymutex.KeyMutex
+	svcByBgpVipIndexer           cache.Indexer
+	svcIndexer                   cache.Indexer
+	addServiceQueue              workqueue.TypedRateLimitingInterface[string]
+	addOrUpdateNftableLbSvcQueue workqueue.TypedRateLimitingInterface[string]
+	deleteServiceQueue           workqueue.TypedRateLimitingInterface[*vpcService]
+	updateServiceQueue           workqueue.TypedRateLimitingInterface[*updateSvcObject]
+	svcKeyMutex                  keymutex.KeyMutex
 
 	endpointSlicesLister          discoveryv1.EndpointSliceLister
 	endpointSlicesSynced          cache.InformerSynced
@@ -437,6 +440,13 @@ func Run(ctx context.Context, config *Configuration) {
 			}
 			return keys, nil
 		},
+		IndexServiceByNftableLbEip: func(obj any) ([]string, error) {
+			svc, ok := obj.(*corev1.Service)
+			if !ok || svc.Annotations[util.EipAnnotation] == "" {
+				return nil, nil
+			}
+			return []string{svc.Annotations[util.EipAnnotation]}, nil
+		},
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add bgpVip indexer to service informer")
 	}
@@ -589,12 +599,14 @@ func Run(ctx context.Context, config *Configuration) {
 		deleteNodeQueue: newTypedRateLimitingQueue[string]("DeleteNode", nil),
 		nodeKeyMutex:    keymutex.NewHashed(numKeyLocks),
 
-		servicesLister:     serviceInformer.Lister(),
-		serviceSynced:      serviceInformer.Informer().HasSynced,
-		addServiceQueue:    newTypedRateLimitingQueue[string]("AddService", nil),
-		deleteServiceQueue: newTypedRateLimitingQueue[*vpcService]("DeleteService", nil),
-		updateServiceQueue: newTypedRateLimitingQueue[*updateSvcObject]("UpdateService", nil),
-		svcKeyMutex:        keymutex.NewHashed(numKeyLocks),
+		servicesLister:               serviceInformer.Lister(),
+		serviceSynced:                serviceInformer.Informer().HasSynced,
+		svcIndexer:                   serviceInformer.Informer().GetIndexer(),
+		addServiceQueue:              newTypedRateLimitingQueue[string]("AddService", nil),
+		addOrUpdateNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateNftableLbSvc", nil),
+		deleteServiceQueue:           newTypedRateLimitingQueue[*vpcService]("DeleteService", nil),
+		updateServiceQueue:           newTypedRateLimitingQueue[*updateSvcObject]("UpdateService", nil),
+		svcKeyMutex:                  keymutex.NewHashed(numKeyLocks),
 
 		endpointSlicesLister:          endpointSliceInformer.Lister(),
 		endpointSlicesSynced:          endpointSliceInformer.Informer().HasSynced,
@@ -832,6 +844,7 @@ func Run(ctx context.Context, config *Configuration) {
 	if _, err = endpointSliceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    controller.enqueueAddEndpointSlice,
 		UpdateFunc: controller.enqueueUpdateEndpointSlice,
+		DeleteFunc: controller.enqueueDeleteEndpointSlice,
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add endpoint slice event handler")
 	}
@@ -1222,6 +1235,7 @@ func (c *Controller) shutdown() {
 	c.addServiceQueue.ShutDown()
 	c.deleteServiceQueue.ShutDown()
 	c.updateServiceQueue.ShutDown()
+	c.addOrUpdateNftableLbSvcQueue.ShutDown()
 	c.addOrUpdateEndpointSliceQueue.ShutDown()
 
 	c.addVlanQueue.ShutDown()
@@ -1441,6 +1455,9 @@ func (c *Controller) startWorkers(ctx context.Context) {
 		if k8sLBWorker {
 			go wait.Until(runWorker("update service", c.updateServiceQueue, c.handleUpdateService), time.Second, ctx.Done())
 		}
+		if c.config.EnableNftableLbSvc {
+			go wait.Until(runWorker("add/update nftable lb service", c.addOrUpdateNftableLbSvcQueue, c.handleAddOrUpdateNftableLbService), time.Second, ctx.Done())
+		}
 
 		if ovnLBWorker {
 			go wait.Until(runWorker("add/update endpoint slice", c.addOrUpdateEndpointSliceQueue, c.handleUpdateEndpointSlice), time.Second, ctx.Done())
@@ -1542,6 +1559,13 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(runWorker("add iptables snat rule", c.addIptablesSnatRuleQueue, c.handleAddIptablesSnatRule), time.Second, ctx.Done())
 	go wait.Until(runWorker("update iptables snat rule", c.updateIptablesSnatRuleQueue, c.handleUpdateIptablesSnatRule), time.Second, ctx.Done())
 	go wait.Until(runWorker("delete iptables snat rule", c.delIptablesSnatRuleQueue, c.handleDelIptablesSnatRule), time.Second, ctx.Done())
+
+	if c.config.EnableNftableLbSvc {
+		if err := c.enqueueNftableLbSvcOwnersFromRules(); err != nil {
+			util.LogFatalAndExit(err, "failed to enqueue nftable lb service owners")
+		}
+		go wait.Until(runWorker("add/update nftable lb service", c.addOrUpdateNftableLbSvcQueue, c.handleAddOrUpdateNftableLbService), time.Second, ctx.Done())
+	}
 
 	go wait.Until(runWorker("add qos policy", c.addQoSPolicyQueue, c.handleAddQoSPolicy), time.Second, ctx.Done())
 	go wait.Until(runWorker("update qos policy", c.updateQoSPolicyQueue, c.handleUpdateQoSPolicy), time.Second, ctx.Done())
