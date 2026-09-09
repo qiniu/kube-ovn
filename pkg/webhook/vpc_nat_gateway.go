@@ -290,6 +290,10 @@ func (v *ValidatingHook) iptablesDnatUpdateHook(ctx context.Context, req admissi
 		if oldType != newType {
 			return ctrlwebhook.Errored(http.StatusBadRequest, fmt.Errorf("dnat type is immutable after creation: cannot change from %q to %q", oldType, newType))
 		}
+		if dnatOld.Spec.SessionAffinity != dnatNew.Spec.SessionAffinity ||
+			dnatOld.Spec.SessionAffinityTimeoutSeconds != dnatNew.Spec.SessionAffinityTimeoutSeconds {
+			return ctrlwebhook.Errored(http.StatusBadRequest, fmt.Errorf("dnat %q sessionAffinity is immutable after creation", dnatNew.Name))
+		}
 
 		if err := v.ValidateVpcNatConfig(ctx); err != nil {
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
@@ -629,6 +633,22 @@ func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.I
 	// empty) are allowed here; the controller requeues until the IPv4 address is ready.
 	if dnatType == ovnv1.DnatRuleTypeShare && eip.Spec.V4ip == "" && eip.Spec.V6ip != "" {
 		return fmt.Errorf("dnat %q cannot use type=share: EIP %q is IPv6-only, share dnat only supports IPv4", dnat.Name, dnat.Spec.EIP)
+	}
+
+	switch dnat.Spec.SessionAffinity {
+	case ovnv1.DnatSessionAffinityNone:
+		if dnat.Spec.SessionAffinityTimeoutSeconds != 0 {
+			return fmt.Errorf("dnat %q sets sessionAffinityTimeoutSeconds without ClientIP affinity", dnat.Name)
+		}
+	case ovnv1.DnatSessionAffinityClientIP:
+		if dnatType != ovnv1.DnatRuleTypeShare {
+			return fmt.Errorf("dnat %q ClientIP affinity requires type=share", dnat.Name)
+		}
+		if dnat.Spec.SessionAffinityTimeoutSeconds < 0 || dnat.Spec.SessionAffinityTimeoutSeconds > 86400 {
+			return fmt.Errorf("dnat %q sessionAffinityTimeoutSeconds is out of range", dnat.Name)
+		}
+	default:
+		return fmt.Errorf("dnat %q has invalid sessionAffinity %q", dnat.Name, dnat.Spec.SessionAffinity)
 	}
 
 	// Check type conflict with existing DNAT rules sharing the same identity
