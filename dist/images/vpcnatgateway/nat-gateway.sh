@@ -672,8 +672,6 @@ function add_nft_dnat_map() {
             "add chain ip $NFT_TABLE $identity_chain"
         )
         local keep_bkhashes=""
-        local nft_proto
-        nft_proto=$(echo "$protocol" | tr '[:upper:]' '[:lower:]')
 
         if [ "$affinity" = "clientip" ]; then
             local bkhash ep_chain aff_set vmap_entries=""
@@ -776,6 +774,8 @@ function del_nft_dnat_map() {
         nft_transaction_ignore_errors \
             "flush chain ip $NFT_TABLE $identity_chain" \
             "delete chain ip $NFT_TABLE $identity_chain"
+
+        cleanup_nft_affinity_objects "$(nft_identity_hash "$eip" "$dport" "$protocol")" ""
 
         # Clean up conntrack entries for this identity
         conntrack -D -d "$eip" -p "$nft_proto" --dport "$dport" 2>/dev/null || true

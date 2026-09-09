@@ -237,6 +237,29 @@ func (c *Controller) getShareBackends(gwName, eipName, externalPort, protocol, d
 	return backends, nil
 }
 
+func (c *Controller) getShareDnatAffinity(gwName, eipName, externalPort, protocol, dnatName string) (string, int32, error) {
+	dnats, err := c.iptablesDnatRulesLister.List(labels.SelectorFromSet(labels.Set{
+		util.VpcNatGatewayNameLabel: gwName,
+		util.VpcDnatEPortLabel:      externalPort,
+	}))
+	if err != nil {
+		return kubeovnv1.DnatSessionAffinityNone, 0, err
+	}
+	for _, d := range dnats {
+		if d.Name == dnatName {
+			continue
+		}
+		if d.Spec.EIP != eipName || d.Spec.Protocol != protocol || d.Spec.ExternalPort != externalPort {
+			continue
+		}
+		if d.Spec.Type != kubeovnv1.DnatRuleTypeShare || d.DeletionTimestamp != nil && !d.DeletionTimestamp.IsZero() {
+			continue
+		}
+		return d.Spec.SessionAffinity, d.Spec.SessionAffinityTimeoutSeconds, nil
+	}
+	return kubeovnv1.DnatSessionAffinityNone, 0, nil
+}
+
 // cleanupShareDnatInPod rebuilds the share nft map with the remaining backends for the given
 // identity, or deletes the rule entirely when no backend is left after excluding dnatName.
 //
@@ -270,9 +293,12 @@ func (c *Controller) cleanupShareDnatInPod(key, gwName, eipName, protocol, v4ip,
 		}
 		return nil
 	}
-	// Rebuild nft rule with remaining backends
+	affinity, timeout, err := c.getShareDnatAffinity(gwName, eipName, externalPort, protocol, dnatName)
+	if err != nil {
+		return fmt.Errorf("failed to get share dnat affinity for %s: %w", key, err)
+	}
 	if err := c.createNftDnatMapInPod(gwName, protocol, v4ip, externalPort, remainingBackends,
-		kubeovnv1.DnatSessionAffinityNone, 0); err != nil {
+		affinity, timeout); err != nil {
 		return fmt.Errorf("failed to rebuild nft dnat map for %s: %w", key, err)
 	}
 	return nil
