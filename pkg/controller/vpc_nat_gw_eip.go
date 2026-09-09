@@ -24,6 +24,7 @@ import (
 
 func (c *Controller) enqueueAddIptablesEip(obj any) {
 	eip := obj.(*kubeovnv1.IptablesEIP)
+	c.enqueueNftableLbServicesForEIP(eip.Name)
 	key := cache.MetaObjectToName(eip).String()
 	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesEipQueue, key, "iptables eip", eip.DeletionTimestamp) {
@@ -116,6 +117,7 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 	oldEip := oldObj.(*kubeovnv1.IptablesEIP)
 	newEip := newObj.(*kubeovnv1.IptablesEIP)
+	c.enqueueNftableLbServicesForEIP(newEip.Name)
 	if !newEip.DeletionTimestamp.IsZero() ||
 		oldEip.Status.Redo != newEip.Status.Redo ||
 		oldEip.Spec.QoSPolicy != newEip.Spec.QoSPolicy {
@@ -152,6 +154,7 @@ func (c *Controller) enqueueDelIptablesEip(obj any) {
 		klog.Warningf("unexpected type: %T", obj)
 		return
 	}
+	c.enqueueNftableLbServicesForEIP(eip.Name)
 
 	key := cache.MetaObjectToName(eip).String()
 	klog.Infof("enqueue del iptables eip %s", key)

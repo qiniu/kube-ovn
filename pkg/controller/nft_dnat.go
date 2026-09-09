@@ -75,7 +75,10 @@ const (
 // '@' is used as the separator (not ';') because the rule string is passed as a single
 // argument through the pod-exec API into a shell context, where ';' would be interpreted
 // as a command separator; '@' never appears in an ip:port and is shell-safe.
-func (c *Controller) createNftDnatMapInPod(dp, protocol, v4ip, externalPort string, backends []string) error {
+func (c *Controller) createNftDnatMapInPod(
+	dp, protocol, v4ip, externalPort string,
+	backends []string, sessionAffinity string, affinityTimeoutSeconds int32,
+) error {
 	if v4ip == "" {
 		// Share DNAT is implemented with `ip daddr`/`ip saddr` nft rules and only supports IPv4.
 		return errors.New("cannot create nft dnat map: empty IPv4 EIP (share dnat does not support IPv6)")
@@ -96,8 +99,17 @@ func (c *Controller) createNftDnatMapInPod(dp, protocol, v4ip, externalPort stri
 		return err
 	}
 
+	affinity := "none"
+	timeout := int32(0)
+	if sessionAffinity == kubeovnv1.DnatSessionAffinityClientIP {
+		affinity = "clientip"
+		timeout = affinityTimeoutSeconds
+		if timeout <= 0 {
+			timeout = kubeovnv1.DefaultDnatSessionAffinityTimeoutSeconds
+		}
+	}
 	backendStr := strings.Join(backends, "@")
-	rule := fmt.Sprintf("%s,%s,%s,%s", v4ip, externalPort, protocol, backendStr)
+	rule := fmt.Sprintf("%s,%s,%s,%s,%d,%s", v4ip, externalPort, protocol, affinity, timeout, backendStr)
 	if err = c.execNatGwRules(gwPod, natGwNftDnatMapAdd, []string{rule}); err != nil {
 		klog.Errorf("failed to create nft dnat map, err: %v", err)
 		return err
@@ -225,6 +237,29 @@ func (c *Controller) getShareBackends(gwName, eipName, externalPort, protocol, d
 	return backends, nil
 }
 
+func (c *Controller) getShareDnatAffinity(gwName, eipName, externalPort, protocol, dnatName string) (string, int32, error) {
+	dnats, err := c.iptablesDnatRulesLister.List(labels.SelectorFromSet(labels.Set{
+		util.VpcNatGatewayNameLabel: gwName,
+		util.VpcDnatEPortLabel:      externalPort,
+	}))
+	if err != nil {
+		return kubeovnv1.DnatSessionAffinityNone, 0, err
+	}
+	for _, d := range dnats {
+		if d.Name == dnatName {
+			continue
+		}
+		if d.Spec.EIP != eipName || d.Spec.Protocol != protocol || d.Spec.ExternalPort != externalPort {
+			continue
+		}
+		if d.Spec.Type != kubeovnv1.DnatRuleTypeShare || d.DeletionTimestamp != nil && !d.DeletionTimestamp.IsZero() {
+			continue
+		}
+		return d.Spec.SessionAffinity, d.Spec.SessionAffinityTimeoutSeconds, nil
+	}
+	return kubeovnv1.DnatSessionAffinityNone, 0, nil
+}
+
 // cleanupShareDnatInPod rebuilds the share nft map with the remaining backends for the given
 // identity, or deletes the rule entirely when no backend is left after excluding dnatName.
 //
@@ -258,8 +293,12 @@ func (c *Controller) cleanupShareDnatInPod(key, gwName, eipName, protocol, v4ip,
 		}
 		return nil
 	}
-	// Rebuild nft rule with remaining backends
-	if err := c.createNftDnatMapInPod(gwName, protocol, v4ip, externalPort, remainingBackends); err != nil {
+	affinity, timeout, err := c.getShareDnatAffinity(gwName, eipName, externalPort, protocol, dnatName)
+	if err != nil {
+		return fmt.Errorf("failed to get share dnat affinity for %s: %w", key, err)
+	}
+	if err := c.createNftDnatMapInPod(gwName, protocol, v4ip, externalPort, remainingBackends,
+		affinity, timeout); err != nil {
 		return fmt.Errorf("failed to rebuild nft dnat map for %s: %w", key, err)
 	}
 	return nil

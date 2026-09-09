@@ -56,6 +56,10 @@ const (
 	// IPv4 address; the webhook rejects share on an IPv6-only EIP and the controller requeues
 	// while the EIP is still being allocated (v4 not yet assigned).
 	DnatRuleTypeShare = "share"
+
+	DnatSessionAffinityNone                        = ""
+	DnatSessionAffinityClientIP                    = "ClientIP"
+	DefaultDnatSessionAffinityTimeoutSeconds int32 = 10800
 )
 
 type IptablesDnatRuleSpec struct {
@@ -83,6 +87,15 @@ type IptablesDnatRuleSpec struct {
 	// +kubebuilder:default=exclusive
 	// +optional
 	Type string `json:"type,omitempty"`
+	// SessionAffinity controls client-IP affinity for share DNAT rules.
+	// +kubebuilder:validation:Enum="";ClientIP
+	// +optional
+	SessionAffinity string `json:"sessionAffinity,omitempty"`
+	// SessionAffinityTimeoutSeconds is the client-IP affinity timeout in seconds.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=86400
+	// +optional
+	SessionAffinityTimeoutSeconds int32 `json:"sessionAffinityTimeoutSeconds,omitempty"`
 }
 
 type IptablesDnatRuleStatus struct {

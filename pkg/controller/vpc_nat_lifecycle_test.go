@@ -77,9 +77,36 @@ func TestHandleAddSkipsTerminating(t *testing.T) {
 	require.NotContains(t, stored.Labels, util.QoSPolicyUIDLabel)
 }
 
-// TestSyncVpcNatGatewayCRKeepsQoSLabels pins the startup ordering: syncNatUIDLabels runs before the
-// workers and initResourceOnce runs after, so syncVpcNatGatewayCR must not blank the credential
-// that the QoS in-use check counts.
+// TestGetShareDnatAffinityPreservesClientIP verifies that rebuilding a shared identity keeps the
+// affinity settings from its remaining backend.
+func TestGetShareDnatAffinityPreservesClientIP(t *testing.T) {
+	sibling := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "sibling-dnat",
+			Labels: map[string]string{
+				util.VpcNatGatewayNameLabel: "gw",
+				util.VpcDnatEPortLabel:      "80",
+			},
+		},
+		Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip", ExternalPort: "80", InternalPort: "8080",
+			InternalIP: "10.0.0.9", Protocol: "tcp",
+			Type:                          kubeovnv1.DnatRuleTypeShare,
+			SessionAffinity:               kubeovnv1.DnatSessionAffinityClientIP,
+			SessionAffinityTimeoutSeconds: 600,
+		},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{sibling},
+	})
+	require.NoError(t, err)
+
+	affinity, timeout, err := fc.fakeController.getShareDnatAffinity("gw", "eip", "80", "tcp", "dnat")
+	require.NoError(t, err)
+	require.Equal(t, kubeovnv1.DnatSessionAffinityClientIP, affinity)
+	require.Equal(t, int32(600), timeout)
+}
+
 func TestSyncVpcNatGatewayCRKeepsQoSLabels(t *testing.T) {
 	old := vpcNatEnabled
 	vpcNatEnabled = "true"
