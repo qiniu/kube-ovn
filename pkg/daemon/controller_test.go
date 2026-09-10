@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	kubevirtv1 "kubevirt.io/api/core/v1"
@@ -94,6 +96,17 @@ func TestHasVMILauncherPod(t *testing.T) {
 		found, err := c.hasVMILauncherPod(namespace, vmiName)
 		require.NoError(t, err)
 		require.False(t, found)
+	})
+
+	t.Run("matches a VMI whose name exceeds the label length limit", func(t *testing.T) {
+		// kubevirt truncates and hashes such a name in the vmi.kubevirt.io/id label,
+		// the owner reference always holds the full name
+		longVMIName := strings.Repeat("a", validation.DNS1035LabelMaxLength+10)
+		pod := newLauncherPod(namespace, "virt-launcher-long-name", longVMIName, vmName)
+		c := newControllerWithPods(t, pod)
+		found, err := c.hasVMILauncherPod(namespace, longVMIName)
+		require.NoError(t, err)
+		require.True(t, found)
 	})
 
 	t.Run("ignores pods of other namespaces", func(t *testing.T) {
