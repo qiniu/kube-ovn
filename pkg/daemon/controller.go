@@ -880,6 +880,10 @@ func (c *Controller) gcInterfaces() {
 			continue
 		}
 
+		// Any interface whose pod still exists is kept, whatever the pod phase is:
+		// the interface left behind by a terminated (e.g. Completed) pod is released by the
+		// CNI DEL executed when its sandbox is torn down, it is not up to the GC to remove it.
+		// The GC only takes care of the interfaces whose pod is already gone from the API.
 		if _, err = c.podsLister.Pods(podNamespace).Get(podName); err != nil {
 			if !k8serrors.IsNotFound(err) {
 				klog.Errorf("failed to get pod %s/%s: %v", podNamespace, podName, err)
@@ -887,20 +891,20 @@ func (c *Controller) gcInterfaces() {
 			}
 
 			// Pod not found by name. Check if this might be a KubeVirt VM.
-			// For KubeVirt VMs, the pod_name in OVS external_ids is set to the VM name (not the launcher pod name).
-			// The actual launcher pod has the label 'vm.kubevirt.io/name' with the VM name as value.
-			// Try to find launcher pods by this label.
-			selector := labels.SelectorFromSet(map[string]string{kubevirtv1.DeprecatedVirtualMachineNameLabel: podName})
-			launcherPods, err := c.podsLister.Pods(podNamespace).List(selector)
+			// For KubeVirt VMs, the pod_name in OVS external_ids is set to the VMI name (not the launcher
+			// pod name), see the annotation ovn.kubernetes.io/virtualmachine which the controller fills
+			// with the name of the owner VMI. The launcher pods are owned by the VMI, so look them up by
+			// the owner reference: unlike the annotation, it is set when the pod is created.
+			hasLauncherPod, err := c.hasVMILauncherPod(podNamespace, podName)
 			if err != nil {
-				klog.Errorf("failed to list launcher pods for vm %s/%s: %v", podNamespace, podName, err)
+				klog.Errorf("failed to list launcher pods for vmi %s/%s: %v", podNamespace, podName, err)
 				continue
 			}
 
-			// If we found launcher pod(s) for this VM, keep the interface
-			if len(launcherPods) > 0 {
-				klog.V(5).Infof("found %d launcher pod(s) for vm %s/%s, keeping ovs interface %s",
-					len(launcherPods), podNamespace, podName, iface)
+			// A launcher pod of this VMI is still running here, e.g. the target pod of a live migration
+			// waiting for its interface to be claimed by ovn-controller: keep the interface.
+			if hasLauncherPod {
+				klog.V(5).Infof("vmi %s/%s still has a launcher pod, keeping ovs interface %s", podNamespace, podName, iface)
 				continue
 			}
 
@@ -911,6 +915,25 @@ func (c *Controller) gcInterfaces() {
 			}
 		}
 	}
+}
+
+// hasVMILauncherPod tells whether a kubevirt launcher pod owned by the given VMI still exists.
+func (c *Controller) hasVMILauncherPod(namespace, vmiName string) (bool, error) {
+	pods, err := c.podsLister.Pods(namespace).List(labels.Everything())
+	if err != nil {
+		return false, err
+	}
+
+	for _, pod := range pods {
+		for _, owner := range pod.OwnerReferences {
+			if owner.Kind == util.KindVirtualMachineInstance &&
+				owner.Name == vmiName &&
+				strings.HasPrefix(owner.APIVersion, kubevirtv1.SchemeGroupVersion.Group+"/") {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func (c *Controller) runIPSecWorker() {
