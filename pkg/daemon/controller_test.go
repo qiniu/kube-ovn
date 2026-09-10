@@ -98,6 +98,18 @@ func TestHasVMILauncherPod(t *testing.T) {
 		require.False(t, found)
 	})
 
+	t.Run("matches a launcher pod carrying no kubevirt label at all", func(t *testing.T) {
+		// the owner reference is set by renderLaunchManifest for every launcher pod, so the
+		// lookup does not depend on the kubevirt version providing a given label
+		pod := newLauncherPod(namespace, "virt-launcher-no-labels", vmiName, vmName)
+		pod.Labels = nil
+		pod.Annotations = nil
+		c := newControllerWithPods(t, pod)
+		found, err := c.hasVMILauncherPod(namespace, vmiName)
+		require.NoError(t, err)
+		require.True(t, found)
+	})
+
 	t.Run("matches a VMI whose name exceeds the label length limit", func(t *testing.T) {
 		// kubevirt truncates and hashes such a name in the vmi.kubevirt.io/id label,
 		// the owner reference always holds the full name
