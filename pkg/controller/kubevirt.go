@@ -105,7 +105,9 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 		utilruntime.HandleError(fmt.Errorf("failed to get VMI migration by key %s: %w", key, err))
 		return err
 	}
-	if vmiMigration.Status.MigrationState == nil {
+	if vmiMigration.Status.MigrationState == nil &&
+		vmiMigration.Status.Phase != kubevirtv1.MigrationPending &&
+		vmiMigration.Status.Phase != kubevirtv1.MigrationScheduling {
 		klog.V(3).Infof("VirtualMachineInstanceMigration %s migration state is nil, skipping", key)
 		return nil
 	}
@@ -155,7 +157,9 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 	klog.Infof("collected port names of vmi %s, port names are %v", vmi.Name, strings.Join(portNames, ", "))
 
 	switch vmiMigration.Status.Phase {
-	case kubevirtv1.MigrationScheduling:
+	case kubevirtv1.MigrationPending, kubevirtv1.MigrationScheduling:
+		// Hotplug volumes keep the migration Pending until the target launcher is ready,
+		// so configure its network before waiting for the Scheduling phase.
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				kubevirtv1.MigrationJobLabel: string(vmiMigration.UID),
@@ -176,16 +180,21 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 
 		if len(pods) > 0 {
 			targetPod := pods[0]
-			// During MigrationScheduling phase, use vmi.Status.NodeName if SourceNode is empty
-			// because vmi.Status.MigrationState may not be fully synchronized yet
+			// Before MigrationState is synchronized, use the VMI's current node as the source.
 			sourceNode := srcNodeName
 			if sourceNode == "" {
 				sourceNode = vmi.Status.NodeName
 			}
 
-			if sourceNode == "" || targetPod.Spec.NodeName == "" || sourceNode == targetPod.Spec.NodeName {
+			if sourceNode == "" || targetPod.Spec.NodeName == "" {
 				klog.Warningf("VM pod %s/%s migration setup skipped, source node: %s, target node: %s (migration job UID: %s)",
 					targetPod.Namespace, targetPod.Name, sourceNode, targetPod.Spec.NodeName, vmiMigration.UID)
+				return fmt.Errorf("VM pod %s/%s migration setup deferred, source node %q, target node %q not ready yet (migration job UID %s)",
+					targetPod.Namespace, targetPod.Name, sourceNode, targetPod.Spec.NodeName, vmiMigration.UID)
+			}
+			if sourceNode == targetPod.Spec.NodeName {
+				klog.Warningf("VM pod %s/%s migration setup skipped, source and target node are both %s (migration job UID: %s)",
+					targetPod.Namespace, targetPod.Name, sourceNode, vmiMigration.UID)
 				return nil
 			}
 
@@ -203,7 +212,7 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 		} else {
 			klog.Warningf("target pod not yet created for migration job UID %s in phase %s, waiting for pod creation",
 				vmiMigration.UID, vmiMigration.Status.Phase)
-			return nil
+			return fmt.Errorf("target pod not yet created for migration job UID %s in phase %s", vmiMigration.UID, vmiMigration.Status.Phase)
 		}
 	case kubevirtv1.MigrationSucceeded:
 		for _, portName := range portNames {
