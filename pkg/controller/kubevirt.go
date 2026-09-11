@@ -160,8 +160,12 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 
 	switch vmiMigration.Status.Phase {
 	case kubevirtv1.MigrationPending, kubevirtv1.MigrationScheduling:
-		// Hotplug volumes can keep a migration Pending while the target virt-launcher and
-		// attachment pods wait for network readiness. Configure both phases to break the wait.
+		// KubeVirt creates the target virt-launcher in Pending and, for hotplug volumes,
+		// creates its attachment pod only after the launcher is ready. An attachment pod
+		// then gates Pending -> Scheduling, and both pods gate Scheduling -> Scheduled.
+		// Configure Pending to unblock launcher CNI and keep Scheduling for retries.
+		// Hotplug attachment pods share MigrationJobLabel, so AppLabel must distinguish
+		// the target virt-launcher whose NodeName identifies the migration target.
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				kubevirtv1.MigrationJobLabel: string(vmiMigration.UID),
