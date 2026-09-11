@@ -105,6 +105,8 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 		utilruntime.HandleError(fmt.Errorf("failed to get VMI migration by key %s: %w", key, err))
 		return err
 	}
+	// MigrationState may still be nil before target virt-launcher pod handoff. Pending and
+	// Scheduling can derive both nodes without it, so allow network setup to proceed.
 	if vmiMigration.Status.MigrationState == nil &&
 		vmiMigration.Status.Phase != kubevirtv1.MigrationPending &&
 		vmiMigration.Status.Phase != kubevirtv1.MigrationScheduling {
@@ -158,11 +160,12 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 
 	switch vmiMigration.Status.Phase {
 	case kubevirtv1.MigrationPending, kubevirtv1.MigrationScheduling:
-		// Hotplug volumes keep the migration Pending until the target launcher is ready,
-		// so configure its network before waiting for the Scheduling phase.
+		// Hotplug volumes can keep a migration Pending while the target virt-launcher and
+		// attachment pods wait for network readiness. Configure both phases to break the wait.
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				kubevirtv1.MigrationJobLabel: string(vmiMigration.UID),
+				kubevirtv1.AppLabel:          "virt-launcher",
 			},
 		})
 		if err != nil {
@@ -171,48 +174,52 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 			return err
 		}
 
-		pods, err := c.podsLister.Pods(vmiMigration.Namespace).List(selector)
+		launcherPods, err := c.podsLister.Pods(vmiMigration.Namespace).List(selector)
 		if err != nil {
-			err = fmt.Errorf("failed to list pods with migration job UID %s: %w", vmiMigration.UID, err)
+			err = fmt.Errorf("failed to list target launcher pods with migration job UID %s: %w", vmiMigration.UID, err)
 			klog.Error(err)
 			return err
 		}
 
-		if len(pods) > 0 {
-			targetPod := pods[0]
+		if len(launcherPods) > 0 {
+			targetLauncherPod := launcherPods[0]
 			// Before MigrationState is synchronized, use the VMI's current node as the source.
 			sourceNode := srcNodeName
 			if sourceNode == "" {
 				sourceNode = vmi.Status.NodeName
 			}
 
-			if sourceNode == "" || targetPod.Spec.NodeName == "" {
-				klog.Warningf("VM pod %s/%s migration setup skipped, source node: %s, target node: %s (migration job UID: %s)",
-					targetPod.Namespace, targetPod.Name, sourceNode, targetPod.Spec.NodeName, vmiMigration.UID)
-				return fmt.Errorf("VM pod %s/%s migration setup deferred, source node %q, target node %q not ready yet (migration job UID %s)",
-					targetPod.Namespace, targetPod.Name, sourceNode, targetPod.Spec.NodeName, vmiMigration.UID)
+			if sourceNode == "" || targetLauncherPod.Spec.NodeName == "" {
+				klog.Warningf("target launcher pod %s/%s migration setup skipped, source node: %s, target node: %s (migration job UID: %s)",
+					targetLauncherPod.Namespace, targetLauncherPod.Name, sourceNode, targetLauncherPod.Spec.NodeName, vmiMigration.UID)
+				// Pod scheduling may complete without another VMIM phase update. Requeue until
+				// both node assignments are visible instead of dropping the pending setup.
+				return fmt.Errorf("target launcher pod %s/%s migration setup deferred, source node %q, target node %q not ready yet (migration job UID %s)",
+					targetLauncherPod.Namespace, targetLauncherPod.Name, sourceNode, targetLauncherPod.Spec.NodeName, vmiMigration.UID)
 			}
-			if sourceNode == targetPod.Spec.NodeName {
-				klog.Warningf("VM pod %s/%s migration setup skipped, source and target node are both %s (migration job UID: %s)",
-					targetPod.Namespace, targetPod.Name, sourceNode, vmiMigration.UID)
+			if sourceNode == targetLauncherPod.Spec.NodeName {
+				klog.Warningf("target launcher pod %s/%s migration setup skipped, source and target node are both %s (migration job UID: %s)",
+					targetLauncherPod.Namespace, targetLauncherPod.Name, sourceNode, vmiMigration.UID)
 				return nil
 			}
 
-			klog.Infof("VM pod %s/%s is migrating from %s to %s (migration job UID: %s)",
-				targetPod.Namespace, targetPod.Name, sourceNode, targetPod.Spec.NodeName, vmiMigration.UID)
+			klog.Infof("target launcher pod %s/%s is migrating from %s to %s (migration job UID: %s)",
+				targetLauncherPod.Namespace, targetLauncherPod.Name, sourceNode, targetLauncherPod.Spec.NodeName, vmiMigration.UID)
 
 			for _, portName := range portNames {
-				if err := c.OVNNbClient.SetLogicalSwitchPortMigrateOptions(portName, sourceNode, targetPod.Spec.NodeName); err != nil {
+				if err := c.OVNNbClient.SetLogicalSwitchPortMigrateOptions(portName, sourceNode, targetLauncherPod.Spec.NodeName); err != nil {
 					err = fmt.Errorf("failed to set migrate options for VM pod lsp %s: %w", portName, err)
 					klog.Error(err)
 					return err
 				}
-				klog.Infof("successfully set migrate options for lsp %s from %s to %s", portName, sourceNode, targetPod.Spec.NodeName)
+				klog.Infof("successfully set migrate options for lsp %s from %s to %s", portName, sourceNode, targetLauncherPod.Spec.NodeName)
 			}
 		} else {
-			klog.Warningf("target pod not yet created for migration job UID %s in phase %s, waiting for pod creation",
+			klog.Warningf("target launcher pod not yet created for migration job UID %s in phase %s, waiting for pod creation",
 				vmiMigration.UID, vmiMigration.Status.Phase)
-			return fmt.Errorf("target pod not yet created for migration job UID %s in phase %s", vmiMigration.UID, vmiMigration.Status.Phase)
+			// Target launcher pod creation does not necessarily change the VMIM phase.
+			// Requeue so the same Pending migration is retried after the pod appears.
+			return fmt.Errorf("target launcher pod not yet created for migration job UID %s in phase %s", vmiMigration.UID, vmiMigration.Status.Phase)
 		}
 	case kubevirtv1.MigrationSucceeded:
 		for _, portName := range portNames {
