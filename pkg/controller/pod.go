@@ -1282,6 +1282,7 @@ func (c *Controller) handleDeletePod(key string) (err error) {
 			}
 		}
 	}
+	var aliveVMSibling *v1.Pod
 	isVMPod, vmName := isVMPod(pod)
 	if isVMPod && c.config.EnableKeepVMIP {
 		ports, err := c.OVNNbClient.ListNormalLogicalSwitchPorts(true, map[string]string{"pod": podKey})
@@ -1302,6 +1303,18 @@ func (c *Controller) handleDeletePod(key string) (err error) {
 			if !isOwnerRefToDel {
 				klog.Infof("try keep ip for vm pod %s", podKey)
 				keepIPCR = true
+				// The VM LSP is shared across every virt-launcher pod of the VM
+				// (ExternalIDs["pod"] is keyed by VM name). Port-group memberships,
+				// however, belong to whichever virt-launcher pod is currently running
+				// the VM. If another live sibling exists (e.g. a live-migration
+				// destination while the completed source is being GC'd), its
+				// memberships must not be wiped out.
+				sibling, listErr := c.aliveVMSiblingOf(pod, vmName)
+				if listErr != nil {
+					klog.Errorf("failed to list pods of vm %s/%s: %v", pod.Namespace, vmName, listErr)
+					return listErr
+				}
+				aliveVMSibling = sibling
 			}
 		}
 		if keepIPCR {
@@ -1327,12 +1340,37 @@ func (c *Controller) handleDeletePod(key string) (err error) {
 		return err
 	}
 	if keepIPCR {
-		// always remove lsp from port groups
-		for _, port := range ports {
-			klog.Infof("remove lsp %s from all port groups", port.Name)
-			if err = c.OVNNbClient.RemovePortFromPortGroups(port.Name); err != nil {
-				klog.Errorf("failed to remove lsp %s from all port groups: %v", port.Name, err)
+		if aliveVMSibling != nil {
+			// The port-group memberships belong to the sibling now, so they are not wiped
+			// here. They are not left wherever the last reconcile put them either: clearing
+			// the sibling's routed annotation makes reconcileRouteSubnets run again for it,
+			// which is the only code that knows which port group each membership belongs to
+			// (node, subnet, u2o, EIP/SNAT) and re-asserts them all for the node the VM
+			// actually runs on. Without it the memberships can stay on the node of an
+			// aborted migration target: this pod is dead and the sibling, being routed
+			// already, would never reconcile them again.
+			klog.Infof("keep lsp port groups of vm %s/%s, re-asserting them on alive virt-launcher pod %s", pod.Namespace, vmName, aliveVMSibling.Name)
+			var siblingAlive bool
+			siblingAlive, err = c.resetVMPodRouted(aliveVMSibling)
+			if err != nil {
 				return err
+			}
+			if siblingAlive {
+				if err = c.alignVMIPNodeName(ports, aliveVMSibling.Spec.NodeName); err != nil {
+					return err
+				}
+			} else {
+				// It disappeared between the lookup and the patch, so there is no node left to
+				// point the records at: its own delete handler owns whatever is left of it.
+				klog.Infof("no live virt-launcher pod left for vm %s/%s, leaving its records to their delete handler", pod.Namespace, vmName)
+			}
+		} else {
+			for _, port := range ports {
+				klog.Infof("remove lsp %s from all port groups", port.Name)
+				if err = c.OVNNbClient.RemovePortFromPortGroups(port.Name); err != nil {
+					klog.Errorf("failed to remove lsp %s from all port groups: %v", port.Name, err)
+					return err
+				}
 			}
 		}
 	} else {
@@ -2576,6 +2614,168 @@ func isVMPod(pod *v1.Pod) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// aliveVMSiblingOf finds another alive virt-launcher pod of the same VMI, or nil.
+//
+// The lookup is narrowed to the VMI's own pods through kubevirt.io/created-by, the label kubevirt
+// puts on every virt-launcher pod (the migration target included, both are rendered by the same
+// template) and the one its own migration anti-affinity selects on. It is applied only when the pod
+// being processed carries the label: both pods come from the same kubevirt version, so a pod
+// without it means its sibling may lack it as well, and reading "no sibling" out of that would wipe
+// the port groups of a live VM pod -- the very failure this guard exists to prevent. Without the
+// label the whole namespace is listed, which is what the guard did before.
+func (c *Controller) aliveVMSiblingOf(pod *v1.Pod, vmName string) (*v1.Pod, error) {
+	selector := labels.Everything()
+	if createdBy := pod.Labels[kubevirtv1.CreatedByLabel]; createdBy != "" {
+		selector = labels.SelectorFromSet(labels.Set{kubevirtv1.CreatedByLabel: createdBy})
+	}
+	pods, err := c.podsLister.Pods(pod.Namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+	return aliveSiblingVMPod(pods, vmName, pod.Name), nil
+}
+
+// aliveSiblingVMPod returns an alive virt-launcher pod owned by the VMI vmName
+// other than excludePodName, or nil. It decides whether a VM LSP's port-group
+// memberships are still owned by a running sibling (e.g. a live-migration
+// destination) while a completed/GC'd source pod is being processed. The pod
+// itself is returned rather than a bool because it is the one that has to
+// re-assert those memberships.
+func aliveSiblingVMPod(pods []*v1.Pod, vmName, excludePodName string) *v1.Pod {
+	for _, p := range pods {
+		if p == nil || p.Name == excludePodName {
+			continue
+		}
+		isVM, name := isVMPod(p)
+		if !isVM || name != vmName {
+			continue
+		}
+		if isPodAlive(p) {
+			return p
+		}
+	}
+	return nil
+}
+
+// clearRoutedPatch builds the patch that makes pod re-run its routed reconcile: the routed
+// annotation of every OVN network it has already routed is removed. An empty patch means there is
+// nothing to re-run (no OVN network, or the pod has not been routed yet and its reconcile is still
+// pending anyway).
+func clearRoutedPatch(pod *v1.Pod, nets []*kubeovnNet) util.KVPatch {
+	patch := util.KVPatch{}
+	for _, net := range nets {
+		if !isOvnSubnet(net.Subnet) {
+			continue
+		}
+		key := fmt.Sprintf(util.RoutedAnnotationTemplate, net.ProviderName)
+		if pod.Annotations[key] != "true" {
+			continue
+		}
+		patch[key] = nil
+	}
+	return patch
+}
+
+// resetVMPodRouted drops the routed annotation of every OVN network the pod has already routed, so
+// its own reconcile re-asserts its port-group memberships. That reconcile is gated on this
+// annotation (needRouteSubnets), which is why enqueuing an already-routed pod is a no-op. The patch
+// is also what enqueues it: its update event reaches the add/update worker (enqueueUpdatePod), so no
+// explicit enqueue is needed here. The inspection loop clears this annotation the same way to
+// recover a pod whose OVN state drifted.
+//
+// It reports whether the pod still exists. One that disappeared between the sibling lookup and the
+// patch is owned by its own delete handler, and the caller must not act on its node.
+func (c *Controller) resetVMPodRouted(pod *v1.Pod) (bool, error) {
+	key := cache.MetaObjectToName(pod).String()
+	podNets, err := c.getPodKubeovnNets(pod)
+	if err != nil {
+		// The pod is there but its networks cannot be resolved, which means its subnet was
+		// removed by hand and the VM is broken anyway. Report the error rather than skipping the
+		// reset: the delete is retried, so the memberships are re-asserted once the state can be
+		// read instead of being left where an aborted migration put them.
+		klog.Errorf("failed to get kube-ovn nets of pod %s: %v", key, err)
+		return false, err
+	}
+	patch := clearRoutedPatch(pod, podNets)
+	if len(patch) == 0 {
+		return true, nil
+	}
+	if err = util.PatchAnnotations(c.config.KubeClient.CoreV1().Pods(pod.Namespace), pod.Name, patch); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return false, nil
+		}
+		klog.Errorf("failed to reset routed annotations of pod %s: %v", key, err)
+		return false, err
+	}
+	return true, nil
+}
+
+// alignVMIPNodeName points the IP records of a VM at the node that runs it now. The IP CR is
+// written with the node of whichever pod was allocated (createOrUpdateIPCR), and a migration target
+// is allocated as soon as it is scheduled, long before the migration can complete: an aborted
+// migration therefore leaves the record on a node that no longer runs the VM. The u2o port-group
+// sync places every lsp by this field (see addPolicyRouteForU2ONoLoadBalancer in subnet.go), so a
+// stale record puts the VM's port back into that node's port group. The pod that is still alive is
+// the authority on the right node.
+//
+// A pod that is alive but not placed yet has no node to offer: its allocation writes the record once
+// it is scheduled, and until then the value already there is the best known one -- writing the empty
+// name would place the port in a port group named after no node at all.
+//
+// Known edges, deliberately not handled, neither of them a defect in a running VM:
+//
+//   - This field is written only by the allocation path and here, so two pods of one VM terminating
+//     at once -- both still inside their deletion grace period, so each sees the other alive -- can
+//     write two nodes and leave whichever wrote last. It stays inert: in that state no pod runs the
+//     VM, the next allocation rewrites the field, and the pod's own reconcile then re-places its
+//     port groups. The node-name label shares the fate of the spec above it.
+//   - The ports include the VM's attachment networks, so an attachment port that only the terminated
+//     pod held keeps a record pointing at the live pod's node until it is deleted together with its
+//     lsp (the skip-all decision above, upstream #6666). No placement depends on it in the meantime.
+func (c *Controller) alignVMIPNodeName(ports []ovnnb.LogicalSwitchPort, nodeName string) error {
+	if nodeName == "" {
+		klog.Infof("the vm has no placed virt-launcher pod, leaving its ip records on the node they name")
+		return nil
+	}
+	for _, port := range ports {
+		ip, err := c.ipsLister.Get(port.Name)
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				continue
+			}
+			klog.Errorf("failed to get ip %s of vm lsp: %v", port.Name, err)
+			return err
+		}
+		if ip.Spec.NodeName == nodeName && ip.Labels[util.NodeNameLabel] == nodeName {
+			continue
+		}
+		newIP := ip.DeepCopy()
+		newIP.Spec.NodeName = nodeName
+		if newIP.Labels == nil {
+			newIP.Labels = map[string]string{}
+		}
+		// The label is written with the spec, as createOrUpdateIPCR does: nothing in the
+		// controller reads it, it is the operator-facing index of which node holds this IP, and
+		// a half-updated record would mislead exactly the migration this function repairs.
+		newIP.Labels[util.NodeNameLabel] = nodeName
+		patch, err := util.GenerateMergePatchPayload(ip, newIP)
+		if err != nil {
+			klog.Errorf("failed to generate patch payload for ip %s, %v", ip.Name, err)
+			return err
+		}
+		if _, err = c.config.KubeOvnClient.KubeovnV1().IPs().Patch(context.Background(), ip.Name,
+			types.MergePatchType, patch, metav1.PatchOptions{}, ""); err != nil {
+			if k8serrors.IsNotFound(err) {
+				continue
+			}
+			klog.Errorf("failed to point ip %s at node %s: %v", ip.Name, nodeName, err)
+			return err
+		}
+		klog.Infof("pointed vm ip %s at node %s", ip.Name, nodeName)
+	}
+	return nil
 }
 
 func isOwnsByTheVM(vmi metav1.Object) (bool, string) {

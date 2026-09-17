@@ -15,10 +15,15 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	kubevirtv1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ipam"
+	"github.com/kubeovn/kube-ovn/pkg/ovs"
+	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -336,7 +341,8 @@ func TestBackfillVpcNatGwLanIPFromPod(t *testing.T) {
 			require.NoError(t, err)
 
 			gotGw, err := controller.config.KubeOvnClient.KubeovnV1().VpcNatGateways().Get(
-				context.Background(), gwName, metav1.GetOptions{})
+				context.Background(), gwName, metav1.GetOptions{},
+			)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expectedLanIP, gotGw.Spec.LanIP)
 		})
@@ -1438,4 +1444,444 @@ func TestRepairPodTunnelKeyOnStartup(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAliveSiblingVMPod(t *testing.T) {
+	vmiOwner := func(vmName string) []metav1.OwnerReference {
+		return []metav1.OwnerReference{
+			{
+				APIVersion: kubevirtv1.SchemeGroupVersion.String(),
+				Kind:       util.KindVirtualMachineInstance,
+				Name:       vmName,
+			},
+		}
+	}
+	vmPod := func(name, vmName string, phase corev1.PodPhase, deleted bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:       "ns",
+				Name:            name,
+				OwnerReferences: vmiOwner(vmName),
+			},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+		if deleted {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			grace := int64(0)
+			p.DeletionGracePeriodSeconds = &grace
+		}
+		return p
+	}
+
+	tests := []struct {
+		name           string
+		pods           []*corev1.Pod
+		vmName         string
+		excludePodName string
+		wantName       string
+	}{
+		{
+			name:           "no siblings",
+			pods:           []*corev1.Pod{vmPod("virt-launcher-vm-aaa", "vm", corev1.PodRunning, false)},
+			vmName:         "vm",
+			excludePodName: "virt-launcher-vm-aaa",
+			wantName:       "",
+		},
+		{
+			name: "alive sibling exists",
+			pods: []*corev1.Pod{
+				vmPod("virt-launcher-vm-aaa", "vm", corev1.PodSucceeded, true),
+				vmPod("virt-launcher-vm-bbb", "vm", corev1.PodRunning, false),
+			},
+			vmName:         "vm",
+			excludePodName: "virt-launcher-vm-aaa",
+			wantName:       "virt-launcher-vm-bbb",
+		},
+		{
+			name: "only completed siblings",
+			pods: []*corev1.Pod{
+				vmPod("virt-launcher-vm-aaa", "vm", corev1.PodSucceeded, true),
+				vmPod("virt-launcher-vm-bbb", "vm", corev1.PodSucceeded, false),
+			},
+			vmName:         "vm",
+			excludePodName: "virt-launcher-vm-aaa",
+			wantName:       "",
+		},
+		{
+			name: "sibling belongs to different vm",
+			pods: []*corev1.Pod{
+				vmPod("virt-launcher-other-xxx", "other", corev1.PodRunning, false),
+			},
+			vmName:         "vm",
+			excludePodName: "virt-launcher-vm-aaa",
+			wantName:       "",
+		},
+		{
+			name: "non-vm pod ignored",
+			pods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "plain-pod"},
+					Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			vmName:         "vm",
+			excludePodName: "virt-launcher-vm-aaa",
+			wantName:       "",
+		},
+		{
+			name: "excluded pod ignored even when alive",
+			pods: []*corev1.Pod{
+				vmPod("virt-launcher-vm-aaa", "vm", corev1.PodRunning, false),
+			},
+			vmName:         "vm",
+			excludePodName: "virt-launcher-vm-aaa",
+			wantName:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := aliveSiblingVMPod(tt.pods, tt.vmName, tt.excludePodName)
+			if tt.wantName == "" {
+				assert.Nil(t, got)
+				return
+			}
+			require.NotNil(t, got)
+			assert.Equal(t, tt.wantName, got.Name)
+		})
+	}
+}
+
+func TestClearRoutedPatch(t *testing.T) {
+	ovnNet := func(provider string) *kubeovnNet {
+		return &kubeovnNet{
+			ProviderName: provider,
+			Subnet:       &kubeovnv1.Subnet{Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider}},
+		}
+	}
+	attachNet := &kubeovnNet{
+		ProviderName: "macvlan.default",
+		Subnet:       &kubeovnv1.Subnet{Spec: kubeovnv1.SubnetSpec{Provider: "macvlan.default"}},
+	}
+	podWith := func(annotations map[string]string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p", Annotations: annotations}}
+	}
+
+	routedKey := fmt.Sprintf(util.RoutedAnnotationTemplate, util.OvnProvider)
+	attachRoutedKey := fmt.Sprintf(util.RoutedAnnotationTemplate, attachNet.ProviderName)
+
+	// A routed OVN network is reset so its reconcile runs again.
+	patch := clearRoutedPatch(podWith(map[string]string{routedKey: "true"}), []*kubeovnNet{ovnNet(util.OvnProvider)})
+	require.Len(t, patch, 1)
+	value, ok := patch[routedKey]
+	require.True(t, ok)
+	assert.Nil(t, value, "the annotation must be removed, not set to a value")
+
+	// A pod that has not been routed yet has a pending reconcile already.
+	assert.Empty(t, clearRoutedPatch(podWith(nil), []*kubeovnNet{ovnNet(util.OvnProvider)}))
+
+	// A non-OVN attachment has no port group of ours, so it is left alone.
+	assert.Empty(t, clearRoutedPatch(podWith(map[string]string{attachRoutedKey: "true"}), []*kubeovnNet{attachNet}))
+}
+
+func TestAlignVMIPNodeName(t *testing.T) {
+	newIP := func(name, nodeName string, labels map[string]string) *kubeovnv1.IP {
+		return &kubeovnv1.IP{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+			Spec:       kubeovnv1.IPSpec{PodName: "vm", Namespace: "ns", NodeName: nodeName},
+		}
+	}
+	ports := []ovnnb.LogicalSwitchPort{{Name: "vm.ns.ovn"}, {Name: "vm-attach.ns.ovn"}, {Name: "missing.ns.ovn"}}
+
+	fakeCtrl, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		IPs: []*kubeovnv1.IP{
+			newIP("vm.ns.ovn", "old-node", map[string]string{util.NodeNameLabel: "old-node"}),
+			newIP("vm-attach.ns.ovn", "target-node", map[string]string{util.NodeNameLabel: "target-node"}),
+		},
+	})
+	require.NoError(t, err)
+	ctrl := fakeCtrl.fakeController
+
+	require.NoError(t, ctrl.alignVMIPNodeName(ports, "source-node"))
+
+	for _, name := range []string{"vm.ns.ovn", "vm-attach.ns.ovn"} {
+		ip, err := ctrl.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), name, metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "source-node", ip.Spec.NodeName, "%s must point at the node running the vm", name)
+		assert.Equal(t, "source-node", ip.Labels[util.NodeNameLabel], "%s label must agree with the spec", name)
+	}
+
+	// An IP that is already aligned is left untouched, and a missing one is not an error.
+	require.NoError(t, ctrl.alignVMIPNodeName(ports, "source-node"))
+}
+
+func TestAliveVMSiblingOf(t *testing.T) {
+	vmiOwner := func(vmName string) []metav1.OwnerReference {
+		return []metav1.OwnerReference{{
+			APIVersion: kubevirtv1.SchemeGroupVersion.String(),
+			Kind:       util.KindVirtualMachineInstance,
+			Name:       vmName,
+		}}
+	}
+	vmPod := func(name, vmName string, phase corev1.PodPhase, createdBy string) *corev1.Pod {
+		labels := map[string]string{"vm.kubevirt.io/name": vmName}
+		if createdBy != "" {
+			labels[kubevirtv1.CreatedByLabel] = createdBy
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:       "ns",
+				Name:            name,
+				Labels:          labels,
+				OwnerReferences: vmiOwner(vmName),
+			},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+	}
+
+	const uid = "6c1d1b0a-0000-4000-8000-000000000001"
+
+	t.Run("labelled pods are matched by the vmi label", func(t *testing.T) {
+		dead := vmPod("vm-aaa", "vm", corev1.PodSucceeded, uid)
+		alive := vmPod("vm-bbb", "vm", corev1.PodRunning, uid)
+		// A pod of another namespace user carries no created-by label and must not be picked up.
+		other := vmPod("other-ccc", "other", corev1.PodRunning, "")
+		fakeCtrl, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{dead, alive, other}})
+		require.NoError(t, err)
+
+		sibling, err := fakeCtrl.fakeController.aliveVMSiblingOf(dead, "vm")
+		require.NoError(t, err)
+		require.NotNil(t, sibling)
+		assert.Equal(t, "vm-bbb", sibling.Name)
+	})
+
+	t.Run("a pod without the label still finds its sibling", func(t *testing.T) {
+		dead := vmPod("vm-aaa", "vm", corev1.PodSucceeded, "")
+		alive := vmPod("vm-bbb", "vm", corev1.PodRunning, uid)
+		fakeCtrl, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{dead, alive}})
+		require.NoError(t, err)
+
+		sibling, err := fakeCtrl.fakeController.aliveVMSiblingOf(dead, "vm")
+		require.NoError(t, err)
+		require.NotNil(t, sibling, "a missing label must fall back to the whole namespace, never to \"no sibling\"")
+		assert.Equal(t, "vm-bbb", sibling.Name)
+	})
+
+	t.Run("no alive sibling", func(t *testing.T) {
+		dead := vmPod("vm-aaa", "vm", corev1.PodSucceeded, uid)
+		fakeCtrl, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: []*corev1.Pod{dead}})
+		require.NoError(t, err)
+
+		sibling, err := fakeCtrl.fakeController.aliveVMSiblingOf(dead, "vm")
+		require.NoError(t, err)
+		assert.Nil(t, sibling)
+	})
+}
+
+func TestResetVMPodRouted(t *testing.T) {
+	routedKey := fmt.Sprintf(util.RoutedAnnotationTemplate, util.OvnProvider)
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ovn-default"},
+		Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "ovn-cluster"},
+	}
+	newPod := func() *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns",
+				Name:      "vm-bbb",
+				Annotations: map[string]string{
+					util.LogicalSwitchAnnotation:                                    "ovn-default",
+					fmt.Sprintf(util.AllocatedAnnotationTemplate, util.OvnProvider): "true",
+					routedKey: "true",
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+
+	t.Run("the routed annotation is dropped", func(t *testing.T) {
+		fakeCtrl, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+			Subnets: []*kubeovnv1.Subnet{subnet},
+			Pods:    []*corev1.Pod{newPod()},
+		})
+		require.NoError(t, err)
+		ctrl := fakeCtrl.fakeController
+
+		alive, err := ctrl.resetVMPodRouted(newPod())
+		require.NoError(t, err)
+		assert.True(t, alive)
+
+		patched, err := ctrl.config.KubeClient.CoreV1().Pods("ns").Get(context.Background(), "vm-bbb", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.NotContains(t, patched.Annotations, routedKey, "the routed annotation must be removed, not blanked")
+	})
+
+	t.Run("a pod that is already gone is reported", func(t *testing.T) {
+		fakeCtrl, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+			Subnets: []*kubeovnv1.Subnet{subnet},
+		})
+		require.NoError(t, err)
+		ctrl := fakeCtrl.fakeController
+
+		// The pod exists only in the informer cache: the patch reports NotFound, which is how the
+		// caller learns that the sibling it picked is gone.
+		alive, err := ctrl.resetVMPodRouted(newPod())
+		require.NoError(t, err)
+		assert.False(t, alive, "a vanished sibling must be reported so its node is not used")
+	})
+}
+
+// TestHandleDeletePodVMPortGroups covers the branch decision this feature lives in: a VM pod that
+// is deleted while another virt-launcher pod of the same VMI is alive must not strip the port groups
+// of the shared LSP, and must hand the memberships to that pod; without a live sibling it still
+// removes them. gomock fails on the unexpected call, so "RemovePortFromPortGroups is not called" is
+// a hard assertion here.
+func TestHandleDeletePodVMPortGroups(t *testing.T) {
+	const (
+		namespace = "ns"
+		vmName    = "vm"
+		vmiUID    = "6c1d1b0a-0000-4000-8000-000000000001"
+	)
+	portName := ovs.PodNameToPortName(vmName, namespace, util.OvnProvider)
+	routedKey := fmt.Sprintf(util.RoutedAnnotationTemplate, util.OvnProvider)
+
+	vmPodOwnerRef := []metav1.OwnerReference{{
+		APIVersion: kubevirtv1.SchemeGroupVersion.String(),
+		Kind:       util.KindVirtualMachineInstance,
+		Name:       vmName,
+	}}
+	vmPod := func(name, uid, node string, phase corev1.PodPhase, deleting bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:       namespace,
+				Name:            name,
+				UID:             types.UID(uid),
+				Labels:          map[string]string{kubevirtv1.CreatedByLabel: vmiUID},
+				OwnerReferences: vmPodOwnerRef,
+				Annotations: map[string]string{
+					util.LogicalSwitchAnnotation:                         "ovn-default",
+					util.AllocatedAnnotation:                             "true",
+					fmt.Sprintf(util.IPAddressAnnotationTemplate, "ovn"): "10.0.0.2",
+					routedKey: "true",
+				},
+			},
+			Spec:   corev1.PodSpec{NodeName: node, RestartPolicy: corev1.RestartPolicyNever},
+			Status: corev1.PodStatus{Phase: phase},
+		}
+		if deleting {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+		}
+		return p
+	}
+
+	newController := func(t *testing.T, pods []*corev1.Pod) (*fakeController, *kubeovnv1.IP) {
+		t.Helper()
+		ip := &kubeovnv1.IP{
+			// createOrUpdateIPCR writes the node into both, so the fixture carries both.
+			ObjectMeta: metav1.ObjectMeta{Name: portName, Labels: map[string]string{util.NodeNameLabel: "node-a"}},
+			Spec: kubeovnv1.IPSpec{
+				PodName:   vmName,
+				Namespace: namespace,
+				Subnet:    "ovn-default",
+				NodeName:  "node-a",
+			},
+		}
+		fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+			Namespaces: []*corev1.Namespace{{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        namespace,
+					Annotations: map[string]string{util.LogicalSwitchAnnotation: "ovn-default"},
+				},
+			}},
+			Subnets: []*kubeovnv1.Subnet{{
+				ObjectMeta: metav1.ObjectMeta{Name: "ovn-default"},
+				Spec:       kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Vpc: "ovn-cluster"},
+			}},
+			Pods: pods,
+			IPs:  []*kubeovnv1.IP{ip},
+		})
+		require.NoError(t, err)
+		c := fc.fakeController
+		c.config.EnableKeepVMIP = true
+
+		kvCtrl := gomock.NewController(t)
+		kvClient := kubecli.NewMockKubevirtClient(kvCtrl)
+		vmiIface := kubecli.NewMockVirtualMachineInstanceInterface(kvCtrl)
+		vmIface := kubecli.NewMockVirtualMachineInterface(kvCtrl)
+		kvClient.EXPECT().VirtualMachineInstance(namespace).Return(vmiIface).AnyTimes()
+		vmiIface.EXPECT().Get(gomock.Any(), vmName, gomock.Any()).
+			Return(&kubevirtv1.VirtualMachineInstance{}, nil).AnyTimes()
+		kvClient.EXPECT().VirtualMachine(namespace).Return(vmIface).AnyTimes()
+		vmIface.EXPECT().Get(gomock.Any(), vmName, gomock.Any()).
+			Return(&kubevirtv1.VirtualMachine{}, nil).AnyTimes()
+		c.config.KubevirtClient = kvClient
+
+		return fc, ip
+	}
+
+	t.Run("a live sibling keeps the port groups and its own node", func(t *testing.T) {
+		deleting := vmPod("virt-launcher-vm-aaa", "uid-a", "node-a", corev1.PodSucceeded, true)
+		sibling := vmPod("virt-launcher-vm-bbb", "uid-b", "node-b", corev1.PodRunning, false)
+		fc, _ := newController(t, []*corev1.Pod{deleting, sibling})
+		c := fc.fakeController
+
+		fc.mockOvnClient.EXPECT().
+			ListNormalLogicalSwitchPorts(gomock.Any(), map[string]string{"pod": namespace + "/" + vmName}).
+			Return([]ovnnb.LogicalSwitchPort{{Name: portName}}, nil).Times(2)
+		fc.mockOvnClient.EXPECT().CleanLogicalSwitchPortMigrateOptions(portName).Return(nil)
+
+		key := namespace + "/" + deleting.Name
+		c.deletingPodObjMap.Store(key, deleting)
+		require.NoError(t, c.handleDeletePod(key))
+
+		patched, err := c.config.KubeClient.CoreV1().Pods(namespace).Get(context.Background(), sibling.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.NotContains(t, patched.Annotations, routedKey, "the surviving pod must be told to re-assert its memberships")
+
+		ip, err := c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), portName, metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "node-b", ip.Spec.NodeName, "the IP must follow the node that runs the vm")
+		assert.Equal(t, "node-b", ip.Labels[util.NodeNameLabel])
+	})
+
+	t.Run("a sibling that is not placed yet leaves the records alone", func(t *testing.T) {
+		deleting := vmPod("virt-launcher-vm-aaa", "uid-a", "node-a", corev1.PodSucceeded, true)
+		pending := vmPod("virt-launcher-vm-bbb", "uid-b", "", corev1.PodPending, false)
+		fc, _ := newController(t, []*corev1.Pod{deleting, pending})
+		c := fc.fakeController
+
+		fc.mockOvnClient.EXPECT().
+			ListNormalLogicalSwitchPorts(gomock.Any(), map[string]string{"pod": namespace + "/" + vmName}).
+			Return([]ovnnb.LogicalSwitchPort{{Name: portName}}, nil).Times(2)
+		fc.mockOvnClient.EXPECT().CleanLogicalSwitchPortMigrateOptions(portName).Return(nil)
+
+		key := namespace + "/" + deleting.Name
+		c.deletingPodObjMap.Store(key, deleting)
+		require.NoError(t, c.handleDeletePod(key))
+
+		ip, err := c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), portName, metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "node-a", ip.Spec.NodeName, "a pod without a node must not blank the record")
+		assert.Equal(t, "node-a", ip.Labels[util.NodeNameLabel])
+	})
+
+	t.Run("without a live sibling the memberships are removed", func(t *testing.T) {
+		deleting := vmPod("virt-launcher-vm-aaa", "uid-a", "node-a", corev1.PodSucceeded, true)
+		fc, ip := newController(t, []*corev1.Pod{deleting})
+		c := fc.fakeController
+
+		fc.mockOvnClient.EXPECT().
+			ListNormalLogicalSwitchPorts(gomock.Any(), map[string]string{"pod": namespace + "/" + vmName}).
+			Return([]ovnnb.LogicalSwitchPort{{Name: portName}}, nil).Times(2)
+		fc.mockOvnClient.EXPECT().CleanLogicalSwitchPortMigrateOptions(portName).Return(nil)
+		fc.mockOvnClient.EXPECT().RemovePortFromPortGroups(portName).Return(nil)
+
+		key := namespace + "/" + deleting.Name
+		c.deletingPodObjMap.Store(key, deleting)
+		require.NoError(t, c.handleDeletePod(key))
+
+		assert.Equal(t, "node-a", ip.Spec.NodeName, "with no live pod the record is left alone")
+	})
 }
