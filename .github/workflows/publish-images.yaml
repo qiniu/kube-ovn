@@ -176,7 +176,6 @@ jobs:
             fi
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --prerelease \
               --title "$TAG" \
               --notes-file /tmp/tag-notes \
               "${release_assets[@]}"
