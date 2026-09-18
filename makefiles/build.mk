@@ -2,6 +2,7 @@
 
 COMMIT = git-$(shell git rev-parse --short HEAD)
 DATE = $(shell date +"%Y-%m-%d_%H:%M:%S")
+BASE_TAG ?= $(RELEASE_TAG)
 
 GOLDFLAGS = -extldflags '-z now' -X github.com/kubeovn/kube-ovn/versions.COMMIT=$(COMMIT) -X github.com/kubeovn/kube-ovn/versions.VERSION=$(RELEASE_TAG) -X github.com/kubeovn/kube-ovn/versions.BUILDDATE=$(DATE)
 ifdef DEBUG
@@ -72,7 +73,7 @@ build-kit: build-go
 
 .PHONY: image-kube-ovn
 image-kube-ovn: build-go
-	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) --build-arg BASE_TAG=$(BASE_TAG) --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
 #	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(LEGACY_TAG) --build-arg VERSION=$(LEGACY_TAG) --build-arg ARCH=amd64 -o type=docker -f dist/images/Dockerfile dist/images/
 
 .PHONY: image-kube-ovn-arm64

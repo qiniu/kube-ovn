@@ -7,12 +7,48 @@ trap 'rm -rf "$output_dir"' EXIT
 
 ruby -ryaml - "$repo_root/.github/workflows/publish-images.yaml" <<'RUBY'
 workflow = YAML.load_file(ARGV.fetch(0))
-steps = workflow.fetch("jobs").fetch("build-release-images").fetch("steps")
+jobs = workflow.fetch("jobs")
+raise "tagged releases must not rebuild base images" if jobs.key?("build-base-images")
+
+prepare_job = jobs.fetch("prepare")
+unless prepare_job.fetch("outputs").fetch("base_tag") == "${{ steps.release.outputs.base_tag }}"
+  raise "prepare must expose the base image tag"
+end
+prepare = prepare_job.fetch("steps").find { |step| step["name"] == "Validate release tag" }
+unless prepare&.fetch("run")&.include?("base_tag=$(<VERSION)")
+  raise "prepare must read the base image tag from VERSION"
+end
+
+build_job = jobs.fetch("build-release-images")
+unless build_job.fetch("needs") == "prepare"
+  raise "build-release-images must only depend on prepare"
+end
+
+steps = build_job.fetch("steps")
 setup_buildx = steps.find { |step| step["uses"] == "docker/setup-buildx-action@v3" }
 unless setup_buildx&.dig("with", "driver") == "docker"
-  raise "build-release-images must use the docker driver to consume daemon-local base images"
+  raise "build-release-images must use the docker driver to export local images"
+end
+
+build = steps.find { |step| step["name"] == "Build release images" }
+raise "Build release images step is missing" unless build
+unless build.fetch("env").fetch("BASE_TAG") == "${{ needs.prepare.outputs.base_tag }}"
+  raise "Build release images must use the base tag from VERSION"
+end
+
+command = build.fetch("run")
+unless command.include?("image-kube-ovn image-vpc-nat-gateway-ubuntu")
+  raise "Build release images must build the Qiniu x86 image set"
+end
+for target in %w[base-amd64 base-amd64-dpdk image-kube-ovn-debug image-kube-ovn-dpdk image-vpc-nat-gateway]
+  raise "Build release images must not run #{target}" if command.match?(/(^|\s)#{Regexp.escape(target)}(\s|$)/)
 end
 RUBY
+
+make -n -f "$repo_root/Makefile" \
+  RELEASE_TAG=v1.15.10-alpha.1 \
+  BASE_TAG=v1.15.10 \
+  image-kube-ovn | grep -Fq -- '--build-arg BASE_TAG=v1.15.10'
 
 for invalid_tag in \
   release-1.15.10-alpha.1 \

@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+      base_tag: ${{ steps.release.outputs.base_tag }}
     steps:
       - uses: actions/checkout@v6
 
@@ -37,85 +38,16 @@ jobs:
             exit 1
           fi
           echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-
-  build-base-images:
-    name: Build and publish x86 base images
-    needs: prepare
-    permissions:
-      contents: read
-      packages: write
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    steps:
-      - uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          docker-images: false
-          large-packages: false
-          tool-cache: false
-          swap-storage: false
-
-      - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: env.BUILDKIT_STEP_LOG_MAX_SIZE=50000000
-
-      - uses: actions/setup-go@v6
-        id: setup-go
-        with:
-          go-version-file: go.mod
-          check-latest: true
-          cache: false
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build base images
-        env:
-          GO_VERSION: ${{ steps.setup-go.outputs.go-version }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
-        run: |
-          set -euo pipefail
-          make \
-            REGISTRY="$IMAGE_REGISTRY" \
-            RELEASE_TAG="$TAG" \
-            DEBUG_TAG="$TAG-debug" \
-            LEGACY_TAG="$TAG-amd64-legacy" \
-            base-amd64 base-amd64-dpdk
-
-      - name: Publish base images
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
-          image="$IMAGE_REGISTRY/kube-ovn-base"
-          docker tag "$image:$TAG-amd64" "$image:$TAG"
-          docker tag "$image:$TAG-debug-amd64" "$image:$TAG-debug"
-          docker tag "$image:$TAG-amd64-dpdk" "$image:$TAG-dpdk"
-
-          for image_tag in \
-            "$TAG" \
-            "$TAG-amd64" \
-            "$TAG-debug" \
-            "$TAG-debug-amd64" \
-            "$TAG-amd64-legacy" \
-            "$TAG-dpdk" \
-            "$TAG-amd64-dpdk"; do
-            docker push "$image:$image_tag"
-          done
+          base_tag=$(<VERSION)
+          if [[ ! "$base_tag" =~ $release_tag_regex ]]; then
+            echo "::error file=VERSION::Base image tag $base_tag is not a valid release version"
+            exit 1
+          fi
+          echo "base_tag=$base_tag" >> "$GITHUB_OUTPUT"
 
   build-release-images:
     name: Build and publish x86 release images
-    needs:
-      - prepare
-      - build-base-images
+    needs: prepare
     permissions:
       contents: read
       packages: write
@@ -150,126 +82,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Load release base images
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
-          image="$IMAGE_REGISTRY/kube-ovn-base"
-          for image_tag in "$TAG" "$TAG-debug" "$TAG-dpdk"; do
-            docker pull "$image:$image_tag"
-            docker tag "$image:$image_tag" "kubeovn/kube-ovn-base:$image_tag"
-          done
-
-      - name: Install golangci-lint
-        env:
-          GOLANGCI_LINT_VERSION: v2.10.1
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh |
-            sh -s -- -b "$(go env GOPATH)/bin" "$GOLANGCI_LINT_VERSION"
-
-      - name: Lint
-        run: make lint
-
-      - name: Scan base image
-        uses: aquasecurity/trivy-action@0.34.2
-        env:
-          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
-        with:
-          scan-type: image
-          scanners: vuln
-          image-ref: docker.io/kubeovn/kube-ovn-base:${{ needs.prepare.outputs.tag }}
-          format: json
-          output: trivy-result.json
-          ignore-unfixed: true
-          trivyignores: .trivyignore
-          vuln-type: library
-
-      - name: Build vulnerable bundled binaries from source
-        env:
-          CGO_ENABLED: '0'
-          GO_INSTALL: go install -v -mod=mod -trimpath
-        run: |
-          set -euo pipefail
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-          cat trivy-result.json
-
-          dockerfile="$GITHUB_WORKSPACE/dist/images/Dockerfile"
-          export GOBIN
-          GOBIN=$(dirname "$dockerfile")
-          cni_plugins_version=$(go list -m -f '{{.Version}}' github.com/containernetworking/plugins)
-          cni_plugins_build_flags="-ldflags '-extldflags -static -X github.com/containernetworking/plugins/pkg/utils/buildversion.BuildVersion=$cni_plugins_version'"
-
-          jq -r '.Results[] | select((.Type=="gobinary") and (.Vulnerabilities!=null)) | .Target' trivy-result.json |
-            while read -r file; do
-              binary=$(basename "$file")
-              case "$binary" in
-                loopback|macvlan)
-                  echo "Building $binary@$cni_plugins_version from source..."
-                  sh -c "cd /tmp && $GO_INSTALL $cni_plugins_build_flags github.com/containernetworking/plugins/plugins/main/$binary@$cni_plugins_version"
-                  echo "COPY $binary $file" >> "$dockerfile"
-                  ;;
-                portmap)
-                  echo "Building $binary@$cni_plugins_version from source..."
-                  sh -c "cd /tmp && $GO_INSTALL $cni_plugins_build_flags github.com/containernetworking/plugins/plugins/meta/$binary@$cni_plugins_version"
-                  echo "COPY $binary $file" >> "$dockerfile"
-                  ;;
-                kubectl)
-                  version=$(go list -m -f '{{.Version}}' k8s.io/kubernetes)
-                  mod_dir=$(go list -m -f '{{.Dir}}' k8s.io/kubernetes)
-                  source "$mod_dir/hack/lib/util.sh"
-                  source "$mod_dir/hack/lib/logging.sh"
-                  source "$mod_dir/hack/lib/version.sh"
-                  read -r type tag_sha < <(curl -sSfL "https://api.github.com/repos/kubernetes/kubernetes/git/ref/tags/$version" |
-                    jq -r '[.object.type,.object.sha] | @tsv')
-                  if [[ "$type" == commit ]]; then
-                    commit=$tag_sha
-                  else
-                    commit=$(curl -sSfL "https://api.github.com/repos/kubernetes/kubernetes/git/tags/$tag_sha" |
-                      jq -r '.object.sha')
-                  fi
-                  export KUBE_GIT_COMMIT="$commit"
-                  export KUBE_GIT_TREE_STATE=clean
-                  export KUBE_GIT_VERSION="$version"
-                  export KUBE_GIT_MAJOR
-                  KUBE_GIT_MAJOR=$(cut -d. -f1 <<< "$KUBE_GIT_VERSION" | sed 's/^v//')
-                  export KUBE_GIT_MINOR
-                  KUBE_GIT_MINOR=$(cut -d. -f2 <<< "$KUBE_GIT_VERSION")
-                  goldflags="all=$(kube::version::ldflags) -s -w"
-                  echo "Building $binary@$version from source..."
-                  $GO_INSTALL -ldflags="$goldflags" k8s.io/kubernetes/cmd/kubectl
-                  echo "COPY $binary $file" >> "$dockerfile"
-                  ;;
-                gobgp)
-                  version=$(go list -m -f '{{.Version}}' github.com/osrg/gobgp/v4)
-                  echo "Building $binary@$version from source..."
-                  $GO_INSTALL github.com/osrg/gobgp/v4/cmd/"$binary"
-                  echo "COPY $binary $file" >> "$dockerfile"
-                  ;;
-              esac
-            done
-
       - name: Build release images
         env:
+          BASE_TAG: ${{ needs.prepare.outputs.base_tag }}
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           make \
             REGISTRY=kubeovn \
             RELEASE_TAG="$TAG" \
-            DEBUG_TAG="$TAG-debug" \
-            image-kube-ovn image-kube-ovn-debug image-kube-ovn-dpdk image-vpc-nat-gateway
+            BASE_TAG="$BASE_TAG" \
+            image-kube-ovn image-vpc-nat-gateway-ubuntu
 
       - name: Publish release images
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          for image_tag in "$TAG" "$TAG-debug" "$TAG-dpdk"; do
-            docker tag "kubeovn/kube-ovn:$image_tag" "$IMAGE_REGISTRY/kube-ovn:$image_tag"
-            docker push "$IMAGE_REGISTRY/kube-ovn:$image_tag"
-          done
+          docker tag "kubeovn/kube-ovn:$TAG" "$IMAGE_REGISTRY/kube-ovn:$TAG"
+          docker push "$IMAGE_REGISTRY/kube-ovn:$TAG"
           docker tag "kubeovn/vpc-nat-gateway:$TAG" "$IMAGE_REGISTRY/vpc-nat-gateway:$TAG"
           docker push "$IMAGE_REGISTRY/vpc-nat-gateway:$TAG"
 
