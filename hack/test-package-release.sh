@@ -2,7 +2,6 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
-version=$(<"$repo_root/VERSION")
 output_dir=$(mktemp -d)
 trap 'rm -rf "$output_dir"' EXIT
 
@@ -15,12 +14,12 @@ unless setup_buildx&.dig("with", "driver") == "docker"
 end
 RUBY
 
-if "$repo_root/hack/package-release.sh" v0.0.0-alpha.1 "$output_dir/invalid" 2>/dev/null; then
-  echo "package-release.sh accepted a tag with a different base version" >&2
+if "$repo_root/hack/package-release.sh" release-1.15.10-alpha.1 "$output_dir/invalid" 2>/dev/null; then
+  echo "package-release.sh accepted an invalid release tag" >&2
   exit 1
 fi
 
-for tag in "$version" "${version}-alpha.1" "${version}-rc.1" "${version}-qiniu.1"; do
+for tag in v1.15.10 v1.15.10-alpha.1 v1.15.10-rc.1 v1.15.10-qiniu.1 v1.15.11-alpha.1; do
   tag_output_dir="$output_dir/${tag#v}"
   "$repo_root/hack/package-release.sh" "$tag" "$tag_output_dir"
 

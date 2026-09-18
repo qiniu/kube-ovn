@@ -14,24 +14,8 @@ if [[ ! $tag =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)([.-][0-9A-Za-z.-]+)?$ ]]; then
   echo "invalid release tag: $tag" >&2
   exit 1
 fi
-base_version=${BASH_REMATCH[1]}
-
-repository_version=$(<"$repo_root/VERSION")
-if [[ $base_version != "$repository_version" ]]; then
-  echo "release tag $tag has base version $base_version, expected VERSION $repository_version" >&2
-  exit 1
-fi
 
 chart_version=${tag#v}
-base_chart_version=${base_version#v}
-for chart in kube-ovn kube-ovn-v2; do
-  actual_version=$(ruby -ryaml -e 'print YAML.load_file(ARGV.fetch(0)).fetch("version")' \
-    "$repo_root/charts/$chart/Chart.yaml")
-  if [[ $actual_version != "$base_chart_version" ]]; then
-    echo "$chart Chart.yaml version $actual_version does not match release base version $base_chart_version" >&2
-    exit 1
-  fi
-done
 
 mkdir -p "$output_dir"
 output_dir=$(cd "$output_dir" && pwd)

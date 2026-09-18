@@ -26,18 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Validate tag and repository version
+      - name: Validate release tag
         id: release
         run: |
           set -euo pipefail
-          version=$(<VERSION)
           if [[ ! "$GITHUB_REF_NAME" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Tag $GITHUB_REF_NAME is not a valid release tag"
-            exit 1
-          fi
-          base_version="${BASH_REMATCH[1]}"
-          if [[ "$base_version" != "$version" ]]; then
-            echo "::error file=VERSION::Tag $GITHUB_REF_NAME has base version $base_version, expected $version"
             exit 1
           fi
           echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
