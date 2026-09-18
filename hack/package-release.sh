@@ -10,7 +10,9 @@ tag=$1
 output_dir=$2
 repo_root=$(git rev-parse --show-toplevel)
 
-if [[ ! $tag =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)([.-][0-9A-Za-z.-]+)?$ ]]; then
+semver_identifier='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+release_tag_regex="^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-$semver_identifier(\.$semver_identifier)*)?$"
+if [[ ! $tag =~ $release_tag_regex ]]; then
   echo "invalid release tag: $tag" >&2
   exit 1
 fi

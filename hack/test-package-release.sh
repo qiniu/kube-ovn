@@ -14,10 +14,18 @@ unless setup_buildx&.dig("with", "driver") == "docker"
 end
 RUBY
 
-if "$repo_root/hack/package-release.sh" release-1.15.10-alpha.1 "$output_dir/invalid" 2>/dev/null; then
-  echo "package-release.sh accepted an invalid release tag" >&2
-  exit 1
-fi
+for invalid_tag in \
+  release-1.15.10-alpha.1 \
+  v1.15.10.. \
+  v1.15.10-alpha..1 \
+  v1.15.10-. \
+  v01.15.10 \
+  v1.15.10-01; do
+  if "$repo_root/hack/package-release.sh" "$invalid_tag" "$output_dir/invalid" 2>/dev/null; then
+    echo "package-release.sh accepted invalid release tag $invalid_tag" >&2
+    exit 1
+  fi
+done
 
 for tag in v1.15.10 v1.15.10-alpha.1 v1.15.10-rc.1 v1.15.10-qiniu.1 v1.15.11-alpha.1; do
   tag_output_dir="$output_dir/${tag#v}"
