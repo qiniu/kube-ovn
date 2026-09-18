@@ -7,6 +7,15 @@ chart_version=${tag#v}
 output_dir=$(mktemp -d)
 trap 'rm -rf "$output_dir"' EXIT
 
+ruby -ryaml - "$repo_root/.github/workflows/publish-images.yaml" <<'RUBY'
+workflow = YAML.load_file(ARGV.fetch(0))
+steps = workflow.fetch("jobs").fetch("build-release-images").fetch("steps")
+setup_buildx = steps.find { |step| step["uses"] == "docker/setup-buildx-action@v3" }
+unless setup_buildx&.dig("with", "driver") == "docker"
+  raise "build-release-images must use the docker driver to consume daemon-local base images"
+end
+RUBY
+
 if "$repo_root/hack/package-release.sh" v0.0.0 "$output_dir/invalid" 2>/dev/null; then
   echo "package-release.sh accepted a tag that does not match VERSION" >&2
   exit 1

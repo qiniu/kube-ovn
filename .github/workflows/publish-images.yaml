@@ -133,6 +133,8 @@ jobs:
 
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
 
       - uses: actions/setup-go@v6
         with:
