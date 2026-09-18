@@ -2,8 +2,7 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
-tag=$(<"$repo_root/VERSION")
-chart_version=${tag#v}
+version=$(<"$repo_root/VERSION")
 output_dir=$(mktemp -d)
 trap 'rm -rf "$output_dir"' EXIT
 
@@ -16,20 +15,31 @@ unless setup_buildx&.dig("with", "driver") == "docker"
 end
 RUBY
 
-if "$repo_root/hack/package-release.sh" v0.0.0 "$output_dir/invalid" 2>/dev/null; then
-  echo "package-release.sh accepted a tag that does not match VERSION" >&2
+if "$repo_root/hack/package-release.sh" v0.0.0-alpha.1 "$output_dir/invalid" 2>/dev/null; then
+  echo "package-release.sh accepted a tag with a different base version" >&2
   exit 1
 fi
 
-"$repo_root/hack/package-release.sh" "$tag" "$output_dir"
+for tag in "$version" "${version}-alpha.1" "${version}-rc.1" "${version}-qiniu.1"; do
+  tag_output_dir="$output_dir/${tag#v}"
+  "$repo_root/hack/package-release.sh" "$tag" "$tag_output_dir"
 
-grep -Fq 'REGISTRY="ghcr.io/qiniu"' "$output_dir/install.sh"
-grep -Fq "VERSION=\"$tag\"" "$output_dir/install.sh"
-tar -xOf "$output_dir/kube-ovn-$chart_version.tgz" kube-ovn/values.yaml |
-  grep -Fq 'address: ghcr.io/qiniu'
-tar -xOf "$output_dir/kube-ovn-$chart_version.tgz" kube-ovn/values.yaml |
-  grep -Fq "DPDK_IMAGE_TAG: $tag-dpdk"
-tar -xOf "$output_dir/kube-ovn-v2-$chart_version.tgz" kube-ovn-v2/values.yaml |
-  grep -Fq 'repository: ghcr.io/qiniu/vpc-nat-gateway'
-tar -xOf "$output_dir/kube-ovn-v2-$chart_version.tgz" kube-ovn-v2/values.yaml |
-  grep -Fq "tag: $tag-dpdk"
+  grep -Fq 'REGISTRY="ghcr.io/qiniu"' "$tag_output_dir/install.sh"
+  grep -Fq "VERSION=\"$tag\"" "$tag_output_dir/install.sh"
+  tar -xOf "$tag_output_dir/kube-ovn-${tag#v}.tgz" kube-ovn/Chart.yaml |
+    grep -Fq "version: ${tag#v}"
+  tar -xOf "$tag_output_dir/kube-ovn-${tag#v}.tgz" kube-ovn/Chart.yaml |
+    grep -Fq "appVersion: ${tag#v}"
+  tar -xOf "$tag_output_dir/kube-ovn-${tag#v}.tgz" kube-ovn/values.yaml |
+    grep -Fq 'address: ghcr.io/qiniu'
+  tar -xOf "$tag_output_dir/kube-ovn-${tag#v}.tgz" kube-ovn/values.yaml |
+    grep -Fq "DPDK_IMAGE_TAG: $tag-dpdk"
+  tar -xOf "$tag_output_dir/kube-ovn-v2-${tag#v}.tgz" kube-ovn-v2/Chart.yaml |
+    grep -Fq "version: ${tag#v}"
+  tar -xOf "$tag_output_dir/kube-ovn-v2-${tag#v}.tgz" kube-ovn-v2/Chart.yaml |
+    grep -Fq "appVersion: ${tag#v}"
+  tar -xOf "$tag_output_dir/kube-ovn-v2-${tag#v}.tgz" kube-ovn-v2/values.yaml |
+    grep -Fq 'repository: ghcr.io/qiniu/vpc-nat-gateway'
+  tar -xOf "$tag_output_dir/kube-ovn-v2-${tag#v}.tgz" kube-ovn-v2/values.yaml |
+    grep -Fq "tag: $tag-dpdk"
+done
