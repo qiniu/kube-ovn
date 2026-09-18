@@ -43,6 +43,17 @@ end
 for target in %w[base-amd64 base-amd64-dpdk image-kube-ovn-debug image-kube-ovn-dpdk image-vpc-nat-gateway]
   raise "Build release images must not run #{target}" if command.match?(/(^|\s)#{Regexp.escape(target)}(\s|$)/)
 end
+
+release_steps = jobs.fetch("release").fetch("steps")
+publish_release = release_steps.find { |step| step["name"] == "Create or update GitHub release" }
+raise "Create or update GitHub release step is missing" unless publish_release
+release_command = publish_release.fetch("run")
+unless release_command.include?('gh release create "$TAG"') && release_command.include?('"${release_assets[@]}"')
+  raise "immutable releases must be created with their assets"
+end
+if release_command.include?('gh release upload')
+  raise "immutable releases must not upload assets after publication"
+end
 RUBY
 
 make -n -f "$repo_root/Makefile" \

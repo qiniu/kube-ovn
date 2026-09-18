@@ -161,7 +161,15 @@ jobs:
             fi
           done
 
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            published_assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            for asset in "${release_assets[@]}"; do
+              if ! grep -Fxq "$(basename "$asset")" <<< "$published_assets"; then
+                echo "::error::Immutable release $TAG is missing $(basename "$asset")"
+                exit 1
+              fi
+            done
+          else
             git for-each-ref "refs/tags/$TAG" --format='%(contents)' > /tmp/tag-notes
             if [[ ! -s /tmp/tag-notes ]]; then
               git log -1 --pretty=%B "$TAG" > /tmp/tag-notes
@@ -170,13 +178,9 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --prerelease \
               --title "$TAG" \
-              --notes-file /tmp/tag-notes
+              --notes-file /tmp/tag-notes \
+              "${release_assets[@]}"
           fi
-
-          gh release upload "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber \
-            "${release_assets[@]}"
 
       - name: Log out from GitHub Container Registry
         if: always()
