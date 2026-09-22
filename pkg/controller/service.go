@@ -141,7 +141,9 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 	}
 
 	key := cache.MetaObjectToName(newSvc).String()
-	c.enqueueNftableLbService(key)
+	if nftableLbSvcChanged(oldSvc, newSvc) {
+		c.enqueueNftableLbService(key)
+	}
 	klog.V(3).Infof("enqueue update service %s", key)
 	if len(ipsToDel) != 0 {
 		ipsToDelStr := strings.Join(ipsToDel, ",")

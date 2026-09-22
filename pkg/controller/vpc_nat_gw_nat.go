@@ -77,8 +77,19 @@ func (c *Controller) enqueueDelIptablesFip(obj any) {
 	c.delIptablesFipQueue.Add(key)
 }
 
+// isNftableLbSvcRecord reports whether a DNAT object is a record written by the nftable LB
+// service feature. Such objects are never reconciled by this controller: the Service drives
+// the gateway dataplane directly, and reconciling the record here would make it a second
+// writer of the same nft identity.
+func isNftableLbSvcRecord(dnat *kubeovnv1.IptablesDnatRule) bool {
+	return dnat.Labels[util.NftableLbSvcRecordLabel] == "true"
+}
+
 func (c *Controller) enqueueAddIptablesDnatRule(obj any) {
 	dnat := obj.(*kubeovnv1.IptablesDnatRule)
+	if isNftableLbSvcRecord(dnat) {
+		return
+	}
 	key := cache.MetaObjectToName(dnat).String()
 	// A terminating object reconciles via the update queue for cleanup (handleAdd returns early).
 	if enqueueUpdateIfTerminating(c.updateIptablesDnatRuleQueue, key, "dnat", dnat.DeletionTimestamp) {
@@ -91,6 +102,9 @@ func (c *Controller) enqueueAddIptablesDnatRule(obj any) {
 func (c *Controller) enqueueUpdateIptablesDnatRule(oldObj, newObj any) {
 	oldDnat := oldObj.(*kubeovnv1.IptablesDnatRule)
 	newDnat := newObj.(*kubeovnv1.IptablesDnatRule)
+	if isNftableLbSvcRecord(newDnat) {
+		return
+	}
 	key := cache.MetaObjectToName(newDnat).String()
 	if !newDnat.DeletionTimestamp.IsZero() {
 		klog.V(3).Infof("enqueue update to clean dnat %s", key)
@@ -139,6 +153,9 @@ func (c *Controller) enqueueDelIptablesDnatRule(obj any) {
 	}
 
 	key := cache.MetaObjectToName(dnat).String()
+	if isNftableLbSvcRecord(dnat) {
+		return
+	}
 	klog.V(3).Infof("enqueue delete iptables dnat %s", key)
 	c.delIptablesDnatRuleQueue.Add(key)
 }

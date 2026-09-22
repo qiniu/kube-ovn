@@ -117,7 +117,11 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 	oldEip := oldObj.(*kubeovnv1.IptablesEIP)
 	newEip := newObj.(*kubeovnv1.IptablesEIP)
-	c.enqueueNftableLbServicesForEIP(newEip.Name)
+	if oldEip.Status.IP != newEip.Status.IP || oldEip.Spec.NatGwDp != newEip.Spec.NatGwDp ||
+		oldEip.DeletionTimestamp.IsZero() != newEip.DeletionTimestamp.IsZero() {
+		// Status.IP and Spec.NatGwDp are the only EIP fields the nftable lb services read.
+		c.enqueueNftableLbServicesForEIP(newEip.Name)
+	}
 	if !newEip.DeletionTimestamp.IsZero() ||
 		oldEip.Status.Redo != newEip.Status.Redo ||
 		oldEip.Spec.QoSPolicy != newEip.Spec.QoSPolicy {

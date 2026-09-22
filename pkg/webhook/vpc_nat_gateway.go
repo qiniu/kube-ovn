@@ -588,13 +588,17 @@ func validateIptablesDnatProtocol(protocol string) error {
 }
 
 func (v *ValidatingHook) ValidateIptablesDnat(ctx context.Context, dnat *ovnv1.IptablesDnatRule) error {
-	if dnat.Spec.EIP == "" {
+	// A record written by the nftable LB service feature for a ClusterIP Service has no EIP:
+	// its external address is the ClusterIP and it is not reconciled by the DNAT controller.
+	if dnat.Spec.EIP == "" && dnat.Labels[util.NftableLbSvcRecordLabel] != "true" {
 		return errors.New("parameter \"eip\" cannot be empty")
 	}
 	eip := &ovnv1.IptablesEIP{}
-	key := types.NamespacedName{Name: dnat.Spec.EIP}
-	if err := v.cache.Get(ctx, key, eip); err != nil {
-		return err
+	if dnat.Spec.EIP != "" {
+		key := types.NamespacedName{Name: dnat.Spec.EIP}
+		if err := v.cache.Get(ctx, key, eip); err != nil {
+			return err
+		}
 	}
 
 	if dnat.Spec.ExternalPort == "" {
