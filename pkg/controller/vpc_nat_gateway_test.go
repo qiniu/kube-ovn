@@ -31,6 +31,26 @@ func (l orderedVpcNatGatewayLister) Get(name string) (*kubeovnv1.VpcNatGateway, 
 	return nil, nil
 }
 
+// fakeNatGwPod builds the running NAT gateway pod of a gateway, optionally already initialized.
+func fakeNatGwPod(gwName string, initialized bool) *corev1.Pod {
+	annotations := map[string]string{util.VpcNatGatewayAnnotation: gwName}
+	if initialized {
+		annotations[util.VpcNatGatewayInitAnnotation] = "true"
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      util.GenNatGwName(gwName) + "-0",
+			Namespace: "kube-system",
+			Labels: map[string]string{
+				"app":                   util.GenNatGwName(gwName),
+				util.VpcNatGatewayLabel: "true",
+			},
+			Annotations: annotations,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
 func TestVpcNatGwScriptConstants(t *testing.T) {
 	// Verify the constants are set correctly for backward compatibility
 	assert.Equal(t, "/kube-ovn", vpcNatGwScriptMountPath, "Script mount path should be /kube-ovn")
@@ -145,35 +165,8 @@ func TestInitVpcNatGwContinuesAfterInitializedGateway(t *testing.T) {
 	initializedGw := fakeGw("initialized-gw")
 	pendingGw := fakeGw("pending-gw")
 	pods := []*corev1.Pod{
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      util.GenNatGwName(initializedGw.Name) + "-0",
-				Namespace: "kube-system",
-				Labels: map[string]string{
-					"app":                   util.GenNatGwName(initializedGw.Name),
-					util.VpcNatGatewayLabel: "true",
-				},
-				Annotations: map[string]string{
-					util.VpcNatGatewayAnnotation:     initializedGw.Name,
-					util.VpcNatGatewayInitAnnotation: "true",
-				},
-			},
-			Status: corev1.PodStatus{Phase: corev1.PodRunning},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      util.GenNatGwName(pendingGw.Name) + "-0",
-				Namespace: "kube-system",
-				Labels: map[string]string{
-					"app":                   util.GenNatGwName(pendingGw.Name),
-					util.VpcNatGatewayLabel: "true",
-				},
-				Annotations: map[string]string{
-					util.VpcNatGatewayAnnotation: pendingGw.Name,
-				},
-			},
-			Status: corev1.PodStatus{Phase: corev1.PodRunning},
-		},
+		fakeNatGwPod(initializedGw.Name, true),
+		fakeNatGwPod(pendingGw.Name, false),
 	}
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: pods})
 	require.NoError(t, err)
@@ -189,6 +182,53 @@ func TestInitVpcNatGwContinuesAfterInitializedGateway(t *testing.T) {
 	item, shutdown := queue.Get()
 	require.False(t, shutdown)
 	queue.Done(item)
+	require.Equal(t, pendingGw.Name, item)
+}
+
+// TestResyncVpcNatGwConfigDrivesInitScan covers the startup race between the enable transition and
+// the init scan: vpcNatEnabled is still "unknown" while initResourceOnce runs, so the scan must be
+// driven by the resync that flips the flag, otherwise the restart silently skips every gateway.
+func TestResyncVpcNatGwConfigDrivesInitScan(t *testing.T) {
+	oldEnabled, oldVersion := vpcNatEnabled, VpcNatCmVersion
+	vpcNatEnabled = "unknown"
+	VpcNatCmVersion = ""
+	t.Cleanup(func() {
+		vpcNatEnabled = oldEnabled
+		VpcNatCmVersion = oldVersion
+	})
+
+	initializedGw := fakeGw("initialized-gw")
+	pendingGw := fakeGw("pending-gw")
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{initializedGw, pendingGw},
+		Pods: []*corev1.Pod{
+			fakeNatGwPod(initializedGw.Name, true),
+			fakeNatGwPod(pendingGw.Name, false),
+		},
+		ConfigMaps: []*corev1.ConfigMap{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: util.VpcNatGatewayConfig, Namespace: "kube-system"},
+				Data:       map[string]string{"enable-vpc-nat-gw": "true"},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	addOrUpdateQueue := newTypedRateLimitingQueue[string]("AddOrUpdateVpcNatGateway", nil)
+	initQueue := newTypedRateLimitingQueue[string]("InitVpcNatGateway", nil)
+	t.Cleanup(addOrUpdateQueue.ShutDown)
+	t.Cleanup(initQueue.ShutDown)
+	fc.fakeController.addOrUpdateVpcNatGatewayQueue = addOrUpdateQueue
+	fc.fakeController.initVpcNatGatewayQueue = initQueue
+
+	fc.fakeController.resyncVpcNatGwConfig()
+
+	require.Equal(t, "true", vpcNatEnabled, "the resync owns the enable transition")
+	require.Equal(t, 2, addOrUpdateQueue.Len())
+	require.Equal(t, 1, initQueue.Len(), "only the uninitialized gateway needs a scan enqueue")
+	item, shutdown := initQueue.Get()
+	require.False(t, shutdown)
+	initQueue.Done(item)
 	require.Equal(t, pendingGw.Name, item)
 }
 
