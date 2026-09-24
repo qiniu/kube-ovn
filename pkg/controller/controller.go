@@ -69,6 +69,8 @@ const (
 	// registration) and vip.go (ByIndex call) so a rename is caught at compile time.
 	bgpVipIndexName            = "bgpVipAnnotation"
 	IndexServiceByNftableLbEip = "byNftableLbEip"
+	// IndexServiceByNftableLbGateway indexes Services by the vpc-nat-gw they are bound to.
+	IndexServiceByNftableLbGateway = "byNftableLbGateway"
 )
 
 // Controller is kube-ovn main controller that watch ns/pod/node/svc/ep and operate ovn
@@ -446,6 +448,13 @@ func Run(ctx context.Context, config *Configuration) {
 				return nil, nil
 			}
 			return []string{svc.Annotations[util.EipAnnotation]}, nil
+		},
+		IndexServiceByNftableLbGateway: func(obj any) ([]string, error) {
+			svc, ok := obj.(*corev1.Service)
+			if !ok || svc.Annotations[util.VpcNatGatewayAnnotation] == "" {
+				return nil, nil
+			}
+			return []string{svc.Annotations[util.VpcNatGatewayAnnotation]}, nil
 		},
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add bgpVip indexer to service informer")
@@ -1561,9 +1570,10 @@ func (c *Controller) startWorkers(ctx context.Context) {
 	go wait.Until(runWorker("delete iptables snat rule", c.delIptablesSnatRuleQueue, c.handleDelIptablesSnatRule), time.Second, ctx.Done())
 
 	if c.config.EnableNftableLbSvc {
-		if err := c.enqueueNftableLbSvcOwnersFromRules(); err != nil {
-			util.LogFatalAndExit(err, "failed to enqueue nftable lb service owners")
-		}
+		// Services are enqueued by synthetic Add events on startup, and a Service deleted
+		// while the controller was down is held Terminating by its finalizer, so it is
+		// replayed too: no extra startup scan is needed. The feature must stay enabled for
+		// claimed Services to be reconciled (and released) - that is the design boundary.
 		go wait.Until(runWorker("add/update nftable lb service", c.addOrUpdateNftableLbSvcQueue, c.handleAddOrUpdateNftableLbService), time.Second, ctx.Done())
 	}
 

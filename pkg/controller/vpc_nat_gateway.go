@@ -136,7 +136,12 @@ func (c *Controller) enqueueAddOrUpdateVpcNatGwByName(gwName, reason string) {
 func (c *Controller) enqueueUpdateVpcNatGw(oldObj, newObj any) {
 	oldGw := oldObj.(*kubeovnv1.VpcNatGateway)
 	newGw := newObj.(*kubeovnv1.VpcNatGateway)
-	c.enqueueNftableLbServicesForNatGw(newGw.Name)
+	if oldGw.Spec.Vpc != newGw.Spec.Vpc || oldGw.DeletionTimestamp.IsZero() != newGw.DeletionTimestamp.IsZero() {
+		// Spec.Vpc is the only gateway field the nftable lb services read (backends are
+		// resolved in it). Pod recreation is replayed by initVpcNatGw, so unrelated gateway
+		// updates must not reprogram every Service bound to it.
+		c.enqueueNftableLbServicesForNatGw(newGw.Name)
+	}
 	key := cache.MetaObjectToName(newGw).String()
 	if newGw.DeletionTimestamp.IsZero() {
 		klog.V(3).Infof("enqueue update vpc-nat-gw %s", key)
@@ -655,6 +660,10 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 		return err
 	}
 	for _, dnat := range dnats {
+		if isNftableLbSvcRecord(dnat) {
+			// Records do not drive the dataplane; the Service replay below reprograms them.
+			continue
+		}
 		if dnat.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo dnat %s", dnat.Name)
 			if err = c.redoDnat(dnat.Name, natGwCreatedAT, false); err != nil {
@@ -664,6 +673,9 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 			}
 		}
 	}
+	// The gateway pod was (re)created with empty nft rules: reconcile every Service bound to
+	// it so the single write path reprograms its share DNAT identities.
+	c.enqueueNftableLbServicesForNatGw(natGwKey)
 	return nil
 }
 

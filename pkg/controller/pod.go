@@ -326,7 +326,11 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 	if newPod.Spec.HostNetwork || oldPod.ResourceVersion == newPod.ResourceVersion {
 		return
 	}
-	c.enqueueNftableLbServicesForPod(newPod)
+	if nftableLbPodAddressesChanged(oldPod, newPod) {
+		// Readiness changes reach the nftable lb services through EndpointSlice events; only
+		// a NIC address change requires reprogramming the gateway from the pod side.
+		c.enqueueNftableLbServicesForPod(newPod)
+	}
 
 	podNets, err := c.getPodKubeovnNets(newPod)
 	if err != nil {

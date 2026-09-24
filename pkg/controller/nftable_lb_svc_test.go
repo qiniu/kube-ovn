@@ -2,6 +2,7 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
@@ -13,7 +14,6 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
-	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -25,16 +25,28 @@ func Test_nftableLbSvcQualifies(t *testing.T) {
 		svc      *v1.Service
 		expected bool
 	}{
-		{name: "loadbalancer with eip annotation", svc: &v1.Service{
-			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.EipAnnotation: "eip0"}},
+		{name: "loadbalancer with gateway and eip annotations", svc: &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw", util.EipAnnotation: "eip0"}},
 			Spec:       v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
 		}, expected: true},
-		{name: "loadbalancer without eip annotation", svc: &v1.Service{
-			Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
-		}, expected: false},
-		{name: "clusterip with eip annotation", svc: &v1.Service{
+		{name: "loadbalancer without gateway annotation", svc: &v1.Service{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.EipAnnotation: "eip0"}},
+			Spec:       v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		}, expected: false},
+		{name: "loadbalancer without eip annotation", svc: &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw"}},
+			Spec:       v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		}, expected: false},
+		{name: "clusterip with gateway annotation", svc: &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw"}},
 			Spec:       v1.ServiceSpec{Type: v1.ServiceTypeClusterIP},
+		}, expected: true},
+		{name: "clusterip without gateway annotation", svc: &v1.Service{
+			Spec: v1.ServiceSpec{Type: v1.ServiceTypeClusterIP},
+		}, expected: false},
+		{name: "nodeport with gateway annotation", svc: &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw"}},
+			Spec:       v1.ServiceSpec{Type: v1.ServiceTypeNodePort},
 		}, expected: false},
 	}
 	for _, tt := range tests {
@@ -54,36 +66,6 @@ func TestNftableLbEventHelpersRespectFeatureGate(t *testing.T) {
 		c.enqueueNftableLbServicesForEIP("eip0")
 		c.enqueueNftableLbServicesForNatGw("gw")
 	})
-}
-
-func TestEnqueueNftableLbSvcOwnersFromRules(t *testing.T) {
-	t.Parallel()
-
-	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-	for _, rule := range []*kubeovnv1.IptablesDnatRule{
-		{ObjectMeta: metav1.ObjectMeta{Name: "owned-a", Labels: map[string]string{util.NftableLbSvcNsLabel: "ns1", util.NftableLbSvcNameLabel: "svc1"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "owned-b", Labels: map[string]string{util.NftableLbSvcNsLabel: "ns1", util.NftableLbSvcNameLabel: "svc1"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "owned-c", Labels: map[string]string{util.NftableLbSvcNsLabel: "ns2", util.NftableLbSvcNameLabel: "svc2"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "manual"}, Spec: kubeovnv1.IptablesDnatRuleSpec{Type: kubeovnv1.DnatRuleTypeShare}},
-	} {
-		require.NoError(t, indexer.Add(rule))
-	}
-
-	c := &Controller{
-		config:                       &Configuration{EnableLb: false, EnableNftableLbSvc: true},
-		iptablesDnatRulesLister:      kubeovnlister.NewIptablesDnatRuleLister(indexer),
-		addOrUpdateNftableLbSvcQueue: newTypedRateLimitingQueue[string]("AddOrUpdateNftableLbSvc", nil),
-	}
-	t.Cleanup(c.addOrUpdateNftableLbSvcQueue.ShutDown)
-	require.NoError(t, c.enqueueNftableLbSvcOwnersFromRules())
-	require.Equal(t, 2, c.addOrUpdateNftableLbSvcQueue.Len())
-	owners := map[string]struct{}{}
-	for c.addOrUpdateNftableLbSvcQueue.Len() > 0 {
-		owner, _ := c.addOrUpdateNftableLbSvcQueue.Get()
-		owners[owner] = struct{}{}
-		c.addOrUpdateNftableLbSvcQueue.Done(owner)
-	}
-	require.Equal(t, map[string]struct{}{"ns1/svc1": {}, "ns2/svc2": {}}, owners)
 }
 
 func Test_nftableLbDnatRuleName(t *testing.T) {
@@ -157,11 +139,10 @@ func Test_firstIPv4(t *testing.T) {
 	require.Empty(t, firstIPv4(nil))
 }
 
-func Test_buildDesiredNftableLbDnatRules(t *testing.T) {
+func Test_buildNftableLbBackends(t *testing.T) {
 	t.Parallel()
 
 	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
-		Type:  v1.ServiceTypeLoadBalancer,
 		Ports: []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}, {Name: "sctp", Port: 90, Protocol: v1.ProtocolSCTP}},
 	}}
 	endpointSlices := []*discoveryv1.EndpointSlice{{
@@ -174,101 +155,105 @@ func Test_buildDesiredNftableLbDnatRules(t *testing.T) {
 		},
 	}}
 
-	desired := buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP)
-	require.Len(t, desired, 2)
-	backends := make(map[string]*kubeovnv1.IptablesDnatRule)
-	for _, rule := range desired {
-		require.Equal(t, "eip0", rule.Spec.EIP)
-		require.Equal(t, "80", rule.Spec.ExternalPort)
-		require.Equal(t, "8080", rule.Spec.InternalPort)
-		require.Equal(t, "tcp", rule.Spec.Protocol)
-		require.Equal(t, kubeovnv1.DnatRuleTypeShare, rule.Spec.Type)
-		require.Equal(t, "default", rule.Labels[util.NftableLbSvcNsLabel])
-		require.Equal(t, "web", rule.Labels[util.NftableLbSvcNameLabel])
-		backends[rule.Spec.InternalIP] = rule
-	}
-	require.Contains(t, backends, "10.0.0.1")
-	require.Contains(t, backends, "10.0.0.2")
-	require.NotContains(t, backends, "10.0.0.3")
-	require.NotContains(t, backends, "fd00::1")
+	desired := buildNftableLbBackends(svc, endpointSlices, testNftableLbBackendIP)
+	// SCTP port and not-ready/IPv6 backends are dropped
+	require.Equal(t, map[nftableLbIdentity][]string{
+		{protocol: "tcp", externalPort: "80"}: {"10.0.0.1:8080", "10.0.0.2:8080"},
+	}, desired)
 }
 
-func Test_buildDesiredNftableLbDnatRules_unnamedPort(t *testing.T) {
+func Test_buildNftableLbBackends_ports(t *testing.T) {
 	t.Parallel()
 
 	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
-		Type: v1.ServiceTypeLoadBalancer, Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP}},
+		Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP}},
 	}}
-	endpointSlices := []*discoveryv1.EndpointSlice{{
+	unnamed := []*discoveryv1.EndpointSlice{{
 		Ports:     []discoveryv1.EndpointPort{{Port: new(int32(8080))}},
 		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
 	}}
-	require.Len(t, buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP), 1)
-}
+	require.Len(t, buildNftableLbBackends(svc, unnamed, testNftableLbBackendIP), 1)
 
-func Test_buildDesiredNftableLbDnatRules_noMatchingPort(t *testing.T) {
-	t.Parallel()
-
-	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
-		Type: v1.ServiceTypeLoadBalancer, Ports: []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
-	}}
-	endpointSlices := []*discoveryv1.EndpointSlice{{
+	svc.Spec.Ports[0].Name = "http"
+	mismatched := []*discoveryv1.EndpointSlice{{
 		Ports:     []discoveryv1.EndpointPort{{Name: new("other"), Port: new(int32(8080))}},
 		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
 	}}
-	require.Empty(t, buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP))
+	require.Empty(t, buildNftableLbBackends(svc, mismatched, testNftableLbBackendIP))
 }
 
-func Test_buildDesiredNftableLbDnatRules_sessionAffinity(t *testing.T) {
+func Test_nftableLbSvcSessionAffinity(t *testing.T) {
 	t.Parallel()
 
-	endpointSlices := []*discoveryv1.EndpointSlice{{
-		Ports:     []discoveryv1.EndpointPort{{Name: new("http"), Port: new(int32(8080))}},
-		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
-	}}
-	ports := []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}}
-	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}, Spec: v1.ServiceSpec{
-		Type: v1.ServiceTypeLoadBalancer, Ports: ports, SessionAffinity: v1.ServiceAffinityClientIP,
+	svc := &v1.Service{Spec: v1.ServiceSpec{
+		SessionAffinity:       v1.ServiceAffinityClientIP,
 		SessionAffinityConfig: &v1.SessionAffinityConfig{ClientIP: &v1.ClientIPConfig{TimeoutSeconds: new(int32(600))}},
 	}}
-	desired := buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP)
-	require.Len(t, desired, 1)
-	for _, rule := range desired {
-		require.Equal(t, kubeovnv1.DnatSessionAffinityClientIP, rule.Spec.SessionAffinity)
-		require.Equal(t, int32(600), rule.Spec.SessionAffinityTimeoutSeconds)
+	affinity, timeout := nftableLbSvcSessionAffinity(svc)
+	require.Equal(t, kubeovnv1.DnatSessionAffinityClientIP, affinity)
+	require.Equal(t, int32(600), timeout)
+
+	svc.Spec.SessionAffinity, svc.Spec.SessionAffinityConfig = v1.ServiceAffinityNone, nil
+	affinity, timeout = nftableLbSvcSessionAffinity(svc)
+	require.Equal(t, kubeovnv1.DnatSessionAffinityNone, affinity)
+	require.Zero(t, timeout)
+}
+
+func Test_buildNftableLbSvcRecords(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}}
+	desired := map[nftableLbIdentity][]string{{protocol: "tcp", externalPort: "80"}: {"10.0.0.1:8080"}}
+
+	// ClusterIP scenario: no EIP, external address is the ClusterIP
+	records := buildNftableLbSvcRecords(svc, &nftableLbSvcTarget{gw: "gw1", externalIP: "10.96.0.10"}, desired)
+	require.Len(t, records, 1)
+	for _, record := range records {
+		require.Empty(t, record.Spec.EIP)
+		require.Equal(t, kubeovnv1.DnatRuleTypeShare, record.Spec.Type)
+		require.Equal(t, "10.0.0.1", record.Spec.InternalIP)
+		require.Equal(t, "8080", record.Spec.InternalPort)
+		require.Equal(t, "true", record.Labels[util.NftableLbSvcRecordLabel])
+		require.Equal(t, "default", record.Labels[util.NftableLbSvcNsLabel])
+		require.Equal(t, "web", record.Labels[util.NftableLbSvcNameLabel])
+		require.Equal(t, "10.96.0.10", record.Labels[util.EipV4IpLabel])
+		require.Equal(t, "gw1", record.Labels[util.VpcNatGatewayNameLabel])
+		require.NotContains(t, record.Labels, util.EipUIDLabel)
 	}
 
-	svc.Spec.SessionAffinity = v1.ServiceAffinityNone
-	svc.Spec.SessionAffinityConfig = nil
-	desired = buildDesiredNftableLbDnatRules(svc, "eip0", endpointSlices, testNftableLbBackendIP)
-	require.Len(t, desired, 1)
-	for _, rule := range desired {
-		require.Equal(t, kubeovnv1.DnatSessionAffinityNone, rule.Spec.SessionAffinity)
-		require.Zero(t, rule.Spec.SessionAffinityTimeoutSeconds)
+	// LoadBalancer scenario: the record claims the EIP so it stays in use
+	eip := &kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "eip0", UID: "uid0"}}
+	records = buildNftableLbSvcRecords(svc, &nftableLbSvcTarget{gw: "gw1", externalIP: "192.168.0.10", eip: eip}, desired)
+	require.Len(t, records, 1)
+	for _, record := range records {
+		require.Equal(t, "eip0", record.Spec.EIP)
+		require.Equal(t, "uid0", record.Labels[util.EipUIDLabel])
+		require.Equal(t, "eip0", record.Annotations[util.VpcEipAnnotation])
 	}
 }
 
-func Test_nftableLbSvcOwnerKey(t *testing.T) {
+func Test_isNftableLbSvcRecord(t *testing.T) {
 	t.Parallel()
 
-	owned := &kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-		util.NftableLbSvcNsLabel: "default", util.NftableLbSvcNameLabel: "web",
-	}}}
-	require.Equal(t, "default/web", nftableLbSvcOwnerKey(owned))
-	for _, labels := range []map[string]string{
-		{util.NftableLbSvcNsLabel: "default"}, {util.NftableLbSvcNameLabel: "web"},
-	} {
-		require.Empty(t, nftableLbSvcOwnerKey(&kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{Labels: labels}}))
-	}
-	require.Empty(t, nftableLbSvcOwnerKey(&kubeovnv1.IptablesDnatRule{}))
+	require.True(t, isNftableLbSvcRecord(&kubeovnv1.IptablesDnatRule{ObjectMeta: metav1.ObjectMeta{
+		Labels: map[string]string{util.NftableLbSvcRecordLabel: "true"},
+	}}))
+	require.False(t, isNftableLbSvcRecord(&kubeovnv1.IptablesDnatRule{}))
 }
 
-func Test_nftableLbDnatIdentity(t *testing.T) {
+func TestCleanupNftableLbServiceSkipsUnclaimedService(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "eip0/80/tcp", nftableLbDnatIdentity("eip0", "80", "TCP"))
-	require.Equal(t, nftableLbDnatIdentity("eip0", "80", "tcp"), nftableLbDnatIdentity("eip0", "80", "TCP"))
-	require.NotEqual(t, nftableLbDnatIdentity("eip0", "80", "tcp"), nftableLbDnatIdentity("eip0", "443", "tcp"))
+	// A LoadBalancer handled by another provider must keep its ingress IP: cleanup returns
+	// before touching status when this mode never claimed it (no finalizer).
+	c := &Controller{}
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "other-provider"},
+		Spec:       v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		Status:     v1.ServiceStatus{LoadBalancer: v1.LoadBalancerStatus{Ingress: []v1.LoadBalancerIngress{{IP: "1.2.3.4"}}}},
+	}
+	require.NoError(t, c.cleanupNftableLbService(svc))
+	require.Equal(t, "1.2.3.4", svc.Status.LoadBalancer.Ingress[0].IP)
 }
 
 func Test_nftableLbSvcIdentities(t *testing.T) {
@@ -277,12 +262,26 @@ func Test_nftableLbSvcIdentities(t *testing.T) {
 	svc := &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{
 		{Port: 80, Protocol: v1.ProtocolTCP}, {Port: 53, Protocol: v1.ProtocolUDP}, {Port: 90, Protocol: v1.ProtocolSCTP},
 	}}}
-	require.ElementsMatch(t, []string{"eip0/80/tcp", "eip0/53/udp"}, nftableLbSvcIdentities(svc, "eip0"))
+	require.ElementsMatch(t, []nftableLbIdentity{
+		{protocol: "tcp", externalPort: "80"}, {protocol: "udp", externalPort: "53"},
+	}, nftableLbSvcIdentities(svc))
 }
 
-func TestResolveNftableLbConflictsWithNoReadyBackends(t *testing.T) {
+func TestDropNftableLbConflictingIdentities(t *testing.T) {
 	t.Parallel()
 
+	newSvc := func(name string, ports ...int32) *v1.Service {
+		svc := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name, Annotations: map[string]string{
+				util.VpcNatGatewayAnnotation: "gw1", util.EipAnnotation: "eip0",
+			}},
+			Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer},
+		}
+		for _, port := range ports {
+			svc.Spec.Ports = append(svc.Spec.Ports, v1.ServicePort{Port: port, Protocol: v1.ProtocolTCP})
+		}
+		return svc
+	}
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{IndexServiceByNftableLbEip: func(obj any) ([]string, error) {
 		svc, ok := obj.(*v1.Service)
 		if !ok || svc.Annotations[util.EipAnnotation] == "" {
@@ -290,47 +289,84 @@ func TestResolveNftableLbConflictsWithNoReadyBackends(t *testing.T) {
 		}
 		return []string{svc.Annotations[util.EipAnnotation]}, nil
 	}})
-	newService := func(namespace, name string) *v1.Service {
-		return &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Annotations: map[string]string{util.EipAnnotation: "eip0"}}, Spec: v1.ServiceSpec{
-			Type: v1.ServiceTypeLoadBalancer, Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP}},
-		}}
-	}
-	require.NoError(t, indexer.Add(newService("ns", "a-winner")))
-	loser := newService("ns", "z-loser")
-	require.NoError(t, indexer.Add(loser))
+	require.NoError(t, indexer.Add(newSvc("a-first", 80)))
+	svc := newSvc("b-second", 80, 443)
+	require.NoError(t, indexer.Add(svc))
 
-	ruleIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	queue := newTypedRateLimitingQueue[string]("nftable-lb-conflict-test", nil)
 	t.Cleanup(queue.ShutDown)
-	controller := &Controller{
-		svcIndexer: indexer, iptablesDnatRulesLister: kubeovnlister.NewIptablesDnatRuleLister(ruleIndexer),
-		recorder: record.NewFakeRecorder(1), addOrUpdateNftableLbSvcQueue: queue,
+	c := &Controller{svcIndexer: indexer, recorder: record.NewFakeRecorder(10), addOrUpdateNftableLbSvcQueue: queue}
+	target := &nftableLbSvcTarget{
+		gw: "gw1", externalIP: "192.168.0.10",
+		eip: &kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "eip0"}},
 	}
-	conflicted, err := controller.resolveNftableLbConflicts(loser, "ns/z-loser", map[string]*kubeovnv1.IptablesDnatRule{})
-	require.NoError(t, err)
-	require.True(t, conflicted)
+	desired := map[nftableLbIdentity][]string{
+		{protocol: "tcp", externalPort: "80"}:  {"10.0.0.1:8080"},
+		{protocol: "tcp", externalPort: "443"}: {"10.0.0.1:8443"},
+	}
+	require.NoError(t, c.dropNftableLbConflictingIdentities(svc, target, desired))
+	// port 80 is owned by the smaller service key, port 443 stays with this service
+	require.Equal(t, map[nftableLbIdentity][]string{
+		{protocol: "tcp", externalPort: "443"}: {"10.0.0.1:8443"},
+	}, desired)
+
+	// the winner keeps everything it declares
+	winner := newSvc("a-first", 80)
+	desired = map[nftableLbIdentity][]string{{protocol: "tcp", externalPort: "80"}: {"10.0.0.2:8080"}}
+	require.NoError(t, c.dropNftableLbConflictingIdentities(winner, target, desired))
+	require.Len(t, desired, 1)
+
+	// ClusterIP scenario: no EIP, nothing is contested
+	desired = map[nftableLbIdentity][]string{{protocol: "tcp", externalPort: "80"}: {"10.0.0.1:8080"}}
+	require.NoError(t, c.dropNftableLbConflictingIdentities(svc, &nftableLbSvcTarget{gw: "gw1", externalIP: "10.96.0.10"}, desired))
+	require.Len(t, desired, 1)
 }
 
-func Test_nftableLbDnatSpecEqual(t *testing.T) {
+func Test_nftableLbPodAddressesChanged(t *testing.T) {
 	t.Parallel()
 
-	base := kubeovnv1.IptablesDnatRuleSpec{EIP: "eip0", ExternalPort: "80", Protocol: "tcp", InternalIP: "10.0.0.1", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare}
-	same := base
-	require.True(t, nftableLbDnatSpecEqual(&base, &same))
-	affinity := base
-	affinity.SessionAffinity = kubeovnv1.DnatSessionAffinityClientIP
-	affinity.SessionAffinityTimeoutSeconds = 600
-	require.False(t, nftableLbDnatSpecEqual(&base, &affinity))
-	eip := base
-	eip.EIP = "eip1"
-	require.False(t, nftableLbDnatSpecEqual(&base, &eip))
+	pod := func(annotations map[string]string) *v1.Pod {
+		return &v1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: annotations}}
+	}
+	base := map[string]string{"ovn.kubernetes.io/ip_address": "10.16.0.5", "ovn.kubernetes.io/allocated": "true"}
+	// unrelated churn (status, other annotations) must not trigger reprogramming
+	require.False(t, nftableLbPodAddressesChanged(pod(base), pod(map[string]string{
+		"ovn.kubernetes.io/ip_address": "10.16.0.5", "ovn.kubernetes.io/allocated": "false",
+	})))
+	require.True(t, nftableLbPodAddressesChanged(pod(base), pod(map[string]string{"ovn.kubernetes.io/ip_address": "10.16.0.6"})))
+	// an attached NIC appearing or disappearing counts too
+	require.True(t, nftableLbPodAddressesChanged(pod(base), pod(map[string]string{
+		"ovn.kubernetes.io/ip_address": "10.16.0.5", "net1.kubernetes.io/ip_address": "192.168.0.5",
+	})))
+	require.False(t, nftableLbPodAddressesChanged(pod(nil), pod(nil)))
 }
 
-func Test_chooseNftableLbOwner(t *testing.T) {
+func Test_nftableLbSvcChanged(t *testing.T) {
 	t.Parallel()
 
-	require.Empty(t, chooseNftableLbOwner(map[string]struct{}{"": {}, "ns/a": {}, "ns/b": {}}))
-	require.Equal(t, "ns/a", chooseNftableLbOwner(map[string]struct{}{"ns/a": {}, "ns/b": {}}))
-	require.Equal(t, "ns/a", chooseNftableLbOwner(map[string]struct{}{"ns/b": {}, "ns/a": {}}))
-	require.Equal(t, "ns/only", chooseNftableLbOwner(map[string]struct{}{"ns/only": {}}))
+	base := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw1"}},
+		Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeClusterIP, ClusterIPs: []string{"10.96.0.10"},
+			Ports: []v1.ServicePort{{Port: 80, Protocol: v1.ProtocolTCP}},
+		},
+	}
+	// our own status write must not trigger another reconcile
+	statusOnly := base.DeepCopy()
+	statusOnly.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "192.168.0.10"}}
+	require.False(t, nftableLbSvcChanged(base, statusOnly))
+
+	for _, mutate := range []func(*v1.Service){
+		func(s *v1.Service) { s.Annotations[util.VpcNatGatewayAnnotation] = "gw2" },
+		func(s *v1.Service) { s.Annotations[util.EipAnnotation] = "eip0" },
+		func(s *v1.Service) { s.Spec.Type = v1.ServiceTypeLoadBalancer },
+		func(s *v1.Service) { s.Spec.Ports[0].Port = 8080 },
+		func(s *v1.Service) { s.Spec.SessionAffinity = v1.ServiceAffinityClientIP },
+		func(s *v1.Service) { s.Finalizers = []string{util.NftableLbSvcFinalizer} },
+		func(s *v1.Service) { s.DeletionTimestamp = &metav1.Time{Time: time.Now()} },
+	} {
+		changed := base.DeepCopy()
+		mutate(changed)
+		require.True(t, nftableLbSvcChanged(base, changed))
+	}
 }
