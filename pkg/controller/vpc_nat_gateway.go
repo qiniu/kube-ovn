@@ -1620,7 +1620,7 @@ func (c *Controller) initVpcNatGw() error {
 
 		if isNatGateway, natGateway := c.checkIsPodVpcNatGw(pod); isNatGateway {
 			if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; hasInit {
-				return nil
+				continue
 			}
 			c.initVpcNatGatewayQueue.Add(natGateway)
 		}
