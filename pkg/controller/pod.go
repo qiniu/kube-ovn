@@ -547,6 +547,18 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 	isVpcNatGw, vpcGwName := c.checkIsPodVpcNatGw(pod)
 	if isVpcNatGw {
 		c.enqueueAddOrUpdateVpcNatGwByName(vpcGwName, "natgw-pod-update")
+		// A gateway pod that already owns its addresses keeps this fast path, so it never reaches
+		// reconcileAllocateSubnets, the only other place that queues the init. Queue it here as well
+		// for a running pod that has not been initialized yet: a terminating pod only keeps its
+		// annotation until its replacement raises its own event, and a pod that is not running yet
+		// would only make the init handler sleep and fail - its transition to Running re-enters this
+		// handler.
+		if c.initVpcNatGatewayQueue != nil && pod.DeletionTimestamp.IsZero() && pod.Status.Phase == v1.PodRunning {
+			if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; !hasInit {
+				klog.Infof("init vpc nat gateway pod %s/%s with name %s", pod.Namespace, pod.Name, vpcGwName)
+				c.initVpcNatGatewayQueue.Add(vpcGwName)
+			}
+		}
 		if needRestartNatGatewayPod(pod) {
 			klog.Infof("restarting vpc nat gateway %s", vpcGwName)
 			c.addOrUpdateVpcNatGatewayQueue.Add(vpcGwName)

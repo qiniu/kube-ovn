@@ -110,6 +110,14 @@ func (c *Controller) resyncVpcNatGwConfig() {
 	for _, gw := range gws {
 		c.addOrUpdateVpcNatGatewayQueue.Add(gw.Name)
 	}
+	// The init scan only queues gateways that still need initialization, and it requires
+	// vpcNatEnabled to be set. Drive it from this enable transition instead of initResourceOnce:
+	// that call raced with this resync goroutine and silently skipped every gateway whenever it
+	// ran before the flag was flipped, leaving NAT gateway pods uninitialized until an unrelated
+	// pod event re-queued them.
+	if err := c.initVpcNatGw(); err != nil {
+		klog.Errorf("failed to initialize vpc nat gateways, %v", err)
+	}
 	klog.Info("finish establishing vpc-nat-gateway")
 }
 
@@ -1607,6 +1615,8 @@ func (c *Controller) initVpcNatGw() error {
 	}
 
 	if vpcNatEnabled != "true" {
+		// Defensive guard only: resyncVpcNatGwConfig sets vpcNatEnabled before calling this, so the
+		// scan no longer depends on the timing of the enable transition.
 		err := errors.New("iptables nat gw not enable")
 		klog.Warning(err)
 		return nil

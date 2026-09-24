@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
@@ -1884,4 +1885,85 @@ func TestHandleDeletePodVMPortGroups(t *testing.T) {
 
 		assert.Equal(t, "node-a", ip.Spec.NodeName, "with no live pod the record is left alone")
 	})
+}
+
+// newNatGwInitQueue wires the init queue the NAT gateway pod handlers enqueue into.
+func newNatGwInitQueue(t *testing.T, c *Controller) workqueue.TypedRateLimitingInterface[string] {
+	t.Helper()
+	queue := newTypedRateLimitingQueue[string]("InitVpcNatGateway", nil)
+	t.Cleanup(queue.ShutDown)
+	c.initVpcNatGatewayQueue = queue
+	return queue
+}
+
+func requireQueueItem(t *testing.T, queue workqueue.TypedRateLimitingInterface[string], want string) {
+	t.Helper()
+	require.Equal(t, 1, queue.Len())
+	item, shutdown := queue.Get()
+	require.False(t, shutdown)
+	queue.Done(item)
+	require.Equal(t, want, item)
+}
+
+// TestHandleAddOrUpdatePodQueuesNatGwInit covers the fast resync path: a NAT gateway pod that
+// already owns its addresses never reaches reconcileAllocateSubnets, so the add/update handler
+// itself must queue the missing initialization, and only for a pod that still needs it.
+func TestHandleAddOrUpdatePodQueuesNatGwInit(t *testing.T) {
+	subnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ovn-subnet"},
+		Spec: kubeovnv1.SubnetSpec{
+			CIDRBlock: "10.0.1.0/24",
+			Protocol:  kubeovnv1.ProtocolIPv4,
+			Provider:  util.OvnProvider,
+		},
+		Status: kubeovnv1.SubnetStatus{V4AvailableIPs: 100, TunnelKey: 1234},
+	}
+
+	tests := []struct {
+		name        string
+		phase       corev1.PodPhase
+		initialized bool
+		terminating bool
+		want        int
+	}{
+		{name: "running pod without the init annotation is queued", phase: corev1.PodRunning, want: 1},
+		{name: "initialized pod is skipped", phase: corev1.PodRunning, initialized: true},
+		{name: "pod that is not running yet is skipped", phase: corev1.PodPending},
+		{name: "terminating pod is skipped", phase: corev1.PodRunning, terminating: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := fakeNatGwPod("gw", tt.initialized)
+			pod.Namespace = "default"
+			pod.Spec.NodeName = "node-1"
+			pod.Status.Phase = tt.phase
+			if tt.terminating {
+				now := metav1.Now()
+				pod.DeletionTimestamp = &now
+			}
+			pod.Annotations[util.LogicalSwitchAnnotation] = subnet.Name
+			pod.Annotations[util.AllocatedAnnotation] = "true"
+			pod.Annotations[util.IPAddressAnnotation] = "10.0.1.10"
+			pod.Annotations[util.MacAddressAnnotation] = "00:00:00:00:00:10"
+			pod.Annotations[util.RoutedAnnotation] = "true"
+
+			fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+				Namespaces: []*corev1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+				Subnets:    []*kubeovnv1.Subnet{subnet},
+				Pods:       []*corev1.Pod{pod},
+			})
+			require.NoError(t, err)
+			c := fc.fakeController
+			queue := newNatGwInitQueue(t, c)
+			fc.mockOvnClient.EXPECT().ListNormalLogicalSwitchPorts(gomock.Any(), gomock.Any()).Return(nil, nil)
+
+			require.NoError(t, c.handleAddOrUpdatePod("default/"+pod.Name))
+			if tt.want == 0 {
+				require.Zero(t, queue.Len())
+				return
+			}
+			requireQueueItem(t, queue, "gw")
+		})
+	}
 }
