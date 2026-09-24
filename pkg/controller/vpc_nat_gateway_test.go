@@ -7,11 +7,29 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
+
+type orderedVpcNatGatewayLister struct {
+	gateways []*kubeovnv1.VpcNatGateway
+}
+
+func (l orderedVpcNatGatewayLister) List(labels.Selector) ([]*kubeovnv1.VpcNatGateway, error) {
+	return l.gateways, nil
+}
+
+func (l orderedVpcNatGatewayLister) Get(name string) (*kubeovnv1.VpcNatGateway, error) {
+	for _, gateway := range l.gateways {
+		if gateway.Name == name {
+			return gateway, nil
+		}
+	}
+	return nil, nil
+}
 
 func TestVpcNatGwScriptConstants(t *testing.T) {
 	// Verify the constants are set correctly for backward compatibility
@@ -117,6 +135,61 @@ func TestHandleInitVpcNatGwSkipsTerminating(t *testing.T) {
 	require.NoError(t, err)
 	// Without the guard this reaches getNatGwPod and fails on the already gone pod.
 	require.NoError(t, fc.fakeController.handleInitVpcNatGw("dying-gw"))
+}
+
+func TestInitVpcNatGwContinuesAfterInitializedGateway(t *testing.T) {
+	old := vpcNatEnabled
+	vpcNatEnabled = "true"
+	t.Cleanup(func() { vpcNatEnabled = old })
+
+	initializedGw := fakeGw("initialized-gw")
+	pendingGw := fakeGw("pending-gw")
+	pods := []*corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      util.GenNatGwName(initializedGw.Name) + "-0",
+				Namespace: "kube-system",
+				Labels: map[string]string{
+					"app":                   util.GenNatGwName(initializedGw.Name),
+					util.VpcNatGatewayLabel: "true",
+				},
+				Annotations: map[string]string{
+					util.VpcNatGatewayAnnotation:     initializedGw.Name,
+					util.VpcNatGatewayInitAnnotation: "true",
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      util.GenNatGwName(pendingGw.Name) + "-0",
+				Namespace: "kube-system",
+				Labels: map[string]string{
+					"app":                   util.GenNatGwName(pendingGw.Name),
+					util.VpcNatGatewayLabel: "true",
+				},
+				Annotations: map[string]string{
+					util.VpcNatGatewayAnnotation: pendingGw.Name,
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Pods: pods})
+	require.NoError(t, err)
+	fc.fakeController.vpcNatGatewayLister = orderedVpcNatGatewayLister{
+		gateways: []*kubeovnv1.VpcNatGateway{initializedGw, pendingGw},
+	}
+	queue := newTypedRateLimitingQueue[string]("InitVpcNatGateway", nil)
+	t.Cleanup(queue.ShutDown)
+	fc.fakeController.initVpcNatGatewayQueue = queue
+
+	require.NoError(t, fc.fakeController.initVpcNatGw())
+	require.Equal(t, 1, queue.Len())
+	item, shutdown := queue.Get()
+	require.False(t, shutdown)
+	queue.Done(item)
+	require.Equal(t, pendingGw.Name, item)
 }
 
 func TestExecNatGwQoSWaitsForQoSPolicyStatus(t *testing.T) {

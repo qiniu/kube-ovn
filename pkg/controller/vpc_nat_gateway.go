@@ -323,9 +323,12 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	}
 
 	// Handle StatefulSet update if needed
-	// WARNING: This will update STS template directly, which triggers NAT GW Pod recreation.
+	// WARNING: Updating the StatefulSet Pod template triggers NAT GW Pod recreation.
 	// TODO: support hot update of runtime Pod annotations directly via patch
 	if gwChanged || needRestartRecovery {
+		podTemplateChanged := !reflect.DeepEqual(oldSts.Spec.Template, newSts.Spec.Template)
+		klog.Warningf("updating NAT gateway StatefulSet %s/%s: gateway spec changed=%t, restart recovery=%t, container restart count=%d, pod template changed=%t; a changed pod template triggers Pod recreation",
+			newSts.Namespace, newSts.Name, gwChanged, needRestartRecovery, natGwPodContainerRestartCount, podTemplateChanged)
 		if _, err := c.config.KubeClient.AppsV1().StatefulSets(c.natGwNamespace(gw)).
 			Update(context.Background(), newSts, metav1.UpdateOptions{}); err != nil {
 			err := fmt.Errorf("failed to update statefulset '%s', err: %w", newSts.Name, err)
@@ -1620,7 +1623,7 @@ func (c *Controller) initVpcNatGw() error {
 
 		if isNatGateway, natGateway := c.checkIsPodVpcNatGw(pod); isNatGateway {
 			if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; hasInit {
-				return nil
+				continue
 			}
 			c.initVpcNatGatewayQueue.Add(natGateway)
 		}
