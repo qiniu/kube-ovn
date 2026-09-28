@@ -24,7 +24,7 @@ LS_CT_SKIP_DST_LPORT_IPS=${LS_CT_SKIP_DST_LPORT_IPS:-true}
 ENABLE_EXTERNAL_VPC=${ENABLE_EXTERNAL_VPC:-false}
 CNI_CONFIG_PRIORITY=${CNI_CONFIG_PRIORITY:-01}
 ENABLE_LB_SVC=${ENABLE_LB_SVC:-false}
-ENABLE_NFTABLE_LB_SVC=${ENABLE_NFTABLE_LB_SVC:-true}
+ENABLE_GW_NFTABLE_LB_SVC=${ENABLE_GW_NFTABLE_LB_SVC:-false}
 ENABLE_BGP_LB_VIP=${ENABLE_BGP_LB_VIP:-false}
 ENABLE_NAT_GW=${ENABLE_NAT_GW:-true}
 ENABLE_KEEP_VM_IP=${ENABLE_KEEP_VM_IP:-true}
@@ -204,7 +204,7 @@ echo "Default Subnet CIDR:  $POD_CIDR"
 echo "Join Subnet CIDR:     $JOIN_CIDR"
 echo "Enable LB:            $ENABLE_LB"
 echo "Enable LB SVC:        $ENABLE_LB_SVC"
-echo "Enable NFT LB SVC:    $ENABLE_NFTABLE_LB_SVC"
+echo "Enable GW NFT LB SVC: $ENABLE_GW_NFTABLE_LB_SVC"
 echo "Enable BGP LB VIP:    $ENABLE_BGP_LB_VIP"
 echo "Enable Networkpolicy: $ENABLE_NP"
 echo "Enable EIP and SNAT:  $ENABLE_EIP_SNAT"
@@ -2020,9 +2020,12 @@ spec:
             spec:
               type: object
               properties:
+                clusterIP:
+                  type: string
+                  description: Kubernetes Service ClusterIP served by this rule for traffic from within the VPC.
                 eip:
                   type: string
-                  description: EIP name for DNAT rule
+                  description: Name of the EIP used as the rule's external address. Optional when ClusterIP is set.
                 externalPort:
                   type: string
                   description: External port number
@@ -5399,7 +5402,7 @@ spec:
           - --ls-dnat-mod-dl-dst=$LS_DNAT_MOD_DL_DST
           - --ls-ct-skip-dst-lport-ips=$LS_CT_SKIP_DST_LPORT_IPS
           - --pod-nic-type=$POD_NIC_TYPE
-          - --enable-lb=$ENABLE_LB
+          - --enable-lb=$(if [ "$ENABLE_GW_NFTABLE_LB_SVC" = true ]; then echo false; else echo "$ENABLE_LB"; fi)
           - --enable-np=$ENABLE_NP
           - --np-enforcement=$NP_ENFORCEMENT
           - --enable-eip-snat=$ENABLE_EIP_SNAT
@@ -5411,7 +5414,7 @@ spec:
           - --log_file=/var/log/kube-ovn/kube-ovn-controller.log
           - --log_file_max_size=200
           - --enable-lb-svc=$ENABLE_LB_SVC
-          - --enable-nftable-lb-svc=$ENABLE_NFTABLE_LB_SVC
+          - --enable-gw-nftable-lb-svc=$ENABLE_GW_NFTABLE_LB_SVC
           - --enable-bgp-lb-vip=$ENABLE_BGP_LB_VIP
           - --keep-vm-ip=$ENABLE_KEEP_VM_IP
           - --enable-metrics=$ENABLE_METRICS
