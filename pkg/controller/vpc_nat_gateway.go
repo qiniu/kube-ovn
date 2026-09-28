@@ -912,16 +912,9 @@ func (c *Controller) execNatGwRulesInPods(pods []*corev1.Pod, operation string, 
 	return errors.Join(errs...)
 }
 
-// TODO: Refactor to avoid shell command injection vulnerability.
-// Current implementation uses "bash -c" with string concatenation, which could be exploited
-// if any element in the rules slice contains shell metacharacters.
-// Recommended fix: Pass arguments directly as a slice instead of joining them into a shell command:
-//
-//	args := append([]string{"/kube-ovn/nat-gateway.sh", operation}, rules...)
-//	util.ExecuteCommandInContainer(..., args...)
-//
-// This requires updating nat-gateway.sh to accept arguments via $@ instead of parsing a single string.
-// Current risk is mitigated by CIDR format validation on all data sources reaching this function.
+// The rules are passed to the gateway script as argv, never interpolated into a shell command:
+// their values come from Services, EndpointSlices and CRs, and the script validates every field
+// itself, but argv keeps a payload from ever reaching a shell parser in the first place.
 func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []string) error {
 	lockKey := fmt.Sprintf("nat-gw-exec:%s/%s", pod.Namespace, pod.Name)
 
@@ -930,9 +923,10 @@ func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []s
 		_ = c.vpcNatGwExecKeyMutex.UnlockKey(lockKey)
 	}()
 
-	cmd := fmt.Sprintf("bash %s %s %s", vpcNatGwScriptPath, operation, strings.Join(rules, " "))
-	klog.V(3).Infof("executing NAT gateway command: %s", cmd)
-	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, vpcNatGwContainerName, []string{"/bin/bash", "-c", cmd}...)
+	args := append([]string{vpcNatGwScriptPath, operation}, rules...)
+	klog.V(3).Infof("executing NAT gateway command: bash %s", strings.Join(args, " "))
+	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, vpcNatGwContainerName,
+		append([]string{"bash"}, args...)...)
 	if err != nil {
 		if len(errOutput) > 0 {
 			klog.Errorf("NAT gateway command failed - stderr: %v", errOutput)

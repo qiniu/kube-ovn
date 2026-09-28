@@ -340,32 +340,51 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 
 	programs := buildNftableLbPrograms(desired, eipIP)
 	wanted := make(map[string]struct{}, len(programs))
+	addRules := make([]string, 0, len(programs))
+	hairpinAddRules := make([]string, 0, len(programs))
 	for _, program := range programs {
 		wanted[program.identity.vip+"/"+program.identity.externalPort+"/"+program.identity.protocol] = struct{}{}
-	}
-	for _, program := range programs {
 		identity := program.identity
-		if err = c.createNftDnatMapInPods(pods, identity.protocol, identity.vip, identity.externalPort,
-			identity.backends, identity.affinity, identity.affinityTimeout); err != nil {
-			return fmt.Errorf("failed to program share dnat identity %s:%s/%s for service %s/%s: %w",
-				identity.vip, identity.externalPort, identity.protocol, svc.Namespace, svc.Name, err)
+		rule, ruleErr := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
+			identity.backends, identity.affinity, identity.affinityTimeout)
+		if ruleErr != nil {
+			return fmt.Errorf("failed to build share dnat identity %s:%s/%s for service %s/%s: %w",
+				identity.vip, identity.externalPort, identity.protocol, svc.Namespace, svc.Name, ruleErr)
 		}
-		if err = c.execNatGwRulesInPods(pods, natGwVipHairpinAdd, []string{program.hairpinRule}); err != nil {
-			return fmt.Errorf("failed to program hairpin for service %s/%s identity %s:%s/%s: %w",
-				svc.Namespace, svc.Name, identity.vip, identity.externalPort, identity.protocol, err)
+		addRules = append(addRules, rule)
+		hairpinAddRules = append(hairpinAddRules, program.hairpinRule)
+	}
+
+	// One exec per Pod for the whole Service: the gateway script accepts several rules per
+	// invocation, so a multi-port Service no longer costs one pod-exec per identity and field.
+	if len(addRules) != 0 {
+		if err = c.execNatGwRulesInPods(pods, natGwNftDnatMapAdd, addRules); err != nil {
+			return fmt.Errorf("failed to program share dnat identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
+		}
+	}
+	if len(hairpinAddRules) != 0 {
+		if err = c.execNatGwRulesInPods(pods, natGwVipHairpinAdd, hairpinAddRules); err != nil {
+			return fmt.Errorf("failed to program hairpins of service %s/%s: %w", svc.Namespace, svc.Name, err)
 		}
 	}
 
+	delRules := make([]string, 0, len(existing))
+	hairpinDelRules := make([]string, 0, len(existing))
 	for key, identity := range nftableLbExistingIdentities(existing) {
 		if _, ok := wanted[key]; ok {
 			continue
 		}
-		if err = c.deleteNftDnatMapInPods(pods, identity.protocol, identity.vip, identity.externalPort); err != nil {
-			return fmt.Errorf("failed to remove stale identity %s of service %s/%s: %w", key, svc.Namespace, svc.Name, err)
+		delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
+		hairpinDelRules = append(hairpinDelRules, fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol))
+	}
+	if len(delRules) != 0 {
+		if err = c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
+			return fmt.Errorf("failed to remove stale identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
 		}
-		if err = c.execNatGwRulesInPods(pods, natGwVipHairpinDel,
-			[]string{fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol)}); err != nil {
-			return fmt.Errorf("failed to remove stale hairpin %s of service %s/%s: %w", key, svc.Namespace, svc.Name, err)
+	}
+	if len(hairpinDelRules) != 0 {
+		if err = c.execNatGwRulesInPods(pods, natGwVipHairpinDel, hairpinDelRules); err != nil {
+			return fmt.Errorf("failed to remove stale hairpins of service %s/%s: %w", svc.Namespace, svc.Name, err)
 		}
 	}
 
@@ -505,8 +524,10 @@ func (c *Controller) ensureServiceControllerFinalizer(svc *v1.Service) (bool, er
 	}
 	updated := svc.DeepCopy()
 	updated.Finalizers = append(updated.Finalizers, util.KubeOVNControllerFinalizer)
-	_, err := c.config.KubeClient.CoreV1().Services(svc.Namespace).Update(context.Background(), updated, metav1.UpdateOptions{})
-	return err == nil, err
+	if _, err := c.config.KubeClient.CoreV1().Services(svc.Namespace).Update(context.Background(), updated, metav1.UpdateOptions{}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // nftableLbSvcClusterIP returns the IPv4 ClusterIP that the gateway programs as a second share
@@ -607,13 +628,20 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 		if err != nil {
 			return err
 		}
-		for key, identity := range nftableLbExistingIdentities(ledger) {
-			if err = c.deleteNftDnatMapInPods(pods, identity.protocol, identity.vip, identity.externalPort); err != nil {
-				return fmt.Errorf("failed to remove identity %s of service %s/%s: %w", key, namespace, name, err)
+		delRules := make([]string, 0, len(ledger))
+		hairpinDelRules := make([]string, 0, len(ledger))
+		for _, identity := range nftableLbExistingIdentities(ledger) {
+			delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
+			hairpinDelRules = append(hairpinDelRules, fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol))
+		}
+		if len(delRules) != 0 {
+			if err = c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
+				return fmt.Errorf("failed to remove identities of service %s/%s: %w", namespace, name, err)
 			}
-			if err = c.execNatGwRulesInPods(pods, natGwVipHairpinDel,
-				[]string{fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol)}); err != nil {
-				return fmt.Errorf("failed to remove hairpin %s of service %s/%s: %w", key, namespace, name, err)
+		}
+		if len(hairpinDelRules) != 0 {
+			if err = c.execNatGwRulesInPods(pods, natGwVipHairpinDel, hairpinDelRules); err != nil {
+				return fmt.Errorf("failed to remove hairpins of service %s/%s: %w", namespace, name, err)
 			}
 		}
 		owner := namespace + "/" + name

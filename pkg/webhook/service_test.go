@@ -35,7 +35,7 @@ func TestServiceUpdateHook(t *testing.T) {
 	require.NoError(t, v1.AddToScheme(scheme))
 	hook := &ValidatingHook{decoder: admission.NewDecoder(scheme)}
 
-	service := func(gateway, eip string) *v1.Service {
+	service := func(serviceType v1.ServiceType, gateway, eip string) *v1.Service {
 		return &v1.Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: "default",
@@ -45,26 +45,40 @@ func TestServiceUpdateHook(t *testing.T) {
 					util.EipAnnotation:           eip,
 				},
 			},
+			Spec: v1.ServiceSpec{Type: serviceType},
 		}
+	}
+	loadBalancer := func(gateway, eip string) *v1.Service {
+		return service(v1.ServiceTypeLoadBalancer, gateway, eip)
+	}
+	clusterIP := func(gateway, eip string) *v1.Service {
+		return service(v1.ServiceTypeClusterIP, gateway, eip)
 	}
 
 	t.Run("allows initial binding", func(t *testing.T) {
-		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, service("", ""), service("gw-a", "eip-a")))
+		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, clusterIP("", ""), clusterIP("gw-a", "eip-a")))
 		require.True(t, resp.Allowed)
 	})
 
 	t.Run("rejects changing or removing gateway", func(t *testing.T) {
-		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, service("gw-a", "eip-a"), service("gw-b", "eip-a")))
+		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, loadBalancer("gw-a", "eip-a"), loadBalancer("gw-b", "eip-a")))
 		require.False(t, resp.Allowed)
 		require.Contains(t, resp.Result.Message, "vpc nat gateway cannot change")
-		resp = hook.ServiceUpdateHook(context.Background(), updateRequest(t, service("gw-a", "eip-a"), service("", "")))
+		resp = hook.ServiceUpdateHook(context.Background(), updateRequest(t, loadBalancer("gw-a", "eip-a"), loadBalancer("", "")))
 		require.False(t, resp.Allowed)
 		require.Contains(t, resp.Result.Message, "vpc nat gateway cannot change")
 	})
 
-	t.Run("rejects changing eip", func(t *testing.T) {
-		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, service("gw-a", "eip-a"), service("gw-a", "eip-b")))
+	t.Run("rejects changing the eip of a LoadBalancer service", func(t *testing.T) {
+		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, loadBalancer("gw-a", "eip-a"), loadBalancer("gw-a", "eip-b")))
 		require.False(t, resp.Allowed)
 		require.Contains(t, resp.Result.Message, "eip cannot change")
+	})
+
+	// A ClusterIP Service never reads the eip annotation, so editing it must not force a
+	// delete/recreate of the Service.
+	t.Run("allows changing the eip annotation of a ClusterIP service", func(t *testing.T) {
+		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, clusterIP("gw-a", "eip-a"), clusterIP("gw-a", "eip-b")))
+		require.True(t, resp.Allowed)
 	})
 }

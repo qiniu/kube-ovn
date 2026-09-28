@@ -195,10 +195,10 @@ features:
   # -- Enable hardware offloads
   # @section -- Opt-in/out Features
   enableHardwareOffload: false
-  # -- Enable Kube-OVN loadbalancer services. Mutually exclusive with enableLoadbalancer and enableGwNftableLoadbalancerService.
+  # -- Enable Kube-OVN loadbalancer services. Requires enableLoadbalancer (only a warning is logged otherwise), and it cannot work when enableGwNftableLoadbalancerService turns --enable-lb off.
   # @section -- Opt-in/out Features
   enableLoadbalancerService: false
-  # -- Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancer and enableLoadbalancerService.
+  # -- Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. It starts the controller with --enable-lb=false, so it cannot be combined with enableLoadbalancer and leaves enableLoadbalancerService without its prerequisite.
   # @section -- Opt-in/out Features
   enableGwNftableLoadbalancerService: false
   # -- Enable BGP LB VIP: use a bgp_lb_vip CRD as the IP source for LoadBalancer Services

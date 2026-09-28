@@ -67,12 +67,15 @@ const (
 	natGwNftDnatMapDel = "nft-dnat-map-del"
 )
 
-// createNftDnatMapInPods atomically creates or updates one share DNAT identity on the
-// gateway instances already resolved by the Service controller.
-func (c *Controller) createNftDnatMapInPods(gwPods []*corev1.Pod, protocol, v4ip, externalPort string, backends []string, sessionAffinity string, affinityTimeoutSeconds int32) error {
+// nftDnatMapAddRule encodes one share DNAT identity for the gateway script:
+// "<vip>,<port>,<protocol>,<affinity>,<timeout>,<backend>[@<backend>...]".
+//
+// The gateway script accepts several rules per invocation, so callers that program a whole
+// Service build every rule here and exec once per Pod instead of once per identity.
+func nftDnatMapAddRule(protocol, v4ip, externalPort string, backends []string, sessionAffinity string, affinityTimeoutSeconds int32) (string, error) {
 	if v4ip == "" {
 		// Share DNAT is implemented with `ip daddr`/`ip saddr` nft rules and only supports IPv4.
-		return errors.New("cannot create nft dnat map: empty IPv4 EIP (share dnat does not support IPv6)")
+		return "", errors.New("cannot create nft dnat map: empty IPv4 EIP (share dnat does not support IPv6)")
 	}
 	// Normalize the backend set: dedup and sort so that an unchanged set of backends always
 	// produces an identical nft map. Without this, the lister's non-deterministic order would
@@ -81,7 +84,7 @@ func (c *Controller) createNftDnatMapInPods(gwPods []*corev1.Pod, protocol, v4ip
 	// choice for new connections; established connections stay pinned by conntrack).
 	backends = dedupSortedBackends(backends)
 	if len(backends) == 0 {
-		return fmt.Errorf("cannot create nft dnat map for %s:%s (%s): no backends", v4ip, externalPort, protocol)
+		return "", fmt.Errorf("cannot create nft dnat map for %s:%s (%s): no backends", v4ip, externalPort, protocol)
 	}
 
 	// Encode client-IP session affinity for the gateway script. "none" keeps the original
@@ -97,19 +100,13 @@ func (c *Controller) createNftDnatMapInPods(gwPods []*corev1.Pod, protocol, v4ip
 		}
 	}
 
-	backendStr := strings.Join(backends, "@")
-	rule := fmt.Sprintf("%s,%s,%s,%s,%d,%s", v4ip, externalPort, protocol, affinity, timeout, backendStr)
-	return c.execNatGwRulesInPods(gwPods, natGwNftDnatMapAdd, []string{rule})
+	return fmt.Sprintf("%s,%s,%s,%s,%d,%s", v4ip, externalPort, protocol, affinity, timeout, strings.Join(backends, "@")), nil
 }
 
-// deleteNftDnatMapInPods deletes an nftables map-based DNAT rule by identity, on an already resolved
-// set of gateway instances: it removes the vmap element and the per-identity chain atomically (see
-// createNftDnatMapInPods). The caller resolves the gateway and its Pods once, so removing several
-// identities of one gateway costs one live list instead of one per identity (and an empty result
-// even sleeps before failing, so the saving is not only round trips).
-func (c *Controller) deleteNftDnatMapInPods(gwPods []*corev1.Pod, protocol, v4ip, externalPort string) error {
-	rule := fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)
-	return c.execNatGwRulesInPods(gwPods, natGwNftDnatMapDel, []string{rule})
+// nftDnatMapDelRule encodes the identity to remove for the gateway script:
+// "<vip>,<port>,<protocol>".
+func nftDnatMapDelRule(protocol, v4ip, externalPort string) string {
+	return fmt.Sprintf("%s,%s,%s", v4ip, externalPort, protocol)
 }
 
 // dnatUsesEip reports whether a rule addresses a public IP through an EIP: the address is
