@@ -327,42 +327,26 @@ func buildNftableLbIdentities(records map[string]*kubeovnv1.IptablesDnatRule, ei
 	return identities
 }
 
-// programNftableLbServiceDirect writes the complete desired share-DNAT identities for one
-// Service. The Service and EndpointSlices are the source of truth; DNAT records are written
-// afterwards only for inspection and accounting.
-func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eipIP string,
-	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule,
-) error {
-	pods, err := c.getNatGwPods(gateway, c.natGwNamespaceByName(gateway), false)
-	if err != nil {
-		return err
-	}
-
-	programs := buildNftableLbPrograms(desired, eipIP)
-	// The accounting records are written only after the data plane succeeded, so an identity whose
-	// recorded state already matches the desired one is in place: re-programming it (and its
-	// hairpin) on every EndpointSlice event of the Service would be pure churn.
-	existingRecords := make(map[string]*kubeovnv1.IptablesDnatRule, len(existing))
-	for _, record := range existing {
-		existingRecords[record.Name] = record
-	}
-	current := buildNftableLbIdentities(existingRecords, eipIP)
-
+// programNftableLbServiceIdentities programs every desired identity on every Pod and removes the
+// identities the Service no longer wants, with one exec per operation and Pod.
+//
+// It takes no view of the accounting records on purpose: the records describe the Service's
+// desired state, not the state of the current gateway instance. Gateway-instance replacement
+// re-enqueues the Service because the new instance starts empty, and an EIP reallocation changes
+// the programmed VIP while the records still carry the old one, so a record-based skip would leave
+// the fresh instance without rules and blackhole the Service.
+func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs []nftableLbProgram, existing []*kubeovnv1.IptablesDnatRule) error {
 	wanted := make(map[string]struct{}, len(programs))
 	addRules := make([]string, 0, len(programs))
 	hairpinAddRules := make([]string, 0, len(programs))
 	for _, program := range programs {
 		identity := program.identity
-		key := identity.vip + "/" + identity.externalPort + "/" + identity.protocol
-		wanted[key] = struct{}{}
-		if recorded, ok := current[key]; ok && sameNftableLbIdentityState(recorded, identity) {
-			continue
-		}
-		rule, ruleErr := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
+		wanted[identity.vip+"/"+identity.externalPort+"/"+identity.protocol] = struct{}{}
+		rule, err := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
 			identity.backends, identity.affinity, identity.affinityTimeout)
-		if ruleErr != nil {
-			return fmt.Errorf("failed to build share dnat identity %s:%s/%s for service %s/%s: %w",
-				identity.vip, identity.externalPort, identity.protocol, svc.Namespace, svc.Name, ruleErr)
+		if err != nil {
+			return fmt.Errorf("failed to build share dnat identity %s:%s/%s: %w",
+				identity.vip, identity.externalPort, identity.protocol, err)
 		}
 		addRules = append(addRules, rule)
 		hairpinAddRules = append(hairpinAddRules, program.hairpinRule)
@@ -371,13 +355,13 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 	// One exec per Pod for the whole Service: the gateway script accepts several rules per
 	// invocation, so a multi-port Service no longer costs one pod-exec per identity and field.
 	if len(addRules) != 0 {
-		if err = c.execNatGwRulesInPods(pods, natGwNftDnatMapAdd, addRules); err != nil {
-			return fmt.Errorf("failed to program share dnat identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
+		if err := c.execNatGwRulesInPods(pods, natGwNftDnatMapAdd, addRules); err != nil {
+			return err
 		}
 	}
 	if len(hairpinAddRules) != 0 {
-		if err = c.execNatGwRulesInPods(pods, natGwVipHairpinAdd, hairpinAddRules); err != nil {
-			return fmt.Errorf("failed to program hairpins of service %s/%s: %w", svc.Namespace, svc.Name, err)
+		if err := c.execNatGwRulesInPods(pods, natGwVipHairpinAdd, hairpinAddRules); err != nil {
+			return err
 		}
 	}
 
@@ -391,14 +375,32 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 		hairpinDelRules = append(hairpinDelRules, fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol))
 	}
 	if len(delRules) != 0 {
-		if err = c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
-			return fmt.Errorf("failed to remove stale identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
+		if err := c.execNatGwRulesInPods(pods, natGwNftDnatMapDel, delRules); err != nil {
+			return err
 		}
 	}
 	if len(hairpinDelRules) != 0 {
-		if err = c.execNatGwRulesInPods(pods, natGwVipHairpinDel, hairpinDelRules); err != nil {
-			return fmt.Errorf("failed to remove stale hairpins of service %s/%s: %w", svc.Namespace, svc.Name, err)
+		if err := c.execNatGwRulesInPods(pods, natGwVipHairpinDel, hairpinDelRules); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// programNftableLbServiceDirect writes the complete desired share-DNAT identities for one
+// Service. The Service and EndpointSlices are the source of truth; DNAT records are written
+// afterwards only for inspection and accounting.
+func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eipIP string,
+	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule,
+) error {
+	pods, err := c.getNatGwPods(gateway, c.natGwNamespaceByName(gateway), false)
+	if err != nil {
+		return err
+	}
+
+	programs := buildNftableLbPrograms(desired, eipIP)
+	if err = c.programNftableLbServiceIdentities(pods, programs, existing); err != nil {
+		return fmt.Errorf("failed to program share dnat identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 
 	owner := svc.Namespace + "/" + svc.Name
@@ -415,14 +417,6 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 		return fmt.Errorf("failed to sync VIP routes of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 	return nil
-}
-
-// sameNftableLbIdentityState reports whether the data plane already holds exactly this identity:
-// the same backend set with the same session-affinity settings.
-func sameNftableLbIdentityState(recorded, desired *nftableLbIdentity) bool {
-	return recorded.affinity == desired.affinity &&
-		recorded.affinityTimeout == desired.affinityTimeout &&
-		slices.Equal(recorded.backends, desired.backends)
 }
 
 func (c *Controller) existingNftableLbSvcRules(namespace, name string) ([]*kubeovnv1.IptablesDnatRule, error) {

@@ -902,9 +902,13 @@ func (c *Controller) handleUpdateNatGwSubnetRoute(natGwKey string) error {
 // execNatGwRulesInPods runs one gateway script command on every given Pod, trying all of them so
 // a failing instance cannot starve the others.
 func (c *Controller) execNatGwRulesInPods(pods []*corev1.Pod, operation string, rules []string) error {
+	exec := c.execRulesInPod
+	if exec == nil {
+		exec = c.execNatGwRules
+	}
 	var errs []error
 	for _, pod := range pods {
-		if err := c.execNatGwRules(pod, operation, rules); err != nil {
+		if err := exec(pod, operation, rules); err != nil {
 			klog.Errorf("failed to run %s in nat gw pod %s/%s, err: %v", operation, pod.Namespace, pod.Name, err)
 			errs = append(errs, err)
 		}

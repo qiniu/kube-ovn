@@ -154,6 +154,10 @@ type Controller struct {
 	updateVpcSubnetQueue          workqueue.TypedRateLimitingInterface[string]
 	vpcNatGwKeyMutex              keymutex.KeyMutex
 	vpcNatGwExecKeyMutex          keymutex.KeyMutex
+	// execRulesInPod runs one gateway-script command in one Pod of a resolved gateway (see
+	// execNatGwRulesInPods). Tests substitute it to observe what a reconciler programs without a
+	// kubelet; nil uses execNatGwRules.
+	execRulesInPod func(pod *corev1.Pod, operation string, rules []string) error
 
 	vpcEgressGatewayLister           kubeovnlister.VpcEgressGatewayLister
 	vpcEgressGatewaySynced           cache.InformerSynced
