@@ -35,6 +35,8 @@ func (c *Controller) enqueueAddIptablesEip(obj any) {
 	}
 	klog.Infof("enqueue add iptables eip %s", key)
 	c.addIptablesEipQueue.Add(key)
+	// A gateway-mode Service that references this EIP may have been waiting for it to be created.
+	c.enqueueGwNftableLbServicesForEIP(eip.Name)
 }
 
 // enqueueIptablesEipReferrers wakes NAT rules that may have been waiting for this EIP to become ready.
@@ -134,6 +136,9 @@ func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 		if err := c.enqueueIptablesEipReferrers(newEip, usable); err != nil {
 			klog.Errorf("failed to enqueue referrers of eip %s: %v", newEip.Name, err)
 		}
+		// The share records of a gateway-mode Service carry the EIP address, so they have to be
+		// rewritten (or released) when it appears, disappears or becomes unusable.
+		c.enqueueGwNftableLbServicesForEIP(newEip.Name)
 	}
 }
 
@@ -160,6 +165,9 @@ func (c *Controller) enqueueDelIptablesEip(obj any) {
 	if err := c.enqueueIptablesEipReferrers(eip, false); err != nil {
 		klog.Errorf("failed to enqueue referrers of deleted eip %s: %v", key, err)
 	}
+	// The Service owns the share records that reference this EIP and has to release them, or the
+	// EIP's finalizer waits for rules nothing else deletes.
+	c.enqueueGwNftableLbServicesForEIP(eip.Name)
 
 	// Re-trigger QoS reconcile so it can drop its finalizer once unused. DeleteFunc runs after
 	// the informer cache dropped this EIP; the queue key is the policy name.

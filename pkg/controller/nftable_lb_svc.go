@@ -116,6 +116,26 @@ func (c *Controller) enqueueGwNftableLbServicesForNatGw(natGwName string) {
 	}
 }
 
+// enqueueGwNftableLbServicesForEIP wakes the gateway-mode Services that reference this EIP. The
+// Service reconcile is the only writer of the share records that point at the EIP, so it has to
+// learn about an EIP that appeared, became usable, became unusable, or is being deleted: an EIP
+// whose referencing records are never released cannot finish deleting.
+func (c *Controller) enqueueGwNftableLbServicesForEIP(eipName string) {
+	if c.config == nil || !c.config.EnableGwNftableLbSvc || eipName == "" || c.svcIndexer == nil {
+		return
+	}
+	svcs, err := c.svcIndexer.ByIndex(IndexGwNftableLbServiceByEip, eipName)
+	if err != nil {
+		klog.Errorf("failed to list nftable lb services of eip %s: %v", eipName, err)
+		return
+	}
+	for _, obj := range svcs {
+		if svc, ok := obj.(*v1.Service); ok {
+			c.enqueueGwNftableLbService(svc.Namespace + "/" + svc.Name)
+		}
+	}
+}
+
 func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	if !c.config.EnableGwNftableLbSvc {
 		return nil
@@ -169,6 +189,13 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		}
 		if eip.Spec.NatGwDp != "" && eip.Spec.NatGwDp != gwName {
 			klog.Errorf("nftable lb service %s: eip %s belongs to nat gw %s, not to the annotated gw %s", key, eipName, eip.Spec.NatGwDp, gwName)
+			return c.cleanupNftableLbService(cachedSvc, namespace, name)
+		}
+		if !eip.DeletionTimestamp.IsZero() {
+			// The EIP is going away. The Service is the only writer of the share records that
+			// reference it, so it has to release them here: the EIP's finalizer waits for those
+			// rules to disappear, and a record nobody else deletes would wait forever.
+			klog.Infof("nftable lb service %s: eip %s is terminating, releasing its share records", key, eipName)
 			return c.cleanupNftableLbService(cachedSvc, namespace, name)
 		}
 		eipIP = eip.Status.IP

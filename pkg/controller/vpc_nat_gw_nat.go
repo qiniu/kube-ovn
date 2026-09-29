@@ -78,6 +78,18 @@ func (c *Controller) enqueueDelIptablesFip(obj any) {
 	c.delIptablesFipQueue.Add(key)
 }
 
+// enqueueIptablesEipRecheck re-runs an EIP's reconcile so it can finish deleting once the rules
+// that referenced it are gone. Share records are written and deleted by the Service reconcile
+// (never by the DNAT worker), so the EIP has to be woken explicitly when one stops referencing it,
+// otherwise its finalizer waits for rules that are already gone.
+func (c *Controller) enqueueIptablesEipRecheck(eipName string) {
+	if eipName == "" || c.updateIptablesEipQueue == nil {
+		return
+	}
+	klog.V(3).Infof("re-check iptables eip %s after its referencing rule changed", eipName)
+	c.updateIptablesEipQueue.Add(eipName)
+}
+
 func (c *Controller) enqueueAddIptablesDnatRule(obj any) {
 	dnat := obj.(*kubeovnv1.IptablesDnatRule)
 	if dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare {
@@ -96,6 +108,12 @@ func (c *Controller) enqueueUpdateIptablesDnatRule(oldObj, newObj any) {
 	oldDnat := oldObj.(*kubeovnv1.IptablesDnatRule)
 	newDnat := newObj.(*kubeovnv1.IptablesDnatRule)
 	if oldDnat.Spec.Type == kubeovnv1.DnatRuleTypeShare || newDnat.Spec.Type == kubeovnv1.DnatRuleTypeShare {
+		// A share record is the Service's accounting object: the DNAT worker never touches it, but
+		// the EIPs it referenced may become free (or newly referenced) with this change.
+		if oldDnat.Spec.EIP != newDnat.Spec.EIP {
+			c.enqueueIptablesEipRecheck(oldDnat.Spec.EIP)
+			c.enqueueIptablesEipRecheck(newDnat.Spec.EIP)
+		}
 		return
 	}
 	key := cache.MetaObjectToName(newDnat).String()
@@ -152,6 +170,9 @@ func (c *Controller) enqueueDelIptablesDnatRule(obj any) {
 	}
 
 	if dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare {
+		// The Service released this record; the EIP it referenced has to be re-checked so its
+		// finalizer can clear now that no rule uses it any more.
+		c.enqueueIptablesEipRecheck(dnat.Spec.EIP)
 		return
 	}
 	key := cache.MetaObjectToName(dnat).String()

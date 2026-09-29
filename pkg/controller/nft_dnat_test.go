@@ -99,3 +99,52 @@ func TestProgramNftableLbServiceIdentitiesReprogramsUnchangedRecords(t *testing.
 	require.Empty(t, programmed[natGwNftDnatMapDel], "an identity the Service still wants must not be deleted")
 	require.Empty(t, programmed[natGwVipHairpinDel])
 }
+
+// TestEnqueueIptablesEipWakesGwNftableLbServices pins the EIP-event wake-up: the Service reconcile
+// is the only writer of the share records that reference an EIP, so an EIP appearing or going away
+// must enqueue the Services bound to it (otherwise a referencing record is never released and the
+// EIP's finalizer waits forever).
+func TestEnqueueIptablesEipWakesGwNftableLbServices(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web",
+			Namespace: metav1.NamespaceDefault,
+			Annotations: map[string]string{
+				util.VpcNatGatewayAnnotation: "gw",
+				util.EipAnnotation:           "eip0",
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Type:  v1.ServiceTypeLoadBalancer,
+			Ports: []v1.ServicePort{{Protocol: v1.ProtocolTCP, Port: 80}},
+		},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{Services: []*v1.Service{svc}})
+	require.NoError(t, err)
+	ctrl := fc.fakeController
+	ctrl.config.EnableGwNftableLbSvc = true
+	ctrl.addOrUpdateGwNftableLbSvcQueue = newTypedRateLimitingQueue[string]("AddOrUpdateGwNftableLbSvc", nil)
+	ctrl.addIptablesEipQueue = newTypedRateLimitingQueue[string]("AddIptablesEip", nil)
+	ctrl.delIptablesEipQueue = newTypedRateLimitingQueue[*kubeovnv1.IptablesEIP]("DelIptablesEip", nil)
+	t.Cleanup(func() {
+		ctrl.addOrUpdateGwNftableLbSvcQueue.ShutDown()
+		ctrl.addIptablesEipQueue.ShutDown()
+		ctrl.delIptablesEipQueue.ShutDown()
+	})
+
+	eip := &kubeovnv1.IptablesEIP{ObjectMeta: metav1.ObjectMeta{Name: "eip0"}}
+	ctrl.enqueueAddIptablesEip(eip)
+	require.Equal(t, 1, ctrl.addOrUpdateGwNftableLbSvcQueue.Len(),
+		"creating the EIP must wake the Service that references it")
+	item, _ := ctrl.addOrUpdateGwNftableLbSvcQueue.Get()
+	require.Equal(t, "default/web", item)
+	ctrl.addOrUpdateGwNftableLbSvcQueue.Done(item)
+
+	// The workqueue de-duplicates a key that is already queued, so drain it first: the delete event
+	// has to enqueue the Service again on its own.
+	ctrl.enqueueDelIptablesEip(eip)
+	require.Equal(t, 1, ctrl.addOrUpdateGwNftableLbSvcQueue.Len(),
+		"deleting the EIP must wake the Service so it releases its records")
+}
