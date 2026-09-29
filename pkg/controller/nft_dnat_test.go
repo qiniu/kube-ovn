@@ -48,3 +48,38 @@ func TestNftDnatMapDelRule(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, "10.0.0.1,80,tcp", nftDnatMapDelRule("tcp", "10.0.0.1", "80"))
 }
+
+func TestSameNftableLbIdentityState(t *testing.T) {
+	t.Parallel()
+
+	base := &nftableLbIdentity{
+		vip: "10.0.0.1", externalPort: "80", protocol: "tcp",
+		backends:        []string{"10.0.0.5:8080", "10.0.0.6:8080"},
+		affinity:        kubeovnv1.DnatSessionAffinityClientIP,
+		affinityTimeout: 30,
+	}
+
+	t.Run("identical state matches", func(t *testing.T) {
+		other := *base
+		other.backends = append([]string(nil), base.backends...)
+		require.True(t, sameNftableLbIdentityState(base, &other))
+	})
+
+	t.Run("backend change does not match", func(t *testing.T) {
+		other := *base
+		other.backends = []string{"10.0.0.5:8080"}
+		require.False(t, sameNftableLbIdentityState(base, &other))
+	})
+
+	t.Run("affinity change does not match", func(t *testing.T) {
+		other := *base
+		other.affinity = ""
+		require.False(t, sameNftableLbIdentityState(base, &other))
+	})
+
+	t.Run("affinity timeout change does not match", func(t *testing.T) {
+		other := *base
+		other.affinityTimeout = 60
+		require.False(t, sameNftableLbIdentityState(base, &other))
+	})
+}

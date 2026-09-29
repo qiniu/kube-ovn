@@ -339,12 +339,25 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 	}
 
 	programs := buildNftableLbPrograms(desired, eipIP)
+	// The accounting records are written only after the data plane succeeded, so an identity whose
+	// recorded state already matches the desired one is in place: re-programming it (and its
+	// hairpin) on every EndpointSlice event of the Service would be pure churn.
+	existingRecords := make(map[string]*kubeovnv1.IptablesDnatRule, len(existing))
+	for _, record := range existing {
+		existingRecords[record.Name] = record
+	}
+	current := buildNftableLbIdentities(existingRecords, eipIP)
+
 	wanted := make(map[string]struct{}, len(programs))
 	addRules := make([]string, 0, len(programs))
 	hairpinAddRules := make([]string, 0, len(programs))
 	for _, program := range programs {
-		wanted[program.identity.vip+"/"+program.identity.externalPort+"/"+program.identity.protocol] = struct{}{}
 		identity := program.identity
+		key := identity.vip + "/" + identity.externalPort + "/" + identity.protocol
+		wanted[key] = struct{}{}
+		if recorded, ok := current[key]; ok && sameNftableLbIdentityState(recorded, identity) {
+			continue
+		}
 		rule, ruleErr := nftDnatMapAddRule(identity.protocol, identity.vip, identity.externalPort,
 			identity.backends, identity.affinity, identity.affinityTimeout)
 		if ruleErr != nil {
@@ -389,17 +402,27 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 	}
 
 	owner := svc.Namespace + "/" + svc.Name
-	_, clusterIPs, err := c.desiredNatGwVipStateForService(gateway, nil, owner, desired, eipIP)
+	desiredVipRoutes, clusterIPs, err := c.desiredNatGwVipStateForService(gateway, nil, owner, desired, eipIP)
 	if err != nil {
 		return err
 	}
 	if err = c.execNatGwRulesInPods(pods, natGwVipAddrSync, clusterIPs); err != nil {
 		return fmt.Errorf("failed to sync cluster VIPs of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
-	if err = c.syncNatGwVipStateForService(gateway, nil, owner, desired, eipIP); err != nil {
+	// The state was computed above for the address sync; reconcile the routes with it instead of
+	// scanning the DNAT lister a second time.
+	if err = c.applyNatGwVipStateForService(gateway, desiredVipRoutes); err != nil {
 		return fmt.Errorf("failed to sync VIP routes of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 	return nil
+}
+
+// sameNftableLbIdentityState reports whether the data plane already holds exactly this identity:
+// the same backend set with the same session-affinity settings.
+func sameNftableLbIdentityState(recorded, desired *nftableLbIdentity) bool {
+	return recorded.affinity == desired.affinity &&
+		recorded.affinityTimeout == desired.affinityTimeout &&
+		slices.Equal(recorded.backends, desired.backends)
 }
 
 func (c *Controller) existingNftableLbSvcRules(namespace, name string) ([]*kubeovnv1.IptablesDnatRule, error) {

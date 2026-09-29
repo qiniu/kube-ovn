@@ -553,8 +553,8 @@ func TestDeleteSnatInPod_NatGwExistsPodMissing(t *testing.T) {
 	require.NoError(t, err, "a gateway without a running instance holds no data plane to clean up")
 }
 
-// shareDnat builds an IptablesDnatRule with the identity labels that getShareBackends
-// and isDnatDuplicated select on. dnatType may be "" (defaults to exclusive behavior).
+// shareDnat builds an IptablesDnatRule with the identity labels the share DNAT consumers
+// select on. dnatType may be "" (defaults to exclusive behavior).
 func shareDnat(name, gw, eip, eport, proto, intIP, intPort, dnatType string) *kubeovnv1.IptablesDnatRule {
 	return &kubeovnv1.IptablesDnatRule{
 		ObjectMeta: metav1.ObjectMeta{

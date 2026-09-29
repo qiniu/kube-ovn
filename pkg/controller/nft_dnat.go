@@ -56,7 +56,7 @@ import (
 // numgen-random map: each backend gets a dynamic timeout set ("update @affinity-set { ip saddr }"
 // in a per-endpoint chain) and the per-identity chain gains a preceding "ip saddr @affinity-set
 // goto <ep>" lookup, layered on top of the same numgen random dispatch (not jhash). Affinity is
-// an identity-level property (all siblings share it) and is threaded through createNftDnatMapInPod
+// an identity-level property (all siblings share it) and is threaded through nftDnatMapAddRule
 // as (sessionAffinity, affinityTimeoutSeconds); "" / none keeps the original stateless behavior.
 
 const (
@@ -346,17 +346,23 @@ func (c *Controller) syncNatGwVipStateForService(gwName string, applying *kubeov
 		// rules it generated are not reconciled either.
 		return nil
 	}
+	desired, _, err := c.desiredNatGwVipStateForService(gwName, applying, owner, records, eipIP)
+	if err != nil {
+		return err
+	}
+	return c.applyNatGwVipStateForService(gwName, desired)
+}
+
+// applyNatGwVipStateForService reconciles the gateway's share-DNAT VIP routes against an already
+// computed desired state, so a caller that just computed it does not have to scan the DNAT lister
+// a second time (the Service reconcile computes the state to sync the VIP addresses first).
+func (c *Controller) applyNatGwVipStateForService(gwName string, desired map[string]string) error {
 	gw, err := c.vpcNatGatewayLister.Get(gwName)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			// The gateway is gone and its VPC routes went with it.
 			return nil
 		}
-		return err
-	}
-
-	desired, _, err := c.desiredNatGwVipStateForService(gwName, applying, owner, records, eipIP)
-	if err != nil {
 		return err
 	}
 	pods, err := c.listNatGwPods(gw)
