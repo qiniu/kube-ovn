@@ -843,6 +843,7 @@ false
   "enableBgpLbVip": false,
   "enableExternalVpcs": false,
   "enableGwNftableLoadbalancerService": false,
+  "enableGwNftableServiceClusterIp": false,
   "enableHardwareOffload": false,
   "enableKeepVmIps": true,
   "enableLiveMigrationOptimization": true,
@@ -885,7 +886,16 @@ false
 false
 </pre>
 </td>
-			<td>Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. It starts the controller with --enable-lb=false, so it cannot be combined with enableLoadbalancer and leaves enableLoadbalancerService without its prerequisite.</td>
+			<td>Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancerService.</td>
+		</tr>
+		<tr>
+			<td>features.enableGwNftableServiceClusterIp</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancer and enableLoadbalancerService.</td>
 		</tr>
 		<tr>
 			<td>features.enableHardwareOffload</td>
@@ -930,7 +940,7 @@ true
 false
 </pre>
 </td>
-			<td>Enable Kube-OVN loadbalancer services. Requires enableLoadbalancer (only a warning is logged otherwise), and it cannot work when enableGwNftableLoadbalancerService turns --enable-lb off.</td>
+			<td>Enable Kube-OVN loadbalancer services. Requires enableLoadbalancer (only a warning is logged otherwise) and is mutually exclusive with enableGwNftableLoadbalancerService and enableGwNftableServiceClusterIp.</td>
 		</tr>
 		<tr>
 			<td>features.enableNatGateways</td>
@@ -2070,4 +2080,3 @@ false
 	</tr>
 	</tbody>
 </table>
-

@@ -41,6 +41,17 @@ type updateSvcObject struct {
 	hadBgpVipAnnotation bool
 }
 
+// usesGwNftableLbService reports whether the Service is owned by the gateway nftables data plane.
+// It is an annotation-level decision on purpose: a LoadBalancer Service that names both a gateway
+// and an EIP declares that the gateway serves it, so the OVN and lb-svc paths must leave it alone.
+// An unavailable EIP is not a reason to fall back to another implementation: the Service reconcile
+// retries until the EIP becomes usable, so the two implementations never race over one Service.
+func (c *Controller) usesGwNftableLbService(svc *v1.Service) bool {
+	return c.config != nil && c.config.EnableGwNftableLbSvc && svc != nil &&
+		svc.Spec.Type == v1.ServiceTypeLoadBalancer && svc.Annotations[util.VpcNatGatewayAnnotation] != "" &&
+		svc.Annotations[util.EipAnnotation] != ""
+}
+
 func (c *Controller) enqueueAddService(obj any) {
 	svc := obj.(*v1.Service)
 	key := cache.MetaObjectToName(svc).String()
@@ -84,6 +95,9 @@ func (c *Controller) enqueueDeleteService(obj any) {
 
 	klog.Infof("enqueue delete service %s/%s", svc.Namespace, svc.Name)
 	c.enqueueGwNftableLbService(svc.Namespace + "/" + svc.Name)
+	if c.usesGwNftableLbService(svc) {
+		return
+	}
 
 	vip, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]
 	if ok || (svc.Spec.ClusterIP != v1.ClusterIPNone && svc.Spec.ClusterIP != "") || svc.Annotations[util.ServiceExternalIPFromSubnetAnnotation] != "" {
@@ -145,6 +159,9 @@ func (c *Controller) enqueueUpdateService(oldObj, newObj any) {
 	// compares, so an unrelated status or annotation churn does not wake it.
 	if gwNftableLbSvcChanged(oldSvc, newSvc) {
 		c.enqueueGwNftableLbService(key)
+	}
+	if c.usesGwNftableLbService(newSvc) {
+		return
 	}
 	klog.V(3).Infof("enqueue update service %s", key)
 	if len(ipsToDel) != 0 {
@@ -295,6 +312,10 @@ func (c *Controller) handleUpdateService(svcObject *updateSvcObject) error {
 	}
 
 	ips := getVipIps(svc)
+
+	if c.usesGwNftableLbService(svc) {
+		return nil
+	}
 
 	// OVN ClusterIP VIP management is only relevant in classic OVN LB mode;
 	// see syncServiceOvnLBVips for details.

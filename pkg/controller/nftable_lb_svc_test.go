@@ -32,73 +32,123 @@ import (
 func Test_nftableLbSvcQualifies(t *testing.T) {
 	t.Parallel()
 
-	withAnnotations := func(svcType v1.ServiceType, anns map[string]string) *v1.Service {
-		return &v1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: anns}, Spec: v1.ServiceSpec{Type: svcType}}
-	}
-	gateway := map[string]string{util.VpcNatGatewayAnnotation: "gw0"}
-
 	tests := []struct {
-		name     string
-		svc      *v1.Service
-		expected bool
+		name            string
+		svcType         v1.ServiceType
+		annotations     map[string]string
+		enableEIP       bool
+		enableClusterIP bool
+		wantEIP         bool
+		wantClusterIP   bool
 	}{
 		{
-			name:     "loadbalancer naming its gateway and an eip",
-			svc:      withAnnotations(v1.ServiceTypeLoadBalancer, map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"}),
-			expected: true,
+			name: "loadbalancer with both identities enabled", svcType: v1.ServiceTypeLoadBalancer,
+			annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"},
+			enableEIP:   true, enableClusterIP: true, wantEIP: true, wantClusterIP: true,
 		},
 		{
-			// Without an EIP a LoadBalancer Service has no ingress IP to publish, so it is not
-			// handled: the gateway serves it through the EIP's address.
-			name:     "loadbalancer naming its gateway without an eip",
-			svc:      withAnnotations(v1.ServiceTypeLoadBalancer, gateway),
-			expected: false,
+			name: "loadbalancer with only eip identity enabled", svcType: v1.ServiceTypeLoadBalancer,
+			annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"},
+			enableEIP:   true, wantEIP: true,
 		},
 		{
-			name:     "clusterip naming its gateway",
-			svc:      withAnnotations(v1.ServiceTypeClusterIP, gateway),
-			expected: true,
+			name: "loadbalancer with only cluster ip identity enabled", svcType: v1.ServiceTypeLoadBalancer,
+			annotations:     map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"},
+			enableClusterIP: true, wantClusterIP: true,
 		},
 		{
-			name:     "loadbalancer without a gateway",
-			svc:      withAnnotations(v1.ServiceTypeLoadBalancer, map[string]string{util.EipAnnotation: "eip0"}),
-			expected: false,
+			name: "loadbalancer with both identities disabled", svcType: v1.ServiceTypeLoadBalancer,
+			annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"},
 		},
 		{
-			name:     "clusterip without a gateway",
-			svc:      withAnnotations(v1.ServiceTypeClusterIP, map[string]string{util.EipAnnotation: "eip0"}),
-			expected: false,
+			name: "loadbalancer without eip can still serve cluster ip", svcType: v1.ServiceTypeLoadBalancer,
+			annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0"},
+			enableEIP:   true, enableClusterIP: true, wantClusterIP: true,
 		},
 		{
-			// Naming a vpc nat gateway wins over the per-Service forwarder's annotation: the two
-			// halves of the exclusivity agree (the forwarder is removed instead of kept in sync),
-			// so a Service carrying both is served by exactly one of them.
-			name: "loadbalancer naming both its gateway and an attachment provider",
-			svc: withAnnotations(v1.ServiceTypeLoadBalancer, map[string]string{
-				util.VpcNatGatewayAnnotation: "gw0",
-				util.EipAnnotation:           "eip0",
-				util.AttachmentProvider:      "lb-svc-attachment.kube-system",
-			}),
-			expected: true,
+			name: "cluster ip service enabled", svcType: v1.ServiceTypeClusterIP,
+			annotations:     map[string]string{util.VpcNatGatewayAnnotation: "gw0"},
+			enableClusterIP: true, wantClusterIP: true,
 		},
 		{
-			name:     "nodeport is not handled",
-			svc:      withAnnotations(v1.ServiceTypeNodePort, gateway),
-			expected: false,
+			name: "service without gateway", svcType: v1.ServiceTypeLoadBalancer,
+			annotations: map[string]string{util.EipAnnotation: "eip0"},
+			enableEIP:   true, enableClusterIP: true,
 		},
 		{
-			name:     "externalname is not handled",
-			svc:      withAnnotations(v1.ServiceTypeExternalName, gateway),
-			expected: false,
+			name: "nodeport is not handled", svcType: v1.ServiceTypeNodePort,
+			annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"},
+			enableEIP:   true, enableClusterIP: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			require.Equal(t, tt.expected, nftableLbSvcQualifies(tt.svc))
+			c := &Controller{config: &Configuration{
+				EnableGwNftableLbSvc: tt.enableEIP, EnableGwNftableSvcClusterIP: tt.enableClusterIP,
+			}}
+			svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}, Spec: v1.ServiceSpec{Type: tt.svcType}}
+			gotEIP, gotClusterIP := c.nftableLbSvcQualifies(svc)
+			require.Equal(t, tt.wantEIP, gotEIP)
+			require.Equal(t, tt.wantClusterIP, gotClusterIP)
 		})
 	}
+}
+
+// TestNftableLbServiceIndexers pins what the two Service indexes hold: the EIP index holds only
+// LoadBalancer Services that name an EIP (the conflict resolver can only contest an EIP identity),
+// while the gateway index holds every candidate, including a LoadBalancer Service that has no EIP
+// yet because the ClusterIP identity can still serve it.
+func TestNftableLbServiceIndexers(t *testing.T) {
+	t.Parallel()
+
+	svc := func(name string, svcType v1.ServiceType, gateway, eip string) *v1.Service {
+		annotations := map[string]string{}
+		if gateway != "" {
+			annotations[util.VpcNatGatewayAnnotation] = gateway
+		}
+		if eip != "" {
+			annotations[util.EipAnnotation] = eip
+		}
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name, Annotations: annotations},
+			Spec:       v1.ServiceSpec{Type: svcType},
+		}
+	}
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		IndexGwNftableLbServiceByEip:     indexGwNftableLbServiceByEip,
+		IndexGwNftableLbServiceByGateway: indexGwNftableLbServiceByGateway,
+	})
+	for _, s := range []*v1.Service{
+		svc("a", v1.ServiceTypeLoadBalancer, "gw0", "eip0"),
+		svc("b", v1.ServiceTypeLoadBalancer, "gw0", ""), // no EIP annotation: ClusterIP identity only
+		svc("c", v1.ServiceTypeLoadBalancer, "gw1", "eip1"),
+		svc("d", v1.ServiceTypeClusterIP, "gw0", ""),    // a ClusterIP Service has no EIP
+		svc("e", v1.ServiceTypeClusterIP, "", ""),       // no gateway: not a candidate
+		svc("f", v1.ServiceTypeNodePort, "gw0", "eip0"), // NodePort is not handled
+	} {
+		require.NoError(t, indexer.Add(s))
+	}
+
+	names := func(objs []any) []string {
+		out := make([]string, 0, len(objs))
+		for _, obj := range objs {
+			out = append(out, obj.(*v1.Service).Name)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	byEIP, err := indexer.ByIndex(IndexGwNftableLbServiceByEip, "eip0")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a"}, names(byEIP))
+
+	byGateway, err := indexer.ByIndex(IndexGwNftableLbServiceByGateway, "gw0")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a", "b", "d"}, names(byGateway),
+		"only gateway candidates are indexed, and a LoadBalancer Service without an EIP still is one")
 }
 
 func TestEnqueueGwNftableLbServiceWithoutOvnLb(t *testing.T) {
@@ -579,13 +629,31 @@ func TestResolveNftableLbConflictsWithNoReadyBackends(t *testing.T) {
 	controller := &Controller{
 		svcIndexer:                     indexer,
 		iptablesDnatRulesLister:        kubeovnlister.NewIptablesDnatRuleLister(ruleIndexer),
-		recorder:                       record.NewFakeRecorder(1),
+		recorder:                       record.NewFakeRecorder(2),
 		addOrUpdateGwNftableLbSvcQueue: queue,
 	}
 
 	conflicted, err := controller.resolveNftableLbConflicts(loser, "ns/z-loser", map[string]*kubeovnv1.IptablesDnatRule{})
 	require.NoError(t, err)
 	require.True(t, conflicted, "a loser must be detected from Service ports even without ready backends")
+
+	desired := map[string]*kubeovnv1.IptablesDnatRule{
+		"backend": {
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{util.EipV4IpLabel: "203.0.113.10", util.EipUIDLabel: "eip-uid"},
+			},
+			Spec: kubeovnv1.IptablesDnatRuleSpec{
+				EIP: "eip0", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			},
+		},
+	}
+	conflicted, err = controller.resolveNftableLbConflicts(loser, "ns/z-loser", desired)
+	require.NoError(t, err)
+	require.True(t, conflicted)
+	require.Empty(t, desired["backend"].Spec.EIP)
+	require.Equal(t, "10.96.1.5", desired["backend"].Spec.ClusterIP)
+	require.NotContains(t, desired["backend"].Labels, util.EipV4IpLabel)
+	require.NotContains(t, desired["backend"].Labels, util.EipUIDLabel)
 }
 
 func TestResolveNftableLbConflictsIgnoresTerminatingServices(t *testing.T) {
@@ -1466,6 +1534,51 @@ func Test_buildDesiredNftableLbDnatRules_clusterIPService(t *testing.T) {
 	}
 }
 
+// Test_buildDesiredNftableLbDnatRules_featureGates pins the per-identity feature gates: each
+// address is dropped by its own switch, and one Service port served by both keeps a single record
+// that carries both fields.
+func Test_buildDesiredNftableLbDnatRules_featureGates(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default", Name: "web",
+			Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"},
+		}, Spec: v1.ServiceSpec{
+			Type: v1.ServiceTypeLoadBalancer, ClusterIP: "10.96.1.5", ClusterIPs: []string{"10.96.1.5"},
+			Ports: []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
+		},
+	}
+	endpointSlices := []*discoveryv1.EndpointSlice{{
+		Ports: []discoveryv1.EndpointPort{{Name: new("http"), Port: new(int32(8080))}},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)},
+		}},
+	}}
+	tests := []struct {
+		name                          string
+		enableEIP, enableClusterIP    bool
+		wantEIP, wantClusterIP        string
+		wantIdentities, wantRuleCount int
+	}{
+		{name: "both disabled"},
+		{name: "eip only", enableEIP: true, wantEIP: "eip0", wantIdentities: 1, wantRuleCount: 1},
+		{name: "cluster ip only", enableClusterIP: true, wantClusterIP: "10.96.1.5", wantIdentities: 1, wantRuleCount: 1},
+		{name: "both enabled", enableEIP: true, enableClusterIP: true, wantEIP: "eip0", wantClusterIP: "10.96.1.5", wantIdentities: 2, wantRuleCount: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			desired := buildDesiredNftableLbDnatRulesForIdentities(svc, "eip0", "gw0", tt.enableEIP, tt.enableClusterIP, endpointSlices, testNftableLbBackendIP)
+			require.Len(t, desired, tt.wantRuleCount)
+			require.Len(t, buildNftableLbIdentities(desired, "203.0.113.10"), tt.wantIdentities)
+			for _, rule := range desired {
+				require.Equal(t, tt.wantEIP, rule.Spec.EIP)
+				require.Equal(t, tt.wantClusterIP, rule.Spec.ClusterIP)
+			}
+		})
+	}
+}
+
 // Test_handleAddOrUpdateGwNftableLbService_clusterIPService pins the ClusterIP Service reconcile:
 // the gateway comes from the annotation, no EIP is looked up, and the generated rule is the one
 // that serves the internal VIP.
@@ -1512,6 +1625,7 @@ func Test_handleAddOrUpdateGwNftableLbService_clusterIPService(t *testing.T) {
 	require.NoError(t, err)
 	c := fc.fakeController
 	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
 	c.addOrUpdateGwNftableLbSvcQueue = newTypedRateLimitingQueue[string]("test-gw-nftable-lb-svc", nil)
 	t.Cleanup(c.addOrUpdateGwNftableLbSvcQueue.ShutDown)
 

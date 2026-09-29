@@ -54,21 +54,27 @@ import (
 //   gateway), matching what Cluster policy already implies.
 //
 
-// nftableLbSvcQualifies reports whether a Service belongs to the gateway mode selected globally.
-// It must name its gateway, and a LoadBalancer Service must also reference the EIP its ingress IP
-// comes from.
-func nftableLbSvcQualifies(svc *v1.Service) bool {
-	if svc.Annotations[util.VpcNatGatewayAnnotation] == "" {
+// nftableLbSvcCandidate reports whether a Service can be considered by the gateway controller.
+func nftableLbSvcCandidate(svc *v1.Service) bool {
+	if svc == nil || svc.Annotations[util.VpcNatGatewayAnnotation] == "" {
 		return false
 	}
-	switch svc.Spec.Type {
-	case v1.ServiceTypeLoadBalancer:
-		return svc.Annotations[util.EipAnnotation] != ""
-	case v1.ServiceTypeClusterIP:
-		return true
-	default:
-		return false
+	return svc.Spec.Type == v1.ServiceTypeLoadBalancer || svc.Spec.Type == v1.ServiceTypeClusterIP
+}
+
+// nftableLbSvcQualifies reports whether at least one enabled gateway identity can serve the
+// Service, and which ones. The two identities are gated independently: EnableGwNftableLbSvc
+// serves the EIP a LoadBalancer Service publishes, EnableGwNftableSvcClusterIP serves the
+// ClusterIP. One Service can have both, and they share a single record and data plane.
+func (c *Controller) nftableLbSvcQualifies(svc *v1.Service) (serveEIP, serveClusterIP bool) {
+	if !nftableLbSvcCandidate(svc) {
+		return false, false
 	}
+	serveEIP = svc.Spec.Type == v1.ServiceTypeLoadBalancer && c.config.EnableGwNftableLbSvc &&
+		svc.Annotations[util.EipAnnotation] != ""
+	serveClusterIP = (svc.Spec.Type == v1.ServiceTypeLoadBalancer || svc.Spec.Type == v1.ServiceTypeClusterIP) &&
+		c.config.EnableGwNftableSvcClusterIP
+	return serveEIP, serveClusterIP
 }
 
 // nftableLbSvcGateway returns the gateway that serves the Service, or "" when none is named.
@@ -79,7 +85,7 @@ func nftableLbSvcGateway(svc *v1.Service) string {
 // enqueueGwNftableLbService enqueues a Service only while gateway mode is selected. Qualification
 // and cleanup decisions stay in the handler so a Service that stops qualifying releases its rules.
 func (c *Controller) enqueueGwNftableLbService(key string) {
-	if c.config == nil || !c.config.EnableGwNftableLbSvc || c.addOrUpdateGwNftableLbSvcQueue == nil || key == "" {
+	if c.config == nil || (!c.config.EnableGwNftableLbSvc && !c.config.EnableGwNftableSvcClusterIP) || c.addOrUpdateGwNftableLbSvcQueue == nil || key == "" {
 		return
 	}
 	klog.V(3).Infof("enqueue add/update gateway nftable lb service %s", key)
@@ -101,7 +107,7 @@ func gwNftableLbSvcChanged(oldSvc, newSvc *v1.Service) bool {
 }
 
 func (c *Controller) enqueueGwNftableLbServicesForNatGw(natGwName string) {
-	if c.config == nil || !c.config.EnableGwNftableLbSvc || natGwName == "" || c.svcIndexer == nil {
+	if c.config == nil || (!c.config.EnableGwNftableLbSvc && !c.config.EnableGwNftableSvcClusterIP) || natGwName == "" || c.svcIndexer == nil {
 		return
 	}
 	svcs, err := c.svcIndexer.ByIndex(IndexGwNftableLbServiceByGateway, natGwName)
@@ -121,7 +127,7 @@ func (c *Controller) enqueueGwNftableLbServicesForNatGw(natGwName string) {
 // learn about an EIP that appeared, became usable, became unusable, or is being deleted: an EIP
 // whose referencing records are never released cannot finish deleting.
 func (c *Controller) enqueueGwNftableLbServicesForEIP(eipName string) {
-	if c.config == nil || !c.config.EnableGwNftableLbSvc || eipName == "" || c.svcIndexer == nil {
+	if c.config == nil || (!c.config.EnableGwNftableLbSvc && !c.config.EnableGwNftableSvcClusterIP) || eipName == "" || c.svcIndexer == nil {
 		return
 	}
 	svcs, err := c.svcIndexer.ByIndex(IndexGwNftableLbServiceByEip, eipName)
@@ -137,7 +143,7 @@ func (c *Controller) enqueueGwNftableLbServicesForEIP(eipName string) {
 }
 
 func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
-	if !c.config.EnableGwNftableLbSvc {
+	if !c.config.EnableGwNftableLbSvc && !c.config.EnableGwNftableSvcClusterIP {
 		return nil
 	}
 
@@ -159,19 +165,20 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		return err
 	}
 
+	serveEIP, serveClusterIP := c.nftableLbSvcQualifies(cachedSvc)
 	// service being deleted or no longer qualifying: clean up owned rules (and clear the
 	// ingress IP we published, if any)
-	if !cachedSvc.DeletionTimestamp.IsZero() || !nftableLbSvcQualifies(cachedSvc) {
+	if !cachedSvc.DeletionTimestamp.IsZero() || (!serveEIP && !serveClusterIP) {
 		return c.cleanupNftableLbService(cachedSvc, namespace, name)
 	}
 
 	// The Service names its gateway; a LoadBalancer Service additionally takes its ingress IP
-	// from an EIP, which must belong to that gateway so both addresses of the Service port are
-	// served by one data plane.
+	// from an EIP, which must belong to that gateway so every enabled identity of the Service
+	// port is served by one data plane.
 	gwName := nftableLbSvcGateway(cachedSvc)
 	var eip *kubeovnv1.IptablesEIP
 	var eipName, eipIP string
-	if cachedSvc.Spec.Type == v1.ServiceTypeLoadBalancer {
+	if serveEIP {
 		eipName = cachedSvc.Annotations[util.EipAnnotation]
 		eip, err = c.GetEip(eipName)
 		if err != nil {
@@ -259,7 +266,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		return err
 	}
 
-	desired := buildDesiredNftableLbDnatRules(cachedSvc, eipName, gwName, endpointSlices, c.nftableLbBackendResolver(cachedSvc, natGw.Spec.Vpc))
+	desired := buildDesiredNftableLbDnatRulesForIdentities(cachedSvc, eipName, gwName, serveEIP, serveClusterIP, endpointSlices, c.nftableLbBackendResolver(cachedSvc, natGw.Spec.Vpc))
 	for _, record := range desired {
 		record.Labels[util.VpcDnatEPortLabel] = record.Spec.ExternalPort
 		if eip != nil {
@@ -270,9 +277,12 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 
 	// A share DNAT identity (EIP, external port and protocol) has one Service writer. When
 	// several Services declare it, the deterministic Service winner keeps it.
-	conflicted, err := c.resolveNftableLbConflicts(cachedSvc, key, desired)
-	if err != nil {
-		return err
+	conflicted := false
+	if serveEIP {
+		conflicted, err = c.resolveNftableLbConflicts(cachedSvc, key, desired)
+		if err != nil {
+			return err
+		}
 	}
 	// Service is the authoritative writer. Accounting records are synchronized only after the
 	// gateway data plane succeeds; record events never trigger NAT changes.
@@ -288,8 +298,19 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	}
 
 	// The Service already programmed the gateway, so record status is not a handoff condition.
-	if conflicted || cachedSvc.Spec.Type != v1.ServiceTypeLoadBalancer {
+	if conflicted {
 		return c.clearNftableLbSvcIngressIP(cachedSvc)
+	}
+	if !serveEIP {
+		// The EIP identity is disabled: the Service already published an ingress IP only while
+		// it had one, so it is cleared here and left alone when there was nothing to clear.
+		hadEIP := slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
+			return rule.Spec.EIP != ""
+		})
+		if hadEIP {
+			return c.clearNftableLbSvcIngressIP(cachedSvc)
+		}
+		return nil
 	}
 	if err = c.ensureNftableLbSvcIngressIP(cachedSvc, eipIP); err != nil {
 		klog.Errorf("failed to set ingress ip for nftable lb service %s: %v", key, err)
@@ -543,9 +564,9 @@ func (c *Controller) syncNftableLbRecords(svc *v1.Service, eipIP, gateway string
 }
 
 func (c *Controller) setNftableLbRecordStatus(record *kubeovnv1.IptablesDnatRule, eipIP, gateway string) error {
-	vip := eipIP
-	if vip == "" {
-		vip = record.Spec.ClusterIP
+	vip := record.Spec.ClusterIP
+	if record.Spec.EIP != "" {
+		vip = eipIP
 	}
 	updated := record.DeepCopy()
 	updated.Status.Ready = true
@@ -798,7 +819,15 @@ func (c *Controller) resolveNftableLbConflicts(svc *v1.Service, key string, desi
 	for name, rule := range desired {
 		id := nftableLbDnatIdentity(rule.Spec.EIP, rule.Spec.ExternalPort, rule.Spec.Protocol)
 		if _, conflicted := droppedIdentities[id]; conflicted {
-			delete(desired, name)
+			// Only the EIP identity is contested: a record that also carries the ClusterIP
+			// stays, minus the EIP fields, so the internal VIP keeps being served.
+			if rule.Spec.ClusterIP == "" {
+				delete(desired, name)
+				continue
+			}
+			rule.Spec.EIP = ""
+			delete(rule.Labels, util.EipV4IpLabel)
+			delete(rule.Labels, util.EipUIDLabel)
 		}
 	}
 
@@ -870,10 +899,28 @@ func endpointPortMatchesServicePort(port discoveryv1.EndpointPort, servicePort v
 // rule name; the name deterministically encodes the full identity so that an unchanged
 // backend always maps to the same rule (idempotent reconcile).
 func buildDesiredNftableLbDnatRules(svc *v1.Service, eipName, gateway string, endpointSlices []*discoveryv1.EndpointSlice, backendIP func(discoveryv1.Endpoint) (string, bool)) map[string]*kubeovnv1.IptablesDnatRule {
+	return buildDesiredNftableLbDnatRulesForIdentities(svc, eipName, gateway, true, true, endpointSlices, backendIP)
+}
+
+// buildDesiredNftableLbDnatRulesForIdentities derives the records of the identities the enabled
+// feature gates select. The ClusterIP identity is dropped when its gate is off, the EIP identity
+// when its gate is off or the Service names no EIP, and both fields stay on one record when both
+// are served: everything else (nft maps, hairpin, lo addresses, VIP routes) is derived from these
+// records, so the gates are applied here once.
+func buildDesiredNftableLbDnatRulesForIdentities(svc *v1.Service, eipName, gateway string, serveEIP, serveClusterIP bool, endpointSlices []*discoveryv1.EndpointSlice, backendIP func(discoveryv1.Endpoint) (string, bool)) map[string]*kubeovnv1.IptablesDnatRule {
 	desired := make(map[string]*kubeovnv1.IptablesDnatRule)
 
 	// The internal VIP the gateway programs with the same backends (see file header).
-	clusterIP := nftableLbSvcClusterIP(svc)
+	clusterIP := ""
+	if serveClusterIP {
+		clusterIP = nftableLbSvcClusterIP(svc)
+	}
+	if !serveEIP {
+		eipName = ""
+	}
+	if eipName == "" && clusterIP == "" {
+		return desired
+	}
 
 	// Translate the Service's client-IP session affinity into the share DNAT fields. All
 	// backends of one identity carry the same affinity settings, matching kube-proxy where
@@ -938,10 +985,9 @@ func buildDesiredNftableLbDnatRules(svc *v1.Service, eipName, gateway string, en
 						},
 					},
 					Spec: kubeovnv1.IptablesDnatRuleSpec{
-						// Both addresses of the Service port are recorded on the rule: the
-						// ClusterIP is the internal VIP the gateway holds on lo, EIP is the public
-						// one a LoadBalancer Service publishes. A ClusterIP Service has no EIP,
-						// so its rule carries only the ClusterIP; the gateway is recorded in its label.
+						// The enabled addresses of the Service port share one record: ClusterIP is
+						// the internal VIP the gateway holds on lo, while EIP is the public one a
+						// LoadBalancer Service publishes. Either field can be independently disabled.
 						EIP:                           eipName,
 						ClusterIP:                     clusterIP,
 						ExternalPort:                  externalPort,

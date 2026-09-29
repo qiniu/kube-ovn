@@ -547,7 +547,7 @@ kind-install-vpc-nat-gw:
 	@$(MAKE) kind-load-image-vpc-nat-gateway
 	# The gateway's nft share DNAT is off by default (the OVN load balancer is the default
 	# implementation): the vpc nat gateway e2e suite opts into it here.
-	@$(MAKE) ENABLE_NAT_GW=true ENABLE_LB=false ENABLE_GW_NFTABLE_LB_SVC=true CNI_CONFIG_PRIORITY=10 kind-install
+	@$(MAKE) ENABLE_NAT_GW=true ENABLE_LB=false ENABLE_GW_NFTABLE_LB_SVC=true ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=true CNI_CONFIG_PRIORITY=10 kind-install
 	@$(MAKE) kind-install-multus
 
 .PHONY: kind-install-kubevirt

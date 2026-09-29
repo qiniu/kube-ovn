@@ -132,7 +132,7 @@ spec:
           - --ls-dnat-mod-dl-dst={{- .Values.features.LS_DNAT_MOD_DL_DST }}
           - --ls-ct-skip-dst-lport-ips={{- .Values.features.LS_CT_SKIP_DST_LPORT_IPS }}
           - --pod-nic-type={{- .Values.networking.podNicType }}
-          - --enable-lb={{ ternary false .Values.features.enableLoadbalancer .Values.features.enableGwNftableLoadbalancerService }}
+          - --enable-lb={{ .Values.features.enableLoadbalancer }}
           - --enable-np={{- .Values.features.enableNetworkPolicies }}
           - --enable-eip-snat={{- .Values.networking.enableEipSnat }}
           - --enable-external-vpc={{- .Values.features.enableExternalVpcs }}
@@ -146,6 +146,9 @@ spec:
           - --enable-lb-svc={{- .Values.features.enableLoadbalancerService }}
           {{- if .Values.features.enableGwNftableLoadbalancerService }}
           - --enable-gw-nftable-lb-svc={{- .Values.features.enableGwNftableLoadbalancerService }}
+          {{- end }}
+          {{- if .Values.features.enableGwNftableServiceClusterIp }}
+          - --enable-gw-nftable-svc-cluster-ip={{- .Values.features.enableGwNftableServiceClusterIp }}
           {{- end }}
           - --enable-bgp-lb-vip={{- .Values.features.enableBgpLbVip }}
           - --keep-vm-ip={{- .Values.features.enableKeepVmIps }}

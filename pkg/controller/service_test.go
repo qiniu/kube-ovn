@@ -16,6 +16,19 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
+func TestUsesGwNftableLbService(t *testing.T) {
+	t.Parallel()
+
+	c := &Controller{config: &Configuration{EnableGwNftableLbSvc: true}}
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0"},
+	}, Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer}}
+	require.False(t, c.usesGwNftableLbService(svc), "a Service without an EIP must stay on the OVN path")
+
+	svc.Annotations[util.EipAnnotation] = "eip0"
+	require.True(t, c.usesGwNftableLbService(svc))
+}
+
 func Test_getVipIps(t *testing.T) {
 	t.Parallel()
 
@@ -210,7 +223,8 @@ func newBgpLbVipController(t *testing.T, vip *kubeovnv1.Vip, svc *v1.Service) *C
 	ctrl.config.KubeClient = fc.fakeController.config.KubeClient
 	if svc != nil {
 		_, err = ctrl.config.KubeClient.CoreV1().Services(svc.Namespace).Create(
-			context.Background(), svc, metav1.CreateOptions{})
+			context.Background(), svc, metav1.CreateOptions{},
+		)
 		if err != nil {
 			// already exists from fake construction — ignore
 			_ = err
@@ -302,7 +316,8 @@ func TestHandleAddBgpLbVipService(t *testing.T) {
 		require.NoError(t, ctrl.handleAddBgpLbVipService(key))
 
 		updated, err := ctrl.config.KubeClient.CoreV1().Services(ns).Get(
-			context.Background(), svcName, metav1.GetOptions{})
+			context.Background(), svcName, metav1.GetOptions{},
+		)
 		require.NoError(t, err)
 		require.Equal(t, []v1.LoadBalancerIngress{{IP: vipIP}}, updated.Status.LoadBalancer.Ingress)
 		// The speaker now gates on bgp-vip / allow-shared-ip directly;
@@ -355,7 +370,8 @@ func TestReconcileBgpLbVipServiceLocked(t *testing.T) {
 	require.NoError(t, ctrl.reconcileBgpLbVipServiceLocked(key, svc))
 
 	updated, err := ctrl.config.KubeClient.CoreV1().Services(ns).Get(
-		context.Background(), svcName, metav1.GetOptions{})
+		context.Background(), svcName, metav1.GetOptions{},
+	)
 	require.NoError(t, err)
 	require.Empty(t, updated.Spec.ExternalIPs)
 	require.Equal(t, []v1.LoadBalancerIngress{{IP: vipIP}}, updated.Status.LoadBalancer.Ingress)

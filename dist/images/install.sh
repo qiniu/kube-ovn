@@ -25,6 +25,7 @@ ENABLE_EXTERNAL_VPC=${ENABLE_EXTERNAL_VPC:-false}
 CNI_CONFIG_PRIORITY=${CNI_CONFIG_PRIORITY:-01}
 ENABLE_LB_SVC=${ENABLE_LB_SVC:-false}
 ENABLE_GW_NFTABLE_LB_SVC=${ENABLE_GW_NFTABLE_LB_SVC:-false}
+ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=${ENABLE_GW_NFTABLE_SVC_CLUSTER_IP:-false}
 ENABLE_BGP_LB_VIP=${ENABLE_BGP_LB_VIP:-false}
 ENABLE_NAT_GW=${ENABLE_NAT_GW:-true}
 ENABLE_KEEP_VM_IP=${ENABLE_KEEP_VM_IP:-true}
@@ -205,6 +206,7 @@ echo "Join Subnet CIDR:     $JOIN_CIDR"
 echo "Enable LB:            $ENABLE_LB"
 echo "Enable LB SVC:        $ENABLE_LB_SVC"
 echo "Enable GW NFT LB SVC: $ENABLE_GW_NFTABLE_LB_SVC"
+echo "Enable GW NFT SVC ClusterIP: $ENABLE_GW_NFTABLE_SVC_CLUSTER_IP"
 echo "Enable BGP LB VIP:    $ENABLE_BGP_LB_VIP"
 echo "Enable Networkpolicy: $ENABLE_NP"
 echo "Enable EIP and SNAT:  $ENABLE_EIP_SNAT"
@@ -5414,7 +5416,7 @@ spec:
           - --ls-dnat-mod-dl-dst=$LS_DNAT_MOD_DL_DST
           - --ls-ct-skip-dst-lport-ips=$LS_CT_SKIP_DST_LPORT_IPS
           - --pod-nic-type=$POD_NIC_TYPE
-          - --enable-lb=$(if [ "$ENABLE_GW_NFTABLE_LB_SVC" = true ]; then echo false; else echo "$ENABLE_LB"; fi)
+          - --enable-lb=$ENABLE_LB
           - --enable-np=$ENABLE_NP
           - --np-enforcement=$NP_ENFORCEMENT
           - --enable-eip-snat=$ENABLE_EIP_SNAT
@@ -5427,6 +5429,7 @@ spec:
           - --log_file_max_size=200
           - --enable-lb-svc=$ENABLE_LB_SVC
           - --enable-gw-nftable-lb-svc=$ENABLE_GW_NFTABLE_LB_SVC
+          - --enable-gw-nftable-svc-cluster-ip=$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP
           - --enable-bgp-lb-vip=$ENABLE_BGP_LB_VIP
           - --keep-vm-ip=$ENABLE_KEEP_VM_IP
           - --enable-metrics=$ENABLE_METRICS

@@ -156,6 +156,11 @@ func (c *Controller) handleUpdateEndpointSlice(key string) error {
 		klog.Error(err)
 		return err
 	}
+	if c.usesGwNftableLbService(cachedService) {
+		// The Service is served by the gateway nftables data plane, which consumes the same
+		// EndpointSlice events through its own queue; OVN must not program it as well.
+		return nil
+	}
 	svc := cachedService.DeepCopy()
 
 	var (

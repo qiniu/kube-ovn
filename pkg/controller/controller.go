@@ -80,13 +80,13 @@ const (
 // references, so the conflict resolver can find competing services in O(matched).
 func indexGwNftableLbServiceByEip(obj any) ([]string, error) {
 	svc, ok := obj.(*corev1.Service)
-	if !ok || !nftableLbSvcQualifies(svc) {
+	if !ok || !nftableLbSvcCandidate(svc) {
 		return nil, nil
 	}
 	// Only a LoadBalancer Service depends on an EIP (its ingress IP). A ClusterIP Service has
 	// none, so it is indexed under the gateway instead (see indexGwNftableLbServiceByGateway),
 	// which is what its data plane depends on.
-	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer || svc.Annotations[util.EipAnnotation] == "" {
 		return nil, nil
 	}
 	return []string{svc.Annotations[util.EipAnnotation]}, nil
@@ -96,7 +96,7 @@ func indexGwNftableLbServiceByEip(obj any) ([]string, error) {
 // instance replacement can wake exactly the Services it serves, whichever kind of Service they are.
 func indexGwNftableLbServiceByGateway(obj any) ([]string, error) {
 	svc, ok := obj.(*corev1.Service)
-	if !ok || !nftableLbSvcQualifies(svc) {
+	if !ok || !nftableLbSvcCandidate(svc) {
 		return nil, nil
 	}
 	return []string{svc.Annotations[util.VpcNatGatewayAnnotation]}, nil
@@ -1451,7 +1451,7 @@ func (c *Controller) startWorkers(ctx context.Context) {
 
 	// TODO: Consolidate the OVN LB workers below, including the WorkerNum-scaled workers,
 	// under a single EnableOvnLB condition instead of scattering the same gate.
-	if c.config.EnableGwNftableLbSvc {
+	if c.config.EnableGwNftableLbSvc || c.config.EnableGwNftableSvcClusterIP {
 		// Gateway mode consumes Service and EndpointSlice informer events through its own queue.
 		// Service informer startup Adds replay every live or finalizing Service, so accounting
 		// records never need to trigger or recover the Service reconcile.

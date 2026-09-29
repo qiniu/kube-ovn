@@ -58,9 +58,9 @@ networking:
   ENABLE_COMPACT: false
 
 func:
-  # ENABLE_LB_SVC requires ENABLE_LB (otherwise only a warning is logged and the flow does not work).
-  # Enabling ENABLE_GW_NFTABLE_LB_SVC starts the controller with --enable-lb=false, so it cannot be
-  # combined with ENABLE_LB and leaves ENABLE_LB_SVC without its prerequisite.
+  # ENABLE_LB_SVC requires ENABLE_LB (otherwise only a warning is logged and the flow does not work)
+  # and is mutually exclusive with ENABLE_GW_NFTABLE_LB_SVC and ENABLE_GW_NFTABLE_SVC_CLUSTER_IP.
+  # ENABLE_GW_NFTABLE_SVC_CLUSTER_IP is mutually exclusive with ENABLE_LB.
   # ENABLE_BGP_LB_VIP and ENABLE_LB_SVC are mutually exclusive.
   ENABLE_LB: true
   ENABLE_NP: true
@@ -69,6 +69,7 @@ func:
   HW_OFFLOAD: false
   ENABLE_LB_SVC: false
   ENABLE_GW_NFTABLE_LB_SVC: false
+  ENABLE_GW_NFTABLE_SVC_CLUSTER_IP: false
   ENABLE_BGP_LB_VIP: false
   ENABLE_KEEP_VM_IP: true
   LS_DNAT_MOD_DL_DST: true

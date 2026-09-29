@@ -172,7 +172,7 @@ func dedupSortedBackends(backends []string) []string {
 // owns beyond the share DNAT identity itself: the per-identity hairpin SNAT rules, the addresses
 // held on lo, and the VIP routes.
 func (c *Controller) gwNftableLbSvcEnabled() bool {
-	return c.config != nil && c.config.EnableGwNftableLbSvc
+	return c.config != nil && (c.config.EnableGwNftableLbSvc || c.config.EnableGwNftableSvcClusterIP)
 }
 
 // natGwVipRouteExternalIDs identifies the VPC policy routes this feature owns for one gateway.
