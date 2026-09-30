@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"testing"
@@ -15,15 +16,18 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	kubeovnfake "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned/fake"
 	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -1353,8 +1357,9 @@ func newNftableLbSvcOwnershipFixture() *nftableLbSvcOwnershipFixture {
 		namespace: namespace,
 		gw:        &kubeovnv1.VpcNatGateway{ObjectMeta: metav1.ObjectMeta{Name: gwName, UID: "gw-uid"}, Spec: kubeovnv1.VpcNatGatewaySpec{Vpc: vpcName, Subnet: subnetName}},
 		eip: &kubeovnv1.IptablesEIP{
-			ObjectMeta: metav1.ObjectMeta{Name: eipName}, Spec: kubeovnv1.IptablesEIPSpec{NatGwDp: gwName, V4ip: "172.20.0.5"},
-			Status: kubeovnv1.IptablesEIPStatus{IP: "172.20.0.5"},
+			ObjectMeta: metav1.ObjectMeta{Name: eipName, UID: "owned-eip-uid"},
+			Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: gwName, V4ip: "172.20.0.5"},
+			Status:     kubeovnv1.IptablesEIPStatus{IP: "172.20.0.5"},
 		},
 		vpc:    &kubeovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: vpcName}, Status: kubeovnv1.VpcStatus{TCPLoadBalancer: "vpc-tcp-load", TCPSessionLoadBalancer: "vpc-tcp-sess"}},
 		subnet: &kubeovnv1.Subnet{ObjectMeta: metav1.ObjectMeta{Name: subnetName}, Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Protocol: kubeovnv1.ProtocolIPv4, Vpc: vpcName, CIDRBlock: "10.0.7.0/24", Gateway: "10.0.7.1"}},
@@ -1642,6 +1647,83 @@ func Test_handleAddOrUpdateGwNftableLbService_clusterIPService(t *testing.T) {
 		metav1.ListOptions{LabelSelector: util.NftableLbSvcNameLabel + "=" + svcName})
 	require.NoError(t, err)
 	require.Empty(t, rules.Items)
+}
+
+// Test_handleAddOrUpdateGwNftableLbService_claimBeforeRule pins the write order that keeps
+// programmed share DNAT state accountable: the claim is persisted before the gateway is touched,
+// so a record create rejected by admission fails the pass with an untouched data plane instead of
+// an orphaned rule cleanup can never find. Ready and the ingress IP land only after the data plane
+// converged.
+func Test_handleAddOrUpdateGwNftableLbService_claimBeforeRule(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	// skip the finalizer-claim pass: this test drives the programming pass directly
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		EndpointSlices: []*discoveryv1.EndpointSlice{f.slice},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{f.eip},
+		Pods:           gatewayPods("owned-gw", "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.resetIptablesEipQueue = newTypedRateLimitingQueue[string]("test-reset-eip", nil)
+	t.Cleanup(c.resetIptablesEipQueue.ShutDown)
+
+	var execs []string
+	c.execRulesInPod = func(_ *v1.Pod, operation string, _ []string) error {
+		execs = append(execs, operation)
+		return nil
+	}
+
+	// Simulated admission rejection of the accounting record (the webhook conflict check). The
+	// captured claim must not carry status: Ready is published only after the data plane converged.
+	// The mock OVN client has no expectations yet, so any NB call fails the test on its own.
+	rejectRecords := true
+	var claimed *kubeovnv1.IptablesDnatRule
+	c.config.KubeOvnClient.(*kubeovnfake.Clientset).PrependReactor("create", "iptables-dnat-rules",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			claimed = action.(k8stesting.CreateAction).GetObject().(*kubeovnv1.IptablesDnatRule)
+			if rejectRecords {
+				return true, nil, errors.New("dnat rejected: conflicting identity")
+			}
+			return false, nil, nil
+		})
+
+	key := f.namespace + "/" + f.svc.Name
+	require.Error(t, c.handleAddOrUpdateGwNftableLbService(key))
+	require.NotNil(t, claimed)
+	require.False(t, claimed.Status.Ready)
+	require.Empty(t, execs, "a rejected claim must stop the pass before the gateway is touched")
+
+	externalIDs := natGwVipRouteExternalIDs("owned-gw")
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority, externalIDs, false).Return(nil, nil)
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, externalIDs).Return(nil).Times(2)
+
+	rejectRecords = false
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(key))
+	require.Contains(t, execs, natGwNftDnatMapAdd)
+	require.Contains(t, execs, natGwVipHairpinAdd)
+	require.Contains(t, execs, natGwVipAddrSync)
+
+	rules, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().List(context.Background(),
+		metav1.ListOptions{LabelSelector: util.NftableLbSvcNameLabel + "=" + f.svc.Name})
+	require.NoError(t, err)
+	require.Len(t, rules.Items, 1)
+	record := rules.Items[0]
+	require.True(t, record.Status.Ready)
+	require.Equal(t, "172.20.0.5", record.Status.V4ip)
+	require.Equal(t, "owned-eip-uid", record.Labels[util.EipUIDLabel], "the persisted claim carries the EIP UID")
+
+	updated, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, []v1.LoadBalancerIngress{{IP: "172.20.0.5"}}, updated.Status.LoadBalancer.Ingress)
 }
 
 func TestClearNftableLbSvcIngressIP(t *testing.T) {

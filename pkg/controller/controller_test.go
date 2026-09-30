@@ -238,6 +238,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 	podInformer := kubeInformerFactory.Core().V1().Pods()
 	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
 	configMapInformer := kubeInformerFactory.Core().V1().ConfigMaps()
+	endpointSliceInformer := kubeInformerFactory.Discovery().V1().EndpointSlices()
 
 	nadInformerFactory := nadinformers.NewSharedInformerFactory(nadClient, 0)
 	nadInformer := nadInformerFactory.K8sCniCncfIo().V1().NetworkAttachmentDefinitions()
@@ -277,6 +278,7 @@ func newFakeControllerWithOptions(t *testing.T, opts *FakeControllerOptions) (*f
 		svcIndexer:              serviceInformer.Informer().GetIndexer(),
 		namespacesLister:        namespaceInformer.Lister(),
 		podsLister:              podInformer.Lister(),
+		endpointSlicesLister:    endpointSliceInformer.Lister(),
 		nodesLister:             nodeInformer.Lister(),
 		configMapsLister:        configMapInformer.Lister(),
 		vpcsLister:              vpcInformer.Lister(),

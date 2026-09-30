@@ -37,6 +37,9 @@ import (
 //   - One IptablesDnatRule record is kept per Service port/backend so operators can query the
 //     programmed forwarding in one layer and EIP accounting continues to work. A type=share
 //     object is only this ledger: its add/update/delete events never write or remove NAT state.
+//     The write order is claim, rule, Ready: a record is persisted before the gateway rule it
+//     accounts for, flips Ready only after the data plane converged, and a stale record is
+//     retired only after its rule is gone, so cleanup always finds a claim for what exists.
 //   - The Kube-OVN controller finalizer claims the whole data plane. Cleanup removes nft identities, hairpin,
 //     loopback VIPs and routes, then deletes the records and finally releases the Service.
 //   - EIP, Pod and ordinary gateway events do not trigger this controller. Their state is read
@@ -284,16 +287,23 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 			return err
 		}
 	}
-	// Service is the authoritative writer. Accounting records are synchronized only after the
-	// gateway data plane succeeds; record events never trigger NAT changes.
+	// The Service is the authoritative writer; record events never trigger NAT changes. Write the
+	// claim before the rule it covers (CODE_STYLE.md): a rejected or half-finished record sync
+	// must never leave programmed share DNAT state that no record accounts for, because cleanup
+	// would find no ledger for it and release the Service finalizer anyway. A failed claim aborts
+	// the pass before the gateway is touched; a failed program keeps the claims for the retry.
 	existing, err := c.existingNftableLbSvcRules(namespace, name)
+	if err != nil {
+		return err
+	}
+	live, err := c.claimNftableLbRecords(cachedSvc, desired, existing)
 	if err != nil {
 		return err
 	}
 	if err = c.programNftableLbServiceDirect(cachedSvc, natGw.Name, eipIP, desired, existing); err != nil {
 		return err
 	}
-	if err = c.syncNftableLbRecords(cachedSvc, eipIP, gwName, desired, existing); err != nil {
+	if err = c.settleNftableLbRecords(eipIP, gwName, desired, existing, live); err != nil {
 		return err
 	}
 
@@ -514,49 +524,72 @@ func buildNftableLbPrograms(records map[string]*kubeovnv1.IptablesDnatRule, eipI
 	return programs
 }
 
-// syncNftableLbRecords mirrors the Service desired state for inspection and EIP accounting.
-// Records are plain data: update/create desired records and delete stale ones synchronously.
-func (c *Controller) syncNftableLbRecords(svc *v1.Service, eipIP, gateway string,
+// claimNftableLbRecords persists the accounting records of the desired identities before the
+// gateway sees the rules they cover: a share DNAT rule must never exist without a record that
+// accounts for it (and carries the EIP's UID claim). Records are written without status; Ready
+// is published by settleNftableLbRecords once the data plane converged. It returns the live
+// record object for each desired name a status can be published for.
+func (c *Controller) claimNftableLbRecords(svc *v1.Service,
 	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule,
+) (map[string]*kubeovnv1.IptablesDnatRule, error) {
+	client := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules()
+	existingByName := make(map[string]*kubeovnv1.IptablesDnatRule, len(existing))
+	for _, current := range existing {
+		existingByName[current.Name] = current
+	}
+	live := make(map[string]*kubeovnv1.IptablesDnatRule, len(desired))
+	for name, want := range desired {
+		current := existingByName[name]
+		switch {
+		case current == nil:
+			created, err := client.Create(context.Background(), want, metav1.CreateOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create nftable LB record %s for Service %s/%s: %w", name, svc.Namespace, svc.Name, err)
+			}
+			live[name] = created
+		case !current.DeletionTimestamp.IsZero():
+			// The user is removing an accounting object. It has no data-plane semantics; keep its
+			// identity programmed, do not recreate the record in this pass.
+			continue
+		default:
+			if !nftableLbDnatSpecEqual(&current.Spec, &want.Spec) || !maps.Equal(current.Labels, want.Labels) || len(current.Finalizers) != 0 {
+				updated := current.DeepCopy()
+				updated.Spec = want.Spec
+				updated.Labels = maps.Clone(want.Labels)
+				updated.Finalizers = nil
+				var err error
+				current, err = client.Update(context.Background(), updated, metav1.UpdateOptions{})
+				if err != nil {
+					return nil, fmt.Errorf("failed to update nftable LB record %s: %w", current.Name, err)
+				}
+			}
+			live[name] = current
+		}
+	}
+	return live, nil
+}
+
+// settleNftableLbRecords runs once the gateway holds the desired data plane: it publishes Ready
+// status for the claimed records, then retires the records the Service no longer wants. A stale
+// record is deleted only here so its claim outlives the rule it covered.
+func (c *Controller) settleNftableLbRecords(eipIP, gateway string,
+	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule, live map[string]*kubeovnv1.IptablesDnatRule,
 ) error {
 	client := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules()
 	for _, current := range existing {
-		want, ok := desired[current.Name]
-		if !ok {
+		if _, ok := desired[current.Name]; !ok {
 			if err := client.Delete(context.Background(), current.Name, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
 				return fmt.Errorf("failed to delete stale nftable LB record %s: %w", current.Name, err)
 			}
-			continue
 		}
-		if !current.DeletionTimestamp.IsZero() {
-			// The user is removing an accounting object. It has no data-plane semantics; do not
-			// block Service reconciliation or attempt to recreate it in this pass.
-			delete(desired, current.Name)
+	}
+	for name := range desired {
+		record, ok := live[name]
+		if !ok {
+			// terminating record: its status is published by a later pass once it was recreated.
 			continue
-		}
-		record := current
-		if !nftableLbDnatSpecEqual(&current.Spec, &want.Spec) || !maps.Equal(current.Labels, want.Labels) || len(current.Finalizers) != 0 {
-			updated := current.DeepCopy()
-			updated.Spec = want.Spec
-			updated.Labels = maps.Clone(want.Labels)
-			updated.Finalizers = nil
-			var err error
-			record, err = client.Update(context.Background(), updated, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to update nftable LB record %s: %w", current.Name, err)
-			}
 		}
 		if err := c.setNftableLbRecordStatus(record, eipIP, gateway); err != nil {
-			return err
-		}
-		delete(desired, current.Name)
-	}
-	for _, record := range desired {
-		created, err := client.Create(context.Background(), record, metav1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to create nftable LB record %s for Service %s/%s: %w", record.Name, svc.Namespace, svc.Name, err)
-		}
-		if err = c.setNftableLbRecordStatus(created, eipIP, gateway); err != nil {
 			return err
 		}
 	}
