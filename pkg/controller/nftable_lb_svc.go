@@ -17,6 +17,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
@@ -612,7 +613,12 @@ func (c *Controller) claimNftableLbRecords(svc *v1.Service,
 			live[name] = created
 		case !current.DeletionTimestamp.IsZero():
 			// The user is removing an accounting object. It has no data-plane semantics; keep its
-			// identity programmed, do not recreate the record in this pass.
+			// identity programmed, do not recreate the record in this pass. A legacy record also
+			// carries the pre-upgrade controller finalizer that nobody clears any more: migrate it
+			// off so the record can finish terminating instead of blocking its recreate forever.
+			if err := c.releaseNftableLbRecordFinalizers(current); err != nil {
+				return nil, err
+			}
 			continue
 		default:
 			if !nftableLbDnatSpecEqual(&current.Spec, &want.Spec) || !maps.Equal(current.Labels, want.Labels) || len(current.Finalizers) != 0 {
@@ -632,6 +638,32 @@ func (c *Controller) claimNftableLbRecords(svc *v1.Service,
 	return live, nil
 }
 
+// releaseNftableLbRecordFinalizers removes the controller finalizers from a Service accounting
+// record. Pre-upgrade share rules carry them, and every share DNAT worker that used to clear
+// them early-returns for these records now: once the Service ran the data-plane cleanup for the
+// record's identities, nobody else will free the record, and its stuck claim would hold its EIP
+// forever.
+func (c *Controller) releaseNftableLbRecordFinalizers(record *kubeovnv1.IptablesDnatRule) error {
+	if !slices.Contains(record.Finalizers, util.DepreciatedFinalizerName) &&
+		!slices.Contains(record.Finalizers, util.KubeOVNControllerFinalizer) {
+		return nil
+	}
+	updated := record.DeepCopy()
+	updated.Finalizers = slices.DeleteFunc(updated.Finalizers, func(finalizer string) bool {
+		return finalizer == util.DepreciatedFinalizerName || finalizer == util.KubeOVNControllerFinalizer
+	})
+	patch, err := util.GenerateMergePatchPayload(record, updated)
+	if err != nil {
+		return err
+	}
+	_, err = c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Patch(context.Background(), record.Name,
+		types.MergePatchType, patch, metav1.PatchOptions{}, "")
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("failed to migrate legacy finalizers of nftable LB record %s: %w", record.Name, err)
+	}
+	return nil
+}
+
 // settleNftableLbRecords runs once the gateway holds the desired data plane: it publishes Ready
 // status for the claimed records, then retires the records the Service no longer wants. A stale
 // record is deleted only here so its claim outlives the rule it covered.
@@ -640,10 +672,17 @@ func (c *Controller) settleNftableLbRecords(eipIP, gateway string,
 ) error {
 	client := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules()
 	for _, current := range existing {
-		if _, ok := desired[current.Name]; !ok {
-			if err := client.Delete(context.Background(), current.Name, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete stale nftable LB record %s: %w", current.Name, err)
-			}
+		if _, ok := desired[current.Name]; ok {
+			continue
+		}
+		if err := client.Delete(context.Background(), current.Name, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete stale nftable LB record %s: %w", current.Name, err)
+		}
+		// The record's identities were removed in the program phase above, so the legacy
+		// controller finalizer is migrated off: nobody else clears it, and the stuck record
+		// would hold its EIP claim forever.
+		if err := c.releaseNftableLbRecordFinalizers(current); err != nil {
+			return err
 		}
 	}
 	for name := range desired {
@@ -830,6 +869,11 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 				continue
 			}
 			return fmt.Errorf("failed to delete nftable lb dnat record %s for service %s/%s: %w", rule.Name, namespace, name, err)
+		}
+		// The identities the record accounted for are removed above; migrate the legacy
+		// controller finalizer off, or the record stays terminating forever.
+		if err = c.releaseNftableLbRecordFinalizers(rule); err != nil {
+			return err
 		}
 	}
 	if svc == nil || !slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer) {

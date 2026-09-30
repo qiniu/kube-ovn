@@ -15,10 +15,13 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/set"
 
+	kubeovnfake "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned/fake"
 	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 )
 
@@ -235,4 +238,187 @@ func Test_handleUpdateIptablesEip_holdsWhileServiceClaims(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, kept.Finalizers, util.KubeOVNControllerFinalizer,
 		"the eip finalizer must hold while a live service still declares the eip")
+}
+
+// honorFinalizersOnDnatDelete makes the fake clientset honor finalizers on delete like the API
+// server does: an object with finalizers transitions to terminating instead of disappearing. It
+// goes through the tracker directly because the fake's own mutex is not reentrant.
+func honorFinalizersOnDnatDelete(client *kubeovnfake.Clientset) {
+	tracker := client.Tracker()
+	gvr := kubeovnv1.SchemeGroupVersion.WithResource("iptables-dnat-rules")
+	client.PrependReactor("delete", "iptables-dnat-rules", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		name := action.(k8stesting.DeleteAction).GetName()
+		obj, err := tracker.Get(gvr, "", name)
+		if err != nil {
+			return true, nil, err
+		}
+		rule, ok := obj.(*kubeovnv1.IptablesDnatRule)
+		if !ok || len(rule.Finalizers) == 0 {
+			// no finalizers: fall through to the default tracker delete, which drops the object
+			return false, nil, nil
+		}
+		updated := rule.DeepCopy()
+		now := metav1.Now()
+		updated.DeletionTimestamp = &now
+		return true, updated, tracker.Update(gvr, updated, "")
+	})
+}
+
+// Test_claimNftableLbRecords_migratesTerminatingRecord pins the stuck-Terminating recovery for a
+// record that re-entered desired: the claim keeps its identity but migrates the legacy controller
+// finalizers off so the record finishes terminating and a later pass can recreate it.
+func Test_claimNftableLbRecords_migratesTerminatingRecord(t *testing.T) {
+	t.Parallel()
+
+	// Seed through the typed client: the fake tracker's key for objects passed to
+	// NewSimpleClientset differs from the one the typed client uses, which would make every
+	// follow-up call a silent no-op.
+	client := kubeovnfake.NewSimpleClientset()
+	honorFinalizersOnDnatDelete(client)
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "legacy-record",
+			Finalizers: []string{util.DepreciatedFinalizerName, util.KubeOVNControllerFinalizer},
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: "default", util.NftableLbSvcNameLabel: "web", util.NftableLbSvcRecordLabel: "true",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip0", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.0.5", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	if _, err := client.KubeovnV1().IptablesDnatRules().Create(context.Background(), record, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.KubeovnV1().IptablesDnatRules().Delete(context.Background(), record.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	terminating, err := client.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, terminating.DeletionTimestamp.IsZero(), "the finalizer-honoring delete keeps the record terminating")
+	client.ClearActions()
+
+	c := &Controller{config: &Configuration{KubeOvnClient: client}}
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}}
+	want := terminating.DeepCopy()
+	want.DeletionTimestamp = nil
+	want.Finalizers = nil
+	want.ResourceVersion = ""
+
+	live, err := c.claimNftableLbRecords(svc, map[string]*kubeovnv1.IptablesDnatRule{record.Name: want},
+		[]*kubeovnv1.IptablesDnatRule{terminating})
+	require.NoError(t, err)
+	require.Empty(t, live, "a terminating record is not claimed this pass")
+
+	actions := client.Actions()
+	require.True(t, testHasAction(actions, "patch"),
+		"the legacy finalizers were migrated off so the record can finish terminating")
+	require.False(t, testHasAction(actions, "create"), "the stuck record's name is not recreated while it exists")
+}
+
+// Test_settleNftableLbRecords_freesLegacyFinalizedRecords pins the stale-retirement closing path:
+// deleting a record that still carries the pre-upgrade controller finalizer does not leave it
+// terminating forever - the Service is its only owner and clears the finalizer after the identity
+// cleanup.
+func Test_settleNftableLbRecords_freesLegacyFinalizedRecords(t *testing.T) {
+	t.Parallel()
+
+	client := kubeovnfake.NewSimpleClientset()
+	honorFinalizersOnDnatDelete(client)
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "legacy-stale",
+			Finalizers: []string{util.KubeOVNControllerFinalizer},
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: "default", util.NftableLbSvcNameLabel: "web", util.NftableLbSvcRecordLabel: "true",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip0", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.0.5", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	if _, err := client.KubeovnV1().IptablesDnatRules().Create(context.Background(), record, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := client.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	client.ClearActions()
+
+	c := &Controller{config: &Configuration{KubeOvnClient: client}}
+	require.NoError(t, c.settleNftableLbRecords("203.0.113.10", "gw0", nil,
+		[]*kubeovnv1.IptablesDnatRule{created}, nil))
+
+	actions := client.Actions()
+	require.True(t, testHasAction(actions, "delete"), "the stale record got its delete request")
+	require.True(t, testHasAction(actions, "patch"), "the stuck record's legacy finalizer was migrated off after it")
+	after, err := client.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, after.DeletionTimestamp.IsZero(), "the record is terminating")
+	require.Empty(t, after.Finalizers, "the stuck record is freed once its identities were cleaned")
+}
+
+// testHasAction reports whether the fake clientset recorded an action with the given verb.
+func testHasAction(actions []k8stesting.Action, verb string) bool {
+	for _, action := range actions {
+		if action.GetVerb() == verb {
+			return true
+		}
+	}
+	return false
+}
+
+// Test_cleanupNftableLbService_migratesLegacyFinalizers pins the closing path for a Service that
+// never gained the annotations of the new design: its leftover share records from before the
+// upgrade keep the controller finalizer the share DNAT workers no longer clear, and cleanup must
+// migrate it off after removing the identities the records account for.
+func Test_cleanupNftableLbService_migratesLegacyFinalizers(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	terminating := metav1.Now()
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	f.svc.DeletionTimestamp = &terminating
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "upgraded-record",
+			Finalizers: []string{util.KubeOVNControllerFinalizer},
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: f.namespace, util.NftableLbSvcNameLabel: f.svc.Name,
+				util.NftableLbSvcUIDLabel: string(f.svc.UID), util.NftableLbSvcRecordLabel: "true",
+				util.VpcNatGatewayNameLabel: f.gw.Name,
+				util.EipV4IpLabel:           "172.20.0.5", util.EipUIDLabel: "owned-eip-uid",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "owned-eip", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.7.2", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:              []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:           []*kubeovnv1.Subnet{f.subnet},
+		Services:          []*v1.Service{f.svc},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{f.eip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{record},
+		Pods:              gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.execRulesInPod = func(_ *v1.Pod, _ string, _ []string) error { return nil }
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return(nil, nil).AnyTimes()
+	client, ok := c.config.KubeOvnClient.(*kubeovnfake.Clientset)
+	require.True(t, ok)
+	honorFinalizersOnDnatDelete(client)
+
+	require.NoError(t, c.cleanupNftableLbService(f.svc, f.namespace, f.svc.Name))
+
+	kept, err := client.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.False(t, kept.DeletionTimestamp.IsZero(), "the record is terminating")
+	require.Empty(t, kept.Finalizers, "the legacy finalizer is migrated off after the identity cleanup, freeing the record")
+	cleaned, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, cleaned.Finalizers, "the Service itself is released")
 }
