@@ -86,8 +86,6 @@ func nftableLbSvcGateway(svc *v1.Service) string {
 	return svc.Annotations[util.VpcNatGatewayAnnotation]
 }
 
-// enqueueGwNftableLbService enqueues a Service only while gateway mode is selected. Qualification
-// and cleanup decisions stay in the handler so a Service that stops qualifying releases its rules.
 // nftableLbSvcIntentClaimsEip reports whether, from the controller's point of view, a live
 // Service still claims share DNAT on this EIP: the Service qualifies and its gateway exists and
 // is not terminating, and the EIP itself is wired. The accounting records documenting such a
@@ -124,8 +122,12 @@ func (c *Controller) nftableLbSvcIntentClaimsEip(eip *kubeovnv1.IptablesEIP) boo
 	return false
 }
 
+// enqueueGwNftableLbService enqueues a Service regardless of the feature gates: with both
+// gates off nothing new is programmed, but a Service carrying the feature's finalizer and
+// records must still reach the cleanup path, which is their only owner. Qualification and
+// cleanup decisions stay in the handler so a Service that stops qualifying releases its rules.
 func (c *Controller) enqueueGwNftableLbService(key string) {
-	if c.config == nil || (!c.config.EnableGwNftableLbSvc && !c.config.EnableGwNftableSvcClusterIP) || c.addOrUpdateGwNftableLbSvcQueue == nil || key == "" {
+	if c.addOrUpdateGwNftableLbSvcQueue == nil || key == "" {
 		return
 	}
 	klog.V(3).Infof("enqueue add/update gateway nftable lb service %s", key)
@@ -183,10 +185,9 @@ func (c *Controller) enqueueGwNftableLbServicesForEIP(eipName string) {
 }
 
 func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
-	if !c.config.EnableGwNftableLbSvc && !c.config.EnableGwNftableSvcClusterIP {
-		return nil
-	}
-
+	// With both feature gates off still run: nftableLbSvcQualifies qualifies nothing then, so
+	// the reconcile is a teardown-only path for Services the feature had managed, and their
+	// controller finalizer would never be released if this handler refused to work.
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))

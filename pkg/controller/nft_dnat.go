@@ -391,11 +391,9 @@ func (c *Controller) syncNatGwVipState(gwName string, applying *kubeovnv1.Iptabl
 func (c *Controller) syncNatGwVipStateForService(gwName string, applying *kubeovnv1.IptablesDnatRule,
 	owner string, records map[string]*kubeovnv1.IptablesDnatRule, eipIP string,
 ) error {
-	if !c.gwNftableLbSvcEnabled() {
-		// The feature owns the VIP state exclusively, and with it disabled it programs nothing: the
-		// rules it generated are not reconciled either.
-		return nil
-	}
+	// With the feature disabled no route is programmed, but the teardown of already-managed
+	// Services still removes the routes their records left behind: applyNatGwVipStateForService
+	// always deletes and programs only while the feature is enabled.
 	desired, _, err := c.desiredNatGwVipStateForService(gwName, applying, owner, records, eipIP)
 	if err != nil {
 		return err
@@ -434,6 +432,9 @@ func (c *Controller) applyNatGwVipStateForService(gwName string, desired map[str
 	if err != nil {
 		return fmt.Errorf("failed to list vip routes of nat gw %s: %w", gwName, err)
 	}
+	// With the feature disabled the sync is a teardown path only: routes with no claim are
+	// removed, routes that still have one are left alone, and nothing is created or rewritten.
+	program := c.gwNftableLbSvcEnabled()
 	for _, policy := range existing {
 		if _, wanted := desired[policy.Match]; !wanted {
 			if err = c.OVNNbClient.DeleteLogicalRouterPolicyByUUID(gw.Spec.Vpc, policy.UUID); err != nil {
@@ -444,7 +445,7 @@ func (c *Controller) applyNatGwVipStateForService(gwName string, desired map[str
 		}
 		current := append([]string(nil), policy.Nexthops...)
 		sort.Strings(current)
-		if policy.Action != string(kubeovnv1.PolicyRouteActionReroute) || !slices.Equal(current, nextHops) {
+		if program && (policy.Action != string(kubeovnv1.PolicyRouteActionReroute) || !slices.Equal(current, nextHops)) {
 			policy.Action, policy.Nexthops, policy.BFDSessions = string(kubeovnv1.PolicyRouteActionReroute), nextHops, nil
 			if err = c.OVNNbClient.UpdateLogicalRouterPolicy(policy, &policy.Action, &policy.Nexthops, &policy.BFDSessions); err != nil {
 				return fmt.Errorf("failed to update vip route %s of nat gw %s: %w", policy.Match, gwName, err)
@@ -454,6 +455,9 @@ func (c *Controller) applyNatGwVipStateForService(gwName string, desired map[str
 		delete(desired, policy.Match)
 	}
 
+	if !program {
+		return nil
+	}
 	for match := range desired {
 		if err = c.addPolicyRouteToVpc(gw.Spec.Vpc, &kubeovnv1.PolicyRoute{
 			Priority:  util.NatGatewayVipPolicyPriority,

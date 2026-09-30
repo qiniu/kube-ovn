@@ -25,6 +25,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	kubeovnfake "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned/fake"
@@ -1283,6 +1284,9 @@ func Test_syncNatGwVipState(t *testing.T) {
 
 // Test_syncNatGwVipStateDisabled pins the feature gate: with --enable-gw-nftable-lb-svc off the
 // feature owns no VIP, so the sync must not touch OVN at all (the mock client fails any call).
+// Test_syncNatGwVipStateDisabled pins the feature-off semantics: the sync is a teardown path
+// only. Unclaimed routes are removed (Services being deleted must be able to release their VIP
+// routes), while claimed routes are left as-is and nothing is created or rewritten.
 func Test_syncNatGwVipStateDisabled(t *testing.T) {
 	t.Parallel()
 
@@ -1293,8 +1297,99 @@ func Test_syncNatGwVipStateDisabled(t *testing.T) {
 	})
 	require.NoError(t, err)
 	fc.fakeController.config.EnableGwNftableLbSvc = false
+	fc.fakeController.config.EnableGwNftableSvcClusterIP = false
+
+	stale := &ovnnb.LogicalRouterPolicy{UUID: "stale-uuid", Priority: util.NatGatewayVipPolicyPriority, Match: "ip4.dst == 10.96.1.9"}
+	// Claimed by rule-a, but its action drifted: with the feature off it is left alone.
+	drifted := &ovnnb.LogicalRouterPolicy{
+		UUID: "drifted-uuid", Priority: util.NatGatewayVipPolicyPriority, Match: "ip4.dst == 10.96.1.5",
+		Action: "allow", Nexthops: []string{"10.0.7.254"},
+	}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies("vpc0", util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs("gw0"), false).Return([]*ovnnb.LogicalRouterPolicy{stale, drifted}, nil)
+	fc.mockOvnClient.EXPECT().DeleteLogicalRouterPolicyByUUID("vpc0", "stale-uuid").Return(nil)
+	// The strict mock fails the test on any update or add: nothing may be programmed once the
+	// feature is disabled.
 
 	require.NoError(t, fc.fakeController.syncNatGwVipState("gw0", nil))
+}
+
+// Test_enqueueGwNftableLbService_gatesOffStillEnqueues pins the exit path's trigger: with both
+// feature gates off, a Service that still carries the feature's finalizer and records must be
+// enqueued anyway, because this queue is the only owner that can release either.
+func Test_enqueueGwNftableLbService_gatesOffStillEnqueues(t *testing.T) {
+	t.Parallel()
+
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	t.Cleanup(queue.ShutDown)
+	c := &Controller{
+		config:                         &Configuration{EnableGwNftableLbSvc: false, EnableGwNftableSvcClusterIP: false},
+		addOrUpdateGwNftableLbSvcQueue: queue,
+	}
+	c.enqueueGwNftableLbService("default/left-behind")
+	require.Equal(t, 1, queue.Len())
+}
+
+// Test_handleAddOrUpdateGwNftableLbService_gatesOffStillCleansUp reproduces the shutdown sequence:
+// the feature was on, the gates were flipped to false and the controller restarted, and the user
+// now deletes a Service the feature manages. Cleanup must still run: remove the identities from
+// the gateway, retire the records, withdraw the VIP routes, and release the Service finalizer,
+// without programming anything new.
+func Test_handleAddOrUpdateGwNftableLbService_gatesOffStillCleansUp(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	terminating := metav1.Now()
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	f.svc.DeletionTimestamp = &terminating
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "leftover-record",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: f.namespace, util.NftableLbSvcNameLabel: f.svc.Name,
+				util.NftableLbSvcUIDLabel: string(f.svc.UID), util.NftableLbSvcRecordLabel: "true",
+				util.VpcNatGatewayNameLabel: f.gw.Name,
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "owned-eip", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.7.2", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:              []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:           []*kubeovnv1.Subnet{f.subnet},
+		Services:          []*v1.Service{f.svc},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{f.eip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{record},
+		Pods:              gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	// both gates off: the feature is disabled
+	c.config.EnableGwNftableLbSvc = false
+	c.config.EnableGwNftableSvcClusterIP = false
+
+	var execs []string
+	c.execRulesInPod = func(_ *v1.Pod, operation string, _ []string) error {
+		execs = append(execs, operation)
+		return nil
+	}
+	staleRoute := &ovnnb.LogicalRouterPolicy{UUID: "leftover-uuid", Priority: util.NatGatewayVipPolicyPriority, Match: "ip4.dst == 10.96.1.5"}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return([]*ovnnb.LogicalRouterPolicy{staleRoute}, nil)
+	fc.mockOvnClient.EXPECT().DeleteLogicalRouterPolicyByUUID(util.DefaultVpc, "leftover-uuid").Return(nil)
+	// The strict mock fails the test on any route add or update: disabled means teardown only.
+
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+f.svc.Name))
+
+	require.Contains(t, execs, natGwNftDnatMapDel, "the leftover identities are removed from the gateway")
+	require.Contains(t, execs, natGwVipHairpinDel)
+	require.Contains(t, execs, natGwVipAddrSync, "the lo VIPs are released")
+	_, err = c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.True(t, k8serrors.IsNotFound(err), "the leftover accounting record is retired")
+	svc, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, svc.Finalizers, "the Service finalizer is released so the deletion can finish")
 }
 
 // TestHandleAddOrUpdateVpcNatGwSyncsVipRoutes pins the gateway side convergence of the share DNAT

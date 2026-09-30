@@ -1451,12 +1451,11 @@ func (c *Controller) startWorkers(ctx context.Context) {
 
 	// TODO: Consolidate the OVN LB workers below, including the WorkerNum-scaled workers,
 	// under a single EnableOvnLB condition instead of scattering the same gate.
-	if c.config.EnableGwNftableLbSvc || c.config.EnableGwNftableSvcClusterIP {
-		// Gateway mode consumes Service and EndpointSlice informer events through its own queue.
-		// Service informer startup Adds replay every live or finalizing Service, so accounting
-		// records never need to trigger or recover the Service reconcile.
-		go wait.Until(runWorker("add/update gateway nftable lb service", c.addOrUpdateGwNftableLbSvcQueue, c.handleAddOrUpdateGwNftableLbService), time.Second, ctx.Done())
-	}
+	// Gateway mode consumes Service and EndpointSlice informer events through its own queue. The
+	// worker runs even with both feature gates off: nothing is programmed then, but the queue is
+	// the only owner of the controller finalizer the feature put on Services, and startup Adds
+	// replay finalizing Services so their cleanup keeps working.
+	go wait.Until(runWorker("add/update gateway nftable lb service", c.addOrUpdateGwNftableLbSvcQueue, c.handleAddOrUpdateGwNftableLbService), time.Second, ctx.Done())
 
 	if k8sLBWorker {
 		go wait.Until(runWorker("add service", c.addServiceQueue, c.handleAddService), time.Second, ctx.Done())
