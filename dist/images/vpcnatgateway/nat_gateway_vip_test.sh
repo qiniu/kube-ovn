@@ -193,4 +193,40 @@ vpc_has_addr=false
 ! ( vip_hairpin_add '10.96.1.5,80,tcp' ) 2>/dev/null
 vpc_has_addr=true
 
-echo 'PASS: share-DNAT VIP address and hairpin rules'
+# QoS filter cleanup must distinguish the EIP class range (0x1-0x7ffe) from the NatGw range
+# (0x8000-0xfeff) by value. tc prints classids without leading zeros, so a three-digit classid
+# like 1:ab8 or 1:8cd is EIP-owned even though its first hex digit is in the NatGw range's set.
+tc_log="$tmp_dir/tc.log"
+tc_filters="$tmp_dir/tc.filters"
+: > "$tc_log"
+cat > "$tc_filters" <<'EOF'
+filter parent 1: protocol ip pref 10 u32 fh 800::801 order 2049 key ht 800 bkt 0 flowid 1:ab8 not_in_hw
+  match ip src 10.0.0.1/32
+filter parent 1: protocol ip pref 10 u32 fh 800::802 order 2050 key ht 800 bkt 0 flowid 1:8cd not_in_hw
+  match ip src 10.0.0.2/32
+filter parent 1: protocol ip pref 20 u32 fh 800::803 order 2051 key ht 800 bkt 0 flowid 1:8005 not_in_hw
+  match ip src 10.20.0.1/32
+EOF
+tc() {
+    printf 'tc %s\n' "$*" >> "$tc_log"
+    case "$*" in
+        "-p filter show dev "*" parent 1:") cat "$tc_filters" ;;
+        "filter del dev "*" parent 1: prio "*" handle "*" u32") : ;;
+        "class del dev "*" classid 1:0x"*) : ;;
+        *) echo "unexpected tc invocation: $*" >&2; return 1 ;;
+    esac
+}
+delete_htb_filter_and_class "$VPC_INTERFACE" "10.0.0.1/32" "src" "eip"
+grep -qF 'tc filter del dev eth0 parent 1: prio 10 handle 800::801 u32' "$tc_log"
+grep -qF 'tc class del dev eth0 classid 1:0xab8' "$tc_log"
+delete_htb_filter_and_class "$VPC_INTERFACE" "10.0.0.2/32" "src" "eip"
+grep -qF 'tc class del dev eth0 classid 1:0x8cd' "$tc_log"
+# the NatGw range keeps matching its four-digit classids
+delete_htb_filter_and_class "$VPC_INTERFACE" "10.20.0.1/32" "src" "natgw"
+grep -qF 'tc class del dev eth0 classid 1:0x8005' "$tc_log"
+# cross-range identities are not touched at all
+delete_calls="$(grep -c ' del ' "$tc_log")"
+delete_htb_filter_and_class "$VPC_INTERFACE" "10.20.0.1/32" "src" "eip"
+[[ "$(grep -c ' del ' "$tc_log")" == "$delete_calls" ]]
+
+echo 'PASS: share-DNAT VIP address, hairpin and QoS class rules' 

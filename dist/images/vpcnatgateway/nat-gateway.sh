@@ -1292,8 +1292,11 @@ function delete_htb_filter_and_class() {
         local match_pattern="match ip $match_direction $ip_escaped([^0-9./]|$)"
         local class_pattern
         case "$class_range" in
-            eip) class_pattern='flowid 1:[0-7][0-9a-fA-F]*([^0-9a-fA-F]|$)' ;;
-            natgw) class_pattern='flowid 1:[89a-fA-F][0-9a-fA-F]*([^0-9a-fA-F]|$)' ;;
+            # EIP classes are 0x1-0x7ffe, NatGw classes 0x8000-0xfeff. tc prints classids without
+            # leading zeros, so an EIP class can start with [89a-f] (e.g. 1:ab8): match the EIP
+            # range by digit count, not by its first hex digit.
+            eip) class_pattern='flowid 1:([0-9a-fA-F]|[0-9a-fA-F][0-9a-fA-F]|[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]|[0-7][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])([^0-9a-fA-F]|$)' ;;
+            natgw) class_pattern='flowid 1:[89a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]([^0-9a-fA-F]|$)' ;;
             *) echo "ERROR: unknown QoS class range '$class_range'" >&2; return 1 ;;
         esac
         local flowid_line
