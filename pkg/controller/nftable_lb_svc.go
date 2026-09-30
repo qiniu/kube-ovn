@@ -293,10 +293,12 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	}
 
 	// A share DNAT identity (EIP, external port and protocol) has one Service writer. When
-	// several Services declare it, the deterministic Service winner keeps it.
-	conflicted := false
+	// several Services declare it, the deterministic Service winner keeps it. The loser must
+	// also never delete what it yielded: the winner owns that nft map and hairpin now (its add
+	// rewrites the complete backend set), and no event would wake it to repair the damage.
+	var yielded map[string]struct{}
 	if serveEIP {
-		conflicted, err = c.resolveNftableLbConflicts(cachedSvc, key, desired)
+		yielded, err = c.resolveNftableLbConflicts(cachedSvc, key, eipIP, desired)
 		if err != nil {
 			return err
 		}
@@ -314,7 +316,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	if err != nil {
 		return err
 	}
-	if err = c.programNftableLbServiceDirect(cachedSvc, natGw.Name, eipIP, desired, existing); err != nil {
+	if err = c.programNftableLbServiceDirect(cachedSvc, natGw.Name, eipIP, desired, existing, yielded); err != nil {
 		return err
 	}
 	if err = c.settleNftableLbRecords(eipIP, gwName, desired, existing, live); err != nil {
@@ -322,7 +324,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	}
 
 	// The Service already programmed the gateway, so record status is not a handoff condition.
-	if conflicted {
+	if len(yielded) > 0 {
 		return c.clearNftableLbSvcIngressIP(cachedSvc)
 	}
 	if !serveEIP {
@@ -407,7 +409,9 @@ func buildNftableLbIdentities(records map[string]*kubeovnv1.IptablesDnatRule, ei
 // re-enqueues the Service because the new instance starts empty, and an EIP reallocation changes
 // the programmed VIP while the records still carry the old one, so a record-based skip would leave
 // the fresh instance without rules and blackhole the Service.
-func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs []nftableLbProgram, existing []*kubeovnv1.IptablesDnatRule) error {
+func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs []nftableLbProgram,
+	existing []*kubeovnv1.IptablesDnatRule, yielded map[string]struct{},
+) error {
 	wanted := make(map[string]struct{}, len(programs))
 	addRules := make([]string, 0, len(programs))
 	hairpinAddRules := make([]string, 0, len(programs))
@@ -443,6 +447,13 @@ func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs 
 		if _, ok := wanted[key]; ok {
 			continue
 		}
+		if _, ok := yielded[key]; ok {
+			// The Service lost this EIP identity to another Service winner, which owns the nft map
+			// and hairpin now: deleting here would tear down what the winner just programmed, and
+			// no event tells the winner to rebuild it. The loser's records already dropped the
+			// identity, so nothing else references it from this Service.
+			continue
+		}
 		delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
 		hairpinDelRules = append(hairpinDelRules, fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol))
 	}
@@ -460,10 +471,12 @@ func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs 
 }
 
 // programNftableLbServiceDirect writes the complete desired share-DNAT identities for one
-// Service. The Service and EndpointSlices are the source of truth; DNAT records are written
-// afterwards only for inspection and accounting.
+// Service. The Service and EndpointSlices are the source of truth; the accounting records are
+// claimed before this runs. yielded holds the identities another Service won in
+// resolveNftableLbConflicts: they are stale for this Service but owned by the winner, so their
+// deletion is suppressed.
 func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eipIP string,
-	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule,
+	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule, yielded map[string]struct{},
 ) error {
 	pods, err := c.getNatGwPods(gateway, c.natGwNamespaceByName(gateway), false)
 	if err != nil {
@@ -471,7 +484,7 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 	}
 
 	programs := buildNftableLbPrograms(desired, eipIP)
-	if err = c.programNftableLbServiceIdentities(pods, programs, existing); err != nil {
+	if err = c.programNftableLbServiceIdentities(pods, programs, existing, yielded); err != nil {
 		return fmt.Errorf("failed to program share dnat identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 
@@ -804,14 +817,16 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 
 // resolveNftableLbConflicts resolves conflicts between Services that declare the same
 // EIP:externalPort:protocol identity. Manual share DNAT is unsupported and is not considered:
-// share CRs are accounting records of Services, not independent forwarding intent.
-func (c *Controller) resolveNftableLbConflicts(svc *v1.Service, key string, desired map[string]*kubeovnv1.IptablesDnatRule) (bool, error) {
+// share CRs are accounting records of Services, not independent forwarding intent. It returns
+// the vip-keyed identities this Service yields to another winner: the caller hands them to the
+// data-plane sync, which must not delete them (the winner owns them already).
+func (c *Controller) resolveNftableLbConflicts(svc *v1.Service, key, eipIP string, desired map[string]*kubeovnv1.IptablesDnatRule) (map[string]struct{}, error) {
 	selfKey := svc.Namespace + "/" + svc.Name
 	eipName := svc.Annotations[util.EipAnnotation]
 	if eipName == "" {
 		// Only an EIP:port identity can be contested: several Services can point at the same EIP,
 		// while a ClusterIP is unique to its Service and its nft map is shared by nobody else.
-		return false, nil
+		return nil, nil
 	}
 
 	// Identities come from Service intent, not desired backends. A Service can have no
@@ -836,7 +851,7 @@ func (c *Controller) resolveNftableLbConflicts(svc *v1.Service, key string, desi
 	svcObjs, err := c.svcIndexer.ByIndex(IndexGwNftableLbServiceByEip, eipName)
 	if err != nil {
 		klog.Errorf("failed to query services by eip for nftable lb conflict check %s: %v", key, err)
-		return false, err
+		return nil, err
 	}
 	for _, obj := range svcObjs {
 		s, ok := obj.(*v1.Service)
@@ -889,7 +904,12 @@ func (c *Controller) resolveNftableLbConflicts(svc *v1.Service, key string, desi
 		c.addOrUpdateGwNftableLbSvcQueue.AddAfter(key, 10*time.Second)
 	}
 
-	return len(droppedIdentities) > 0, nil
+	// The data plane keys identities by the EIP's address rather than its name.
+	yielded := make(map[string]struct{}, len(droppedIdentities))
+	for id := range droppedIdentities {
+		yielded[eipIP+strings.TrimPrefix(id, eipName)] = struct{}{}
+	}
+	return yielded, nil
 }
 
 // nftableLbSvcIdentities returns the EIP-anchored share DNAT identities (eip/externalPort/protocol)

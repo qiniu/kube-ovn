@@ -637,9 +637,10 @@ func TestResolveNftableLbConflictsWithNoReadyBackends(t *testing.T) {
 		addOrUpdateGwNftableLbSvcQueue: queue,
 	}
 
-	conflicted, err := controller.resolveNftableLbConflicts(loser, "ns/z-loser", map[string]*kubeovnv1.IptablesDnatRule{})
+	yielded, err := controller.resolveNftableLbConflicts(loser, "ns/z-loser", "203.0.113.10", map[string]*kubeovnv1.IptablesDnatRule{})
 	require.NoError(t, err)
-	require.True(t, conflicted, "a loser must be detected from Service ports even without ready backends")
+	require.Equal(t, map[string]struct{}{"203.0.113.10/80/tcp": {}}, yielded,
+		"a loser must be detected from Service ports even without ready backends")
 
 	desired := map[string]*kubeovnv1.IptablesDnatRule{
 		"backend": {
@@ -651,9 +652,9 @@ func TestResolveNftableLbConflictsWithNoReadyBackends(t *testing.T) {
 			},
 		},
 	}
-	conflicted, err = controller.resolveNftableLbConflicts(loser, "ns/z-loser", desired)
+	yielded, err = controller.resolveNftableLbConflicts(loser, "ns/z-loser", "203.0.113.10", desired)
 	require.NoError(t, err)
-	require.True(t, conflicted)
+	require.Len(t, yielded, 1)
 	require.Empty(t, desired["backend"].Spec.EIP)
 	require.Equal(t, "10.96.1.5", desired["backend"].Spec.ClusterIP)
 	require.NotContains(t, desired["backend"].Labels, util.EipV4IpLabel)
@@ -703,9 +704,9 @@ func TestResolveNftableLbConflictsIgnoresTerminatingServices(t *testing.T) {
 		addOrUpdateGwNftableLbSvcQueue: queue,
 	}
 
-	conflicted, err := controller.resolveNftableLbConflicts(loser, "ns/z-loser", map[string]*kubeovnv1.IptablesDnatRule{})
+	yielded, err := controller.resolveNftableLbConflicts(loser, "ns/z-loser", "203.0.113.10", map[string]*kubeovnv1.IptablesDnatRule{})
 	require.NoError(t, err)
-	require.False(t, conflicted, "a terminating Service must release the identity to its successor")
+	require.Empty(t, yielded, "a terminating Service must release the identity to its successor")
 }
 
 func Test_nftableLbDnatSpecEqual(t *testing.T) {
@@ -1771,6 +1772,114 @@ func Test_handleAddOrUpdateGwNftableLbService_waitsForReadyEip(t *testing.T) {
 	updated, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Empty(t, updated.Status.LoadBalancer.Ingress)
+}
+
+// Test_handleAddOrUpdateGwNftableLbService_yieldKeepsWinnerIdentity pins the conflict handoff:
+// when a new Service takes an EIP identity over, the previous owner's reconcile must not delete
+// the nft map and hairpin the winner just programmed (its add already rewrote the complete
+// backend set, and no event would wake the winner to repair a deletion).
+func Test_handleAddOrUpdateGwNftableLbService_yieldKeepsWinnerIdentity(t *testing.T) {
+	const (
+		gwName    = "owned-gw"
+		eipName   = "owned-eip"
+		eipIP     = "172.20.0.5"
+		loserName = "z-owner"
+		loserIP   = "10.96.1.60"
+		backend   = "10.0.7.21"
+	)
+	f := newNftableLbSvcOwnershipFixture()
+	newLbSvc := func(name, clusterIP string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.namespace, Name: name, UID: types.UID(name + "-uid"),
+				Annotations: map[string]string{util.EipAnnotation: eipName, util.VpcNatGatewayAnnotation: gwName},
+				Finalizers:  []string{util.KubeOVNControllerFinalizer},
+			}, Spec: v1.ServiceSpec{
+				Type:       v1.ServiceTypeLoadBalancer,
+				ClusterIP:  clusterIP,
+				ClusterIPs: []string{clusterIP},
+				Ports:      []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
+			},
+		}
+	}
+	// "a-winner" sorts before the previous owner and holds the identity's winner seat.
+	winner, loser := newLbSvc("a-winner", "10.96.1.50"), newLbSvc(loserName, loserIP)
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: f.namespace, Name: loserName + "-abc",
+			Labels: map[string]string{discoveryv1.LabelServiceName: loserName},
+		}, AddressType: discoveryv1.AddressTypeIPv4,
+		Ports:     []discoveryv1.EndpointPort{{Name: new("http"), Port: new(int32(8080)), Protocol: new(v1.ProtocolTCP)}},
+		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{backend}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
+	}
+	// The previous owner's ledger from when it still held the identity.
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nftableLbDnatRuleName(f.namespace, loserName, "tcp", "80", backend, "8080"),
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: f.namespace, util.NftableLbSvcNameLabel: loserName,
+				util.NftableLbSvcUIDLabel: string(loser.UID), util.NftableLbSvcRecordLabel: "true",
+				util.VpcNatGatewayNameLabel: gwName,
+				util.EipV4IpLabel:           eipIP, util.EipUIDLabel: "owned-eip-uid",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: eipName, ClusterIP: loserIP, ExternalPort: "80", Protocol: "tcp",
+			InternalIP: backend, InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		}, Status: kubeovnv1.IptablesDnatRuleStatus{Ready: true, V4ip: eipIP, NatGwDp: gwName},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:              []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:           []*kubeovnv1.Subnet{f.subnet},
+		Services:          []*v1.Service{winner, loser},
+		EndpointSlices:    []*discoveryv1.EndpointSlice{slice},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{f.eip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{record},
+		Pods:              gatewayPods(gwName, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.addOrUpdateGwNftableLbSvcQueue = newTypedRateLimitingQueue[string]("test-gw-nftable-lb-svc", nil)
+	t.Cleanup(c.addOrUpdateGwNftableLbSvcQueue.ShutDown)
+
+	type execCall struct {
+		op    string
+		rules []string
+	}
+	var execs []execCall
+	c.execRulesInPod = func(_ *v1.Pod, operation string, rules []string) error {
+		execs = append(execs, execCall{operation, append([]string(nil), rules...)})
+		return nil
+	}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(gwName), false).Return(nil, nil)
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, gomock.Any()).Return(nil).AnyTimes()
+
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+loserName))
+
+	for _, call := range execs {
+		require.NotEqual(t, natGwNftDnatMapDel, call.op, "the loser must not delete the winner's nft map")
+		require.NotEqual(t, natGwVipHairpinDel, call.op, "the loser must not delete the winner's hairpin")
+	}
+	added := false
+	for _, call := range execs {
+		if call.op == natGwNftDnatMapAdd {
+			added = true
+			for _, rule := range call.rules {
+				require.NotContains(t, rule, eipIP, "the loser must not program the EIP identity it lost")
+			}
+		}
+	}
+	require.True(t, added, "the loser still programs its own ClusterIP identity")
+
+	updated, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, updated.Spec.EIP, "the loser's claim drops the identity it yielded")
+	require.Equal(t, loserIP, updated.Spec.ClusterIP)
 }
 
 func TestClearNftableLbSvcIngressIP(t *testing.T) {
