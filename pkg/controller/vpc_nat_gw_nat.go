@@ -173,6 +173,13 @@ func (c *Controller) enqueueDelIptablesDnatRule(obj any) {
 		// The Service released this record; the EIP it referenced has to be re-checked so its
 		// finalizer can clear now that no rule uses it any more.
 		c.enqueueIptablesEipRecheck(dnat.Spec.EIP)
+		// A Service accounting record carries no finalizer, so nothing stops it from being
+		// deleted out from under its Service while the gateway keeps wiring the identity. The
+		// Service reconcile is the only writer that restores the claim, and the EIP release
+		// holds until it has settled, so wake the Service here.
+		if util.IsNftableLbSvcRecord(dnat.Labels) && dnat.Labels[util.NftableLbSvcNameLabel] != "" {
+			c.enqueueGwNftableLbService(dnat.Labels[util.NftableLbSvcNsLabel] + "/" + dnat.Labels[util.NftableLbSvcNameLabel])
+		}
 		return
 	}
 	key := cache.MetaObjectToName(dnat).String()
