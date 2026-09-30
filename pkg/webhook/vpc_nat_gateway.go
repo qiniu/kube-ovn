@@ -329,8 +329,10 @@ func (v *ValidatingHook) iptablesDnatUpdateHook(ctx context.Context, req admissi
 
 	// Service records are mutable accounting data, not forwarding intent. Only the authenticated
 	// controller can change their spec; validate the new record, but do not apply ordinary DNAT
-	// immutability rules that exist to protect a data-plane writer.
-	if v.controllerIdentity != "" && req.UserInfo.Username == v.controllerIdentity &&
+	// immutability rules that exist to protect a data-plane writer. An empty identity disables
+	// identity checking everywhere (see validateNftableLbOwnerLabels), so it must not funnel
+	// record updates into the immutable branches either.
+	if (v.controllerIdentity == "" || req.UserInfo.Username == v.controllerIdentity) &&
 		util.IsNftableLbSvcRecord(dnatOld.Labels) && util.IsNftableLbSvcRecord(dnatNew.Labels) {
 		if err := v.ValidateIptablesDnat(ctx, &dnatNew); err != nil {
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
