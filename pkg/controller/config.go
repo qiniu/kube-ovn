@@ -425,6 +425,11 @@ func (config *Configuration) validateModeFlags() error {
 // A flag gates programming only: a reconcile never creates state for a disabled implementation,
 // but teardown of already-managed state runs regardless of the flag so finalizers and leftover
 // rules can always be released.
+//
+// Below the flags, each Service picks its implementation through its own annotations (VIP
+// annotations for bgp-lb-vip, the gateway+EIP annotations for the nftable gateway modes, the
+// lb-svc deployment annotation for lb-svc). Mixing the annotation sets of two implementations on
+// one Service is unsupported and rejected as a user error rather than reconciled.
 func (config *Configuration) validateServiceFeatureGates() error {
 	if config.EnablePodLbSvc && !config.EnableOvnLB {
 		klog.Warning("--enable-lb-svc requires --enable-lb, the loadbalancer service feature will not work")
