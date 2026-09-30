@@ -217,6 +217,14 @@ func (c *Controller) desiredNatGwVipState(gwName string, applying *kubeovnv1.Ipt
 // Service's cached accounting records with its current desired records. The Service controller
 // uses this immediately after programming the gateway, before the informer can observe record
 // creates/deletes; other Services and exclusive DNAT state remain cache-derived.
+//
+// The result is floored by the intent of every other live Service bound to this gateway: such a
+// Service can be missing from the record lister while its committed claims are still in flight
+// on the watch, and the complete-set sync below would delete the lagging Service's lo addresses
+// and VIP routes with no later event to repair them (record events never re-trigger a sync).
+// Services are the source of truth and are never written by this controller, which is what makes
+// their cache trustworthy for the floor. The current owner is covered by desired above, and
+// terminating Services are being cleaned up.
 func (c *Controller) desiredNatGwVipStateForService(gwName string, applying *kubeovnv1.IptablesDnatRule,
 	owner string, desired map[string]*kubeovnv1.IptablesDnatRule, eipIP string,
 ) (map[string]string, []string, error) {
@@ -286,6 +294,48 @@ func (c *Controller) desiredNatGwVipStateForService(gwName string, applying *kub
 		}
 		if rule.Spec.EIP != "" && util.CheckProtocol(eipIP) == kubeovnv1.ProtocolIPv4 {
 			vips[natGwVipRouteMatch(eipIP)] = eipIP
+		}
+	}
+	if c.svcIndexer == nil || c.config == nil {
+		return vips, clusterIPs.SortedList(), nil
+	}
+	svcObjs, err := c.svcIndexer.ByIndex(IndexGwNftableLbServiceByGateway, gwName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("nat gw %s: failed to list its services for the vip state floor: %w", gwName, err)
+	}
+	for _, svcObj := range svcObjs {
+		svc, ok := svcObj.(*corev1.Service)
+		if !ok || !svc.DeletionTimestamp.IsZero() || svc.Namespace+"/"+svc.Name == owner {
+			continue
+		}
+		serveEIP, serveClusterIP := c.nftableLbSvcQualifies(svc)
+		if serveClusterIP {
+			if clusterIP := nftableLbSvcClusterIP(svc); clusterIP != "" {
+				vips[natGwVipRouteMatch(clusterIP)] = clusterIP
+				clusterIPs.Insert(clusterIP)
+			}
+		}
+		if !serveEIP {
+			continue
+		}
+		eipName := svc.Annotations[util.EipAnnotation]
+		ip, resolved := eipIPs[eipName]
+		if !resolved {
+			// Same rule as for records: a lister failure must not silently narrow the set and delete
+			// a route that is still wanted.
+			eip, eipErr := c.iptablesEipsLister.Get(eipName)
+			switch {
+			case eipErr == nil:
+				ip = eip.Status.IP
+			case k8serrors.IsNotFound(eipErr):
+			default:
+				return nil, nil, fmt.Errorf("nat gw %s: failed to resolve eip %s of service %s/%s for the vip state floor: %w",
+					gwName, eipName, svc.Namespace, svc.Name, eipErr)
+			}
+			eipIPs[eipName] = ip
+		}
+		if util.CheckProtocol(ip) == kubeovnv1.ProtocolIPv4 {
+			vips[natGwVipRouteMatch(ip)] = ip
 		}
 	}
 	return vips, clusterIPs.SortedList(), nil

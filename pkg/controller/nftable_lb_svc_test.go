@@ -820,6 +820,71 @@ func Test_desiredNatGwVipState(t *testing.T) {
 	require.Equal(t, "203.0.113.10", vips["ip4.dst == 203.0.113.10"], "next to the ingress IP it aligns with")
 }
 
+// Test_desiredNatGwVipState_keepsCacheLaggingServices pins the informer-lag window of the
+// complete-set sync: a Service that already claimed and programmed its identities is not yet in
+// the DNAT record cache, and the sync deriving the gateway's whole VIP set from that cache alone
+// would delete its lo address and VIP route with no event to repair them. The intent of live
+// Services bound to the gateway floors the set.
+func Test_desiredNatGwVipState_keepsCacheLaggingServices(t *testing.T) {
+	t.Parallel()
+
+	const gwName = "gw0"
+	svcIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		IndexGwNftableLbServiceByGateway: indexGwNftableLbServiceByGateway,
+	})
+	eipIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	controller := &Controller{
+		config:                  &Configuration{EnableGwNftableLbSvc: true, EnableGwNftableSvcClusterIP: true},
+		svcIndexer:              svcIndexer,
+		iptablesDnatRulesLister: kubeovnlister.NewIptablesDnatRuleLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})),
+		iptablesEipsLister:      kubeovnlister.NewIptablesEIPLister(eipIndexer),
+	}
+	newLbSvc := func(namespace, name, clusterIP string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace, Name: name,
+				Annotations: map[string]string{
+					util.EipAnnotation: "eip0", util.VpcNatGatewayAnnotation: gwName,
+				},
+			}, Spec: v1.ServiceSpec{
+				Type:       v1.ServiceTypeLoadBalancer,
+				ClusterIP:  clusterIP,
+				ClusterIPs: []string{clusterIP},
+				Ports:      []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
+			},
+		}
+	}
+	// live Service whose fresh records have not reached the cache yet
+	require.NoError(t, svcIndexer.Add(newLbSvc("ns", "lagging", "10.96.9.9")))
+	// terminating Services are being cleaned up and contribute no floor
+	dying := newLbSvc("ns", "dying", "10.96.9.10")
+	dying.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	require.NoError(t, svcIndexer.Add(dying))
+	// the owner's floor comes from its desired records below, never from its own intent
+	require.NoError(t, svcIndexer.Add(newLbSvc("ns", "owner", "10.96.9.11")))
+	require.NoError(t, eipIndexer.Add(&kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip0"}, Status: kubeovnv1.IptablesEIPStatus{IP: "203.0.113.10"},
+	}))
+
+	desired := map[string]*kubeovnv1.IptablesDnatRule{
+		"owner-record": {
+			ObjectMeta: metav1.ObjectMeta{Name: "owner-record"},
+			Spec: kubeovnv1.IptablesDnatRuleSpec{
+				ClusterIP: "10.96.9.20", ExternalPort: "80", Protocol: "tcp", Type: kubeovnv1.DnatRuleTypeShare,
+			},
+		},
+	}
+	vips, clusterIPs, err := controller.desiredNatGwVipStateForService(gwName, nil, "ns/owner", desired, "")
+	require.NoError(t, err)
+
+	require.Equal(t, "10.96.9.9", vips["ip4.dst == 10.96.9.9"], "the lagging Service's internal VIP must survive")
+	require.Equal(t, "203.0.113.10", vips["ip4.dst == 203.0.113.10"], "the lagging Service's public VIP must survive")
+	require.Equal(t, "10.96.9.20", vips["ip4.dst == 10.96.9.20"], "the owner's desired records contribute")
+	require.NotContains(t, vips, "ip4.dst == 10.96.9.10", "a terminating Service contributes no floor")
+	require.NotContains(t, vips, "ip4.dst == 10.96.9.11", "the owner's own intent is covered by its desired records, not the floor")
+	require.Equal(t, []string{"10.96.9.20", "10.96.9.9"}, clusterIPs)
+}
+
 func TestDesiredNatGwVipStateConvergesAfterLabelUpdate(t *testing.T) {
 	t.Parallel()
 
