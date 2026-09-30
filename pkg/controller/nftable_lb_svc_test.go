@@ -1359,7 +1359,7 @@ func newNftableLbSvcOwnershipFixture() *nftableLbSvcOwnershipFixture {
 		eip: &kubeovnv1.IptablesEIP{
 			ObjectMeta: metav1.ObjectMeta{Name: eipName, UID: "owned-eip-uid"},
 			Spec:       kubeovnv1.IptablesEIPSpec{NatGwDp: gwName, V4ip: "172.20.0.5"},
-			Status:     kubeovnv1.IptablesEIPStatus{IP: "172.20.0.5"},
+			Status:     kubeovnv1.IptablesEIPStatus{IP: "172.20.0.5", Ready: true},
 		},
 		vpc:    &kubeovnv1.Vpc{ObjectMeta: metav1.ObjectMeta{Name: vpcName}, Status: kubeovnv1.VpcStatus{TCPLoadBalancer: "vpc-tcp-load", TCPSessionLoadBalancer: "vpc-tcp-sess"}},
 		subnet: &kubeovnv1.Subnet{ObjectMeta: metav1.ObjectMeta{Name: subnetName}, Spec: kubeovnv1.SubnetSpec{Provider: util.OvnProvider, Protocol: kubeovnv1.ProtocolIPv4, Vpc: vpcName, CIDRBlock: "10.0.7.0/24", Gateway: "10.0.7.1"}},
@@ -1724,6 +1724,53 @@ func Test_handleAddOrUpdateGwNftableLbService_claimBeforeRule(t *testing.T) {
 	updated, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Equal(t, []v1.LoadBalancerIngress{{IP: "172.20.0.5"}}, updated.Status.LoadBalancer.Ingress)
+}
+
+// Test_handleAddOrUpdateGwNftableLbService_waitsForReadyEip pins the bindability gate the DNAT
+// worker used to provide (getBindableEip): a LoadBalancer Service whose EIP is not ready yet
+// (e.g. during a gateway replacement redo, IP still carrying over) must not claim records with
+// Ready status or publish the ingress IP before the EIP is live on the gateway. The pass waits
+// and schedules a retry; the EIP's ready transition re-enqueues the Service.
+func Test_handleAddOrUpdateGwNftableLbService_waitsForReadyEip(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	f.eip.Status.Ready = false
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		EndpointSlices: []*discoveryv1.EndpointSlice{f.slice},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{f.eip},
+		Pods:           gatewayPods("owned-gw", "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.addOrUpdateGwNftableLbSvcQueue = newTypedRateLimitingQueue[string]("test-gw-nftable-lb-svc", nil)
+	t.Cleanup(c.addOrUpdateGwNftableLbSvcQueue.ShutDown)
+
+	var execs []string
+	c.execRulesInPod = func(_ *v1.Pod, operation string, _ []string) error {
+		execs = append(execs, operation)
+		return nil
+	}
+
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+f.svc.Name))
+	require.Empty(t, execs, "an unready eip must stop the pass before the gateway is touched")
+	require.Eventually(t, func() bool { return c.addOrUpdateGwNftableLbSvcQueue.Len() == 1 },
+		5*time.Second, 100*time.Millisecond, "a retry is scheduled while the eip is not ready")
+
+	rules, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().List(context.Background(),
+		metav1.ListOptions{LabelSelector: util.NftableLbSvcNameLabel + "=" + f.svc.Name})
+	require.NoError(t, err)
+	require.Empty(t, rules.Items, "no Ready record may be published before the eip is live")
+
+	updated, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, updated.Status.LoadBalancer.Ingress)
 }
 
 func TestClearNftableLbSvcIngressIP(t *testing.T) {

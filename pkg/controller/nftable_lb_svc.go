@@ -208,6 +208,20 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 			klog.Infof("nftable lb service %s: eip %s is terminating, releasing its share records", key, eipName)
 			return c.cleanupNftableLbService(cachedSvc, namespace, name)
 		}
+		if !eip.Status.Ready {
+			// The DNAT worker gate (getBindableEip) used to hold a rule until its EIP was
+			// programmed on the gateway; the Service writes share DNAT directly now and must wait
+			// itself: an unready EIP is not live on the gateway (e.g. while a gateway replacement
+			// is being redone), so claiming records with Ready status and publishing the ingress
+			// IP would announce an address that drops traffic. Wait without touching an already
+			// established binding; the EIP's usable transition re-enqueues this Service, and the
+			// delayed retry is the fallback.
+			klog.Infof("nftable lb service %s: eip %s is not ready yet, retrying later", key, eipName)
+			if c.addOrUpdateGwNftableLbSvcQueue != nil {
+				c.addOrUpdateGwNftableLbSvcQueue.AddAfter(key, 2*time.Second)
+			}
+			return nil
+		}
 		eipIP = eip.Status.IP
 	}
 
