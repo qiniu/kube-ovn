@@ -31,6 +31,12 @@ import (
 // VIP:port:protocol identity and its complete backend set, then writes the gateway nft map,
 // hairpin rule, loopback VIP and VPC route directly.
 //
+// It owns exactly the identities its flags name (see validateServiceFeatureGates for the
+// partition): a LoadBalancer Service's EIP identities with --enable-gw-nftable-lb-svc, and
+// ClusterIP identities with --enable-gw-nftable-svc-cluster-ip. The classic OVN load balancer
+// and the per-Service LB Pod implementations keep managing the parts they own; in particular an
+// --enable-lb cluster keeps serving a gateway Service's ClusterIP from the OVN switch LBs.
+//
 // Binding model:
 //   - A Service is handled when it names its gateway in util.VpcNatGatewayAnnotation.
 //     A LoadBalancer Service also names the EIP that supplies its ingress address; a
