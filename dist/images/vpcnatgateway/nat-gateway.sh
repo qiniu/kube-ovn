@@ -473,7 +473,9 @@ function vip_hairpin_del() {
 
         local marker="kube-ovn-vip-hairpin-$protocol-$vip-$port"
         local saved_rules saved_rule
-        saved_rules=$($iptables_save_cmd -t nat | grep HAIRPIN_SNAT | grep -F -- "$marker" || true)
+        # Match the complete quoted comment: a bare substring search would also hit identities
+        # whose port only shares a decimal prefix (80 matches 8080).
+        saved_rules=$($iptables_save_cmd -t nat | grep HAIRPIN_SNAT | grep -F -- "\"$marker\"" || true)
         while IFS= read -r saved_rule
         do
             [ -z "$saved_rule" ] && continue

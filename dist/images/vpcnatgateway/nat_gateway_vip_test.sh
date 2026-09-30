@@ -169,6 +169,20 @@ grep -qF -- '--comment kube-ovn-vip-hairpin-tcp-10.96.1.5-8443 -j SNAT --to-sour
 vip_hairpin_del '10.96.1.5,8443,TCP'
 ! grep -qF -- '--ctorigdstport 8443' "$hairpin_state"
 
+# Ports that share a decimal prefix are distinct identities: garbage-collecting port 80 must not
+# take the still-used 8080 hairpin down with it (the installed rule is located by its comment, and
+# a substring match would hit both).
+vip_hairpin_add '10.96.1.5,80,tcp'
+vip_hairpin_add '10.96.1.5,8080,tcp'
+vip_hairpin_del '10.96.1.5,80,tcp'
+grep -qF -- '--comment kube-ovn-vip-hairpin-tcp-10.96.1.5-8080' "$hairpin_state"
+! grep -qF -- '--comment kube-ovn-vip-hairpin-tcp-10.96.1.5-80 ' "$hairpin_state"
+# the surviving identity is really intact, not just its comment
+grep -qF -- '--ctorigdst 10.96.1.5 --ctorigdstport 8080' "$hairpin_state"
+# and removing it afterwards is a clean sweep
+vip_hairpin_del '10.96.1.5,8080,tcp'
+! grep -qF -- '--ctorigdstport 8080' "$hairpin_state"
+
 # Invalid input must fail instead of interpolating into the iptables command line.
 ! ( vip_hairpin_add '10.96.1.5,70000,tcp' ) 2>/dev/null
 ! ( vip_hairpin_add 'not-an-ip,80,tcp' ) 2>/dev/null
