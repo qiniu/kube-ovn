@@ -317,8 +317,17 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	if err != nil {
 		return err
 	}
-	if !serveEIP && slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
-		return rule.Spec.EIP != ""
+	// Records deleted out of band before this pass leave no ledger for an identity the Service
+	// trimmed since (its EIP annotation is gone, or a gate closed): the restored records would
+	// only describe the identities still served, and the old nft map and hairpin would be
+	// deleted by nobody. Recover and persist the evidence first so any later failure replays it.
+	evidence, err := c.ensureNftableLbTrimmedIdentityRecords(cachedSvc, existing, serveEIP, serveClusterIP)
+	if err != nil {
+		return err
+	}
+	ledger := append(slices.Clone(existing), evidence...)
+	if !serveEIP && slices.ContainsFunc(ledger, func(rule *kubeovnv1.IptablesDnatRule) bool {
+		return rule.Spec.EIP != "" || rule.Labels[util.EipV4IpLabel] != ""
 	}) {
 		// The EIP identity is leaving: withdraw the address from the Service first, while the
 		// records still document the ownership. Clearing after the claim stripped the EIP would
@@ -332,10 +341,10 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	if err != nil {
 		return err
 	}
-	if err = c.programNftableLbServiceDirect(cachedSvc, natGw.Name, eipIP, desired, existing, yielded); err != nil {
+	if err = c.programNftableLbServiceDirect(cachedSvc, natGw.Name, eipIP, desired, ledger); err != nil {
 		return err
 	}
-	if err = c.settleNftableLbRecords(eipIP, gwName, desired, existing, live, retiring); err != nil {
+	if err = c.settleNftableLbRecords(eipIP, gwName, desired, ledger, live, retiring); err != nil {
 		return err
 	}
 
@@ -483,40 +492,27 @@ func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs 
 
 // programNftableLbServiceDirect writes the complete desired share-DNAT identities for one
 // Service. The Service and EndpointSlices are the source of truth; the accounting records are
-// claimed before this runs. yielded holds the identities another Service won in
-// resolveNftableLbConflicts: they are stale for this Service but owned by the winner, so their
-// deletion is suppressed - but only while the winner actually claims them. With a backend-less
-// winner nothing covers the old map (no records, no programs): it would keep answering for the
-// address with loser's backends while claimed by nobody, so the loser tears it down itself.
+// claimed before this runs. ledger holds this Service's pre-claim records plus any recovered
+// evidence of trimmed identities; identities the ledger no longer wants are deleted - except
+// the ones another Service claims: a claim passes before its data plane does, so a live record
+// can mean programmed state whose owner gets no repair event from this pass. An identity
+// claimed by nobody (e.g. yielded to a backend-less winner) is this Service's stale wiring to
+// tear down itself.
 func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eipIP string,
-	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule, yielded map[string]struct{},
+	desired map[string]*kubeovnv1.IptablesDnatRule, ledger []*kubeovnv1.IptablesDnatRule,
 ) error {
 	pods, err := c.getNatGwPods(gateway, c.natGwNamespaceByName(gateway), false)
 	if err != nil {
 		return err
 	}
 
-	deleteProtected := yielded
-	if len(yielded) > 0 {
-		// The yield decision is intent-based and must stay so for adds (no rule may be
-		// programmed even briefly before the winner's exist). Deletion protection is the
-		// opposite direction: only the winner's live claim - read fresh from the API server -
-		// proves the map belongs to a takeover. Keep yielded itself intact for the caller's
-		// ingress bookkeeping.
-		claimed, err := c.nftableLbClaimedIdentities(gateway, svc.Namespace+"/"+svc.Name)
-		if err != nil {
-			return err
-		}
-		deleteProtected = maps.Clone(yielded)
-		for key := range deleteProtected {
-			if _, ok := claimed[key]; !ok {
-				delete(deleteProtected, key)
-			}
-		}
+	protected, err := c.nftableLbClaimedIdentities(gateway, svc.Namespace+"/"+svc.Name)
+	if err != nil {
+		return err
 	}
 
 	programs := buildNftableLbPrograms(desired, eipIP)
-	if err = c.programNftableLbServiceIdentities(pods, programs, existing, deleteProtected); err != nil {
+	if err = c.programNftableLbServiceIdentities(pods, programs, ledger, protected); err != nil {
 		return fmt.Errorf("failed to program share dnat identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 
@@ -921,6 +917,71 @@ func (c *Controller) nftableLbSvcTeardownLedger(svc *v1.Service) []*kubeovnv1.Ip
 		ledger = append(ledger, rule)
 	}
 	return ledger
+}
+
+// ensureNftableLbTrimmedIdentityRecords recreates the ledger of identities the Service trimmed
+// while its accounting records were missing. Records deleted out of band erase exactly the
+// evidence a trim reconcile needs to remove the old nft map and hairpin: the restored records
+// only describe the identities still served, and the ingress-clearing guard above would never
+// fire either. Persisting the recovered evidence (deterministic names, create is idempotent)
+// before the claim narrows the ledger keeps the old identities retrievable across failed
+// passes; settle retires these records together with the stale ones once the data plane
+// converged. A leg that was never programmed costs one idempotent delete; a leg another
+// Service took over is protected by the claim check in the program phase.
+func (c *Controller) ensureNftableLbTrimmedIdentityRecords(svc *v1.Service,
+	existing []*kubeovnv1.IptablesDnatRule, serveEIP, serveClusterIP bool,
+) ([]*kubeovnv1.IptablesDnatRule, error) {
+	if !slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer) {
+		// The finalizer claims everything the feature programmed; without it nothing exists.
+		return nil, nil
+	}
+	trimmedEip := !serveEIP && !slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
+		return rule.Spec.EIP != "" || rule.Labels[util.EipV4IpLabel] != ""
+	})
+	trimmedCluster := !serveClusterIP && !slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
+		return rule.Spec.ClusterIP != ""
+	})
+	if !trimmedEip && !trimmedCluster {
+		return nil, nil
+	}
+
+	client := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules()
+	var evidence []*kubeovnv1.IptablesDnatRule
+	for _, intent := range c.nftableLbSvcTeardownLedger(svc) {
+		eipIP := intent.Labels[util.EipV4IpLabel]
+		if intent.Spec.ClusterIP == "" && eipIP == "" {
+			// No witness for either leg of this port.
+			continue
+		}
+		record := &kubeovnv1.IptablesDnatRule{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nftableLbDnatRuleName(svc.Namespace, svc.Name, intent.Spec.Protocol, intent.Spec.ExternalPort, "trimmed", "evidence"),
+				Labels: map[string]string{
+					util.NftableLbSvcNsLabel:     svc.Namespace,
+					util.NftableLbSvcNameLabel:   svc.Name,
+					util.NftableLbSvcUIDLabel:    string(svc.UID),
+					util.NftableLbSvcRecordLabel: "true",
+					util.VpcNatGatewayNameLabel:  nftableLbSvcGateway(svc),
+				},
+			}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+				ClusterIP:    intent.Spec.ClusterIP,
+				ExternalPort: intent.Spec.ExternalPort,
+				Protocol:     intent.Spec.Protocol,
+				Type:         kubeovnv1.DnatRuleTypeShare,
+				// A tombstone: only the identity (vip, port, protocol) is read back; the backend
+				// fields exist just to satisfy admission.
+				InternalIP: "0.0.0.0", InternalPort: "1",
+			},
+		}
+		if eipIP != "" {
+			record.Labels[util.EipV4IpLabel] = eipIP
+		}
+		if _, err := client.Create(context.Background(), record, metav1.CreateOptions{}); err != nil && !k8serrors.IsAlreadyExists(err) {
+			return nil, fmt.Errorf("failed to persist trimmed identity evidence %s for Service %s/%s: %w", record.Name, svc.Namespace, svc.Name, err)
+		}
+		evidence = append(evidence, record)
+	}
+	return evidence, nil
 }
 
 // cleanupNftableLbService removes all share DNAT rules generated for the given Service and clears

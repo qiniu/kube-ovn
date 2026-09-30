@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -440,4 +441,71 @@ func Test_handleUpdateIptablesEip_releasesOnceNoRecordsClaim(t *testing.T) {
 	released, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(context.Background(), eip.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Empty(t, released.Finalizers, "with no records left the terminating EIP finishes its release")
+}
+
+// Test_handleAddOrUpdateGwNftableLbService_restoresTrimmedIdentityEvidence pins the trim path
+// under record loss: the Service's records were deleted out of band and its EIP annotation was
+// removed before the restore pass ran. The reconcile still serves the ClusterIP, but the old
+// EIP identity (witnessed by the published ingress IP) must be torn down in the same pass, the
+// ingress withdrawn, and - if the gateway delete fails - a retried pass must still find the old
+// identity, because the evidence was persisted before the claim narrowed the ledger.
+func Test_handleAddOrUpdateGwNftableLbService_restoresTrimmedIdentityEvidence(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	// Records are gone (never seeded), the annotation was removed in the gap, and the ingress
+	// still publishes the EIP address the Service once served.
+	delete(f.svc.Annotations, util.EipAnnotation)
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	f.svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "172.20.0.5"}}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		EndpointSlices: []*discoveryv1.EndpointSlice{f.slice},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{f.eip},
+		Pods:           gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+
+	var deleteCalls [][]string
+	failFirstDelete := true
+	c.execRulesInPod = func(_ *v1.Pod, operation string, rules []string) error {
+		if operation == natGwNftDnatMapDel {
+			deleteCalls = append(deleteCalls, append([]string(nil), rules...))
+			if failFirstDelete {
+				failFirstDelete = false
+				return errors.New("injected gateway failure")
+			}
+		}
+		return nil
+	}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return(nil, nil).AnyTimes()
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, gomock.Any()).Return(nil).AnyTimes()
+
+	key := f.namespace + "/" + f.svc.Name
+	require.Error(t, c.handleAddOrUpdateGwNftableLbService(key), "the injected delete failure aborts the first pass")
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(key), "the retry replays the trimmed identity from the persisted evidence")
+
+	require.Len(t, deleteCalls, 2, "both passes attempt the old EIP identity delete")
+	for _, rules := range deleteCalls {
+		require.Contains(t, rules, "172.20.0.5,80,tcp", "the trimmed EIP identity is torn down even after the first pass failed")
+	}
+
+	svc, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, svc.Status.LoadBalancer.Ingress, "the stale ingress address is withdrawn")
+
+	rules, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, rules.Items, 1, "only the still-served ClusterIP record remains; the evidence was retired in settle")
+	restored := rules.Items[0]
+	require.Equal(t, "10.96.1.5", restored.Spec.ClusterIP)
+	require.Empty(t, restored.Spec.EIP)
+	require.Empty(t, restored.Labels[util.EipUIDLabel], "the released EIP claim is not resurrected")
 }
