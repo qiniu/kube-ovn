@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -508,4 +509,63 @@ func Test_handleAddOrUpdateGwNftableLbService_restoresTrimmedIdentityEvidence(t 
 	require.Equal(t, "10.96.1.5", restored.Spec.ClusterIP)
 	require.Empty(t, restored.Spec.EIP)
 	require.Empty(t, restored.Labels[util.EipUIDLabel], "the released EIP claim is not resurrected")
+}
+
+// Test_handleUpdateIptablesEip_holdsWhileServiceTeardownPending pins the EIP-vs-Service release
+// order: with the accounting records gone and the ingress never published, the terminating EIP
+// object is the only remaining witness of the address a referencing Service still has to tear
+// down. The EIP finalizer must hold while the Service carries the feature finalizer; once the
+// Service cleanup ran (records, data plane and finally its finalizer), the EIP release proceeds
+// in a later pass.
+func Test_handleUpdateIptablesEip_holdsWhileServiceTeardownPending(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	terminating := metav1.Now()
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: f.eip.Name, UID: f.eip.UID,
+			Finalizers:        []string{util.KubeOVNControllerFinalizer},
+			DeletionTimestamp: &terminating,
+		},
+		Spec:   f.eip.Spec,
+		Status: f.eip.Status,
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+		Pods:           gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.updateIptablesEipQueue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+	c.execRulesInPod = func(_ *v1.Pod, _ string, _ []string) error { return nil }
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return(nil, nil).AnyTimes()
+
+	// No records, no published ingress: the EIP object itself is the teardown witness.
+	require.NoError(t, c.handleUpdateIptablesEip(eip.Name))
+	held, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(context.Background(), eip.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, held.Finalizers, util.KubeOVNControllerFinalizer,
+		"the EIP release holds while the Service's teardown is pending")
+
+	// The Service reconcile runs the terminating-EIP cleanup: the held object still supplies the
+	// address, so the teardown ledger removes the EIP identity before the finalizer drops.
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+f.svc.Name))
+	require.Eventually(t, func() bool {
+		svc, err := c.servicesLister.Services(f.namespace).Get(f.svc.Name)
+		return err == nil && !slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer)
+	}, 5*time.Second, 10*time.Millisecond, "the informer observes the Service finalizer release")
+
+	require.NoError(t, c.handleUpdateIptablesEip(eip.Name))
+	released, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(context.Background(), eip.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, released.Finalizers, "the EIP finishes its release once the Service settled")
 }

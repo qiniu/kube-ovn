@@ -358,6 +358,15 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			klog.Infof("eip %s is still being used by NAT rules: %s, waiting for them to be deleted", key, nat)
 			return nil
 		}
+		if c.nftableLbSvcTeardownHoldsEip(cachedEip) {
+			// No NAT rule claims the EIP any more, but a referencing Service has not finished its
+			// teardown: its cleanup reads the identity witness (the address) from this very
+			// object, because its records may be gone and its ingress never published. Releasing
+			// now would strand the programmed identities with no witness left at all.
+			klog.Infof("eip %s: no nat rules left, but a nftable lb service has not settled its teardown, holding deletion", key)
+			c.updateIptablesEipQueue.AddAfter(key, 5*time.Second)
+			return nil
+		}
 
 		if vpcNatEnabled == "true" {
 			var v4Cidr string

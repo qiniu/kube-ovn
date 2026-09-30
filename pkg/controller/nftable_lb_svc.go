@@ -93,6 +93,38 @@ func nftableLbSvcGateway(svc *v1.Service) string {
 	return svc.Annotations[util.VpcNatGatewayAnnotation]
 }
 
+// nftableLbSvcTeardownHoldsEip reports whether a Service that declares this EIP may still owe
+// teardown work: a terminating EIP must keep its object (and thereby its address) until every
+// referencing Service dropped the feature finalizer, because the Service's cleanup reads the
+// identity witness from the EIP object itself - the accounting records may be gone and the
+// ingress may never have been published, so the object is the last source of the address. The
+// finalizer is written before the gateway is ever touched and dropped only after records and
+// data plane are gone, and a terminating EIP sends every Service reconcile down the cleanup
+// path, so the hold always ends. Do not key this on the annotation alone: it outlives the
+// cleanup and would hold the release forever.
+func (c *Controller) nftableLbSvcTeardownHoldsEip(eip *kubeovnv1.IptablesEIP) bool {
+	if !c.gwNftableLbSvcEnabled() || c.svcIndexer == nil {
+		return false
+	}
+	svcObjs, err := c.svcIndexer.ByIndex(IndexGwNftableLbServiceByEip, eip.Name)
+	if err != nil {
+		// Bias towards holding: releasing on an unknown answer strands the teardown witness.
+		klog.Errorf("failed to list nftable lb services of eip %s: %v", eip.Name, err)
+		return true
+	}
+	for _, svcObj := range svcObjs {
+		svc, ok := svcObj.(*v1.Service)
+		if !ok {
+			continue
+		}
+		if slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer) {
+			klog.Infof("eip %s: service %s/%s teardown still pending, holding its release", eip.Name, svc.Namespace, svc.Name)
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Controller) enqueueGwNftableLbService(key string) {
 	if c.addOrUpdateGwNftableLbSvcQueue == nil || key == "" {
 		return
