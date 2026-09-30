@@ -569,3 +569,66 @@ func Test_handleUpdateIptablesEip_holdsWhileServiceTeardownPending(t *testing.T)
 	require.NoError(t, err)
 	require.Empty(t, released.Finalizers, "the EIP finishes its release once the Service settled")
 }
+
+// Test_handleUpdateIptablesEip_releasedWhenServiceServesOnlyClusterIP pins the hold's scope: a
+// Service whose EIP leg is disabled keeps its controller finalizer for the ClusterIP leg
+// forever, but owes a terminating EIP nothing once the trim retired the EIP identity from its
+// records. Repeated ClusterIP-only reconciles must not wedge the EIP release.
+func Test_handleUpdateIptablesEip_releasedWhenServiceServesOnlyClusterIP(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		EndpointSlices: []*discoveryv1.EndpointSlice{f.slice},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{f.eip},
+		Pods:           gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	// The EIP leg gate is off: the Service keeps serving its ClusterIP and never again enters
+	// the EIP path, so its finalizer stays.
+	c.config.EnableGwNftableLbSvc = false
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.updateIptablesEipQueue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+	c.execRulesInPod = func(_ *v1.Pod, _ string, _ []string) error { return nil }
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return(nil, nil).AnyTimes()
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, gomock.Any()).Return(nil).AnyTimes()
+
+	key := f.namespace + "/" + f.svc.Name
+	for i := 0; i < 3; i++ {
+		require.NoError(t, c.handleAddOrUpdateGwNftableLbService(key))
+		require.Eventually(t, func() bool {
+			rules, err := c.iptablesDnatRulesLister.List(labels.Everything())
+			if err != nil || len(rules) != 1 {
+				return false
+			}
+			// Settled: only the ClusterIP claim survives, the trim tombstone is retired.
+			return rules[0].Spec.EIP == "" && rules[0].Labels[util.EipV4IpLabel] == ""
+		}, 5*time.Second, 10*time.Millisecond, "the informer observes the settled ledger between passes")
+	}
+
+	terminating := metav1.Now()
+	eip, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(context.Background(), f.eip.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	eip.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	eip.DeletionTimestamp = &terminating
+	if _, err = c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Update(context.Background(), eip, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	require.Eventually(t, func() bool {
+		cached, err := c.iptablesEipsLister.Get(eip.Name)
+		return err == nil && !cached.DeletionTimestamp.IsZero()
+	}, 5*time.Second, 10*time.Millisecond, "the informer observes the terminating EIP")
+
+	require.NoError(t, c.handleUpdateIptablesEip(eip.Name))
+	released, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(context.Background(), eip.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, released.Finalizers, "a Service owing no EIP leg must not hold the release, finalizer or not")
+}

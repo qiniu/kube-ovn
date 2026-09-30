@@ -94,14 +94,15 @@ func nftableLbSvcGateway(svc *v1.Service) string {
 }
 
 // nftableLbSvcTeardownHoldsEip reports whether a Service that declares this EIP may still owe
-// teardown work: a terminating EIP must keep its object (and thereby its address) until every
-// referencing Service dropped the feature finalizer, because the Service's cleanup reads the
-// identity witness from the EIP object itself - the accounting records may be gone and the
-// ingress may never have been published, so the object is the last source of the address. The
-// finalizer is written before the gateway is ever touched and dropped only after records and
-// data plane are gone, and a terminating EIP sends every Service reconcile down the cleanup
-// path, so the hold always ends. Do not key this on the annotation alone: it outlives the
-// cleanup and would hold the release forever.
+// teardown work: a terminating EIP must keep its object (and thereby its address) until no
+// referencing Service can still have the EIP identity wired, because the Service's cleanup
+// reads the identity witness from the EIP object itself - the accounting records may be gone
+// and the ingress may never have been published, so the object is the last source of the
+// address. Two signals count as still holding the identity, and both terminate: the Service
+// still qualifies for the EIP leg (its reconcile restores or tears down the identity, then
+// drops the claim), or one of its records still carries the leg (a live claim or a trim
+// tombstone, both retired by a successful reconcile). The bare finalizer must NOT hold: a
+// Service serving only its ClusterIP keeps it forever while owing this EIP nothing.
 func (c *Controller) nftableLbSvcTeardownHoldsEip(eip *kubeovnv1.IptablesEIP) bool {
 	if !c.gwNftableLbSvcEnabled() || c.svcIndexer == nil {
 		return false
@@ -114,13 +115,29 @@ func (c *Controller) nftableLbSvcTeardownHoldsEip(eip *kubeovnv1.IptablesEIP) bo
 	}
 	for _, svcObj := range svcObjs {
 		svc, ok := svcObj.(*v1.Service)
-		if !ok {
+		if !ok || !slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer) {
 			continue
 		}
-		if slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer) {
-			klog.Infof("eip %s: service %s/%s teardown still pending, holding its release", eip.Name, svc.Namespace, svc.Name)
-			return true
+		serving, _ := c.nftableLbSvcQualifies(svc)
+		if !serving {
+			// The EIP leg is disabled or deconfigured; only still-unretired records (live claims
+			// or trim tombstones) mean the identity can still be wired.
+			rules, err := c.iptablesDnatRulesLister.List(labels.SelectorFromSet(labels.Set{
+				util.NftableLbSvcNsLabel:   svc.Namespace,
+				util.NftableLbSvcNameLabel: svc.Name,
+			}))
+			if err != nil {
+				klog.Errorf("failed to list records of nftable lb service %s/%s: %v", svc.Namespace, svc.Name, err)
+				return true
+			}
+			if !slices.ContainsFunc(rules, func(rule *kubeovnv1.IptablesDnatRule) bool {
+				return rule.Spec.EIP == eip.Name || rule.Labels[util.EipV4IpLabel] != ""
+			}) {
+				continue
+			}
 		}
+		klog.Infof("eip %s: service %s/%s still holds its identity, holding the release", eip.Name, svc.Namespace, svc.Name)
+		return true
 	}
 	return false
 }
