@@ -53,7 +53,11 @@ QOS_DEBUG=${QOS_DEBUG:-"false"}
 
 iptables_cmd=$(which iptables)
 iptables_save_cmd=$(which iptables-save)
-if iptables-legacy -t nat -S INPUT 1 2>/dev/null; then
+# Fall back to the legacy flavor only when the default iptables is not the nftables backend and
+# the legacy tools actually work (centos-7-class images). The nft share DNAT maps this script
+# also programs live in the nftables backend, so when plain iptables is nf_tables-flavored the
+# hairpin and SNAT rules must land there too, or the gateway runs a split data plane.
+if ! iptables --version 2>/dev/null | grep -q nf_tables && iptables-legacy -t nat -S INPUT 1 2>/dev/null; then
     # use iptables-legacy for centos 7
     iptables_cmd=$(which iptables-legacy)
     iptables_save_cmd=$(which iptables-legacy-save)

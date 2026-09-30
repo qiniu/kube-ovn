@@ -358,15 +358,6 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			klog.Infof("eip %s is still being used by NAT rules: %s, waiting for them to be deleted", key, nat)
 			return nil
 		}
-		if c.nftableLbSvcIntentClaimsEip(cachedEip) {
-			// The records documenting a Service's share claim can be deleted out from under it;
-			// its reconcile restores them one pass after the delete event. Releasing the claim in
-			// that gap would strand the identities the Service still wires and let admission
-			// reject the restored records, so hold the release until the Service has settled.
-			klog.Infof("eip %s: no nat rules left, but a nftable lb service still declares it, holding deletion", key)
-			c.updateIptablesEipQueue.AddAfter(key, 5*time.Second)
-			return nil
-		}
 
 		if vpcNatEnabled == "true" {
 			var v4Cidr string

@@ -93,46 +93,6 @@ func nftableLbSvcGateway(svc *v1.Service) string {
 	return svc.Annotations[util.VpcNatGatewayAnnotation]
 }
 
-// nftableLbSvcIntentClaimsEip reports whether, from the controller's point of view, a live
-// Service still claims share DNAT on this EIP: the Service qualifies and its gateway exists and
-// is not terminating, and the EIP itself is wired. The accounting records documenting such a
-// claim carry no finalizer, so deleting them out from under the Service removes the claims while
-// the data plane keeps wiring the identities; the Service restores the records one reconcile
-// after the delete event wakes it. An EIP released in that gap strands wired identities and lets
-// admission reject the restored records, so a release must hold while any Service matches.
-func (c *Controller) nftableLbSvcIntentClaimsEip(eip *kubeovnv1.IptablesEIP) bool {
-	if !c.gwNftableLbSvcEnabled() || c.svcIndexer == nil || !eip.Status.Ready {
-		return false
-	}
-	svcObjs, err := c.svcIndexer.ByIndex(IndexGwNftableLbServiceByEip, eip.Name)
-	if err != nil {
-		// Bias towards holding: releasing the EIP on an unknown answer strands wired identities.
-		klog.Errorf("failed to list nftable lb services of eip %s: %v", eip.Name, err)
-		return true
-	}
-	for _, svcObj := range svcObjs {
-		svc, ok := svcObj.(*v1.Service)
-		if !ok || !svc.DeletionTimestamp.IsZero() {
-			continue
-		}
-		if serveEIP, _ := c.nftableLbSvcQualifies(svc); !serveEIP {
-			continue
-		}
-		natGw, err := c.vpcNatGatewayLister.Get(svc.Annotations[util.VpcNatGatewayAnnotation])
-		if err != nil || !natGw.DeletionTimestamp.IsZero() {
-			// Without its gateway the Service claims nothing, so no claim is being restored either.
-			continue
-		}
-		klog.Infof("eip %s: service %s/%s still claims it, holding its release", eip.Name, svc.Namespace, svc.Name)
-		return true
-	}
-	return false
-}
-
-// enqueueGwNftableLbService enqueues a Service regardless of the feature gates: with both
-// gates off nothing new is programmed, but a Service carrying the feature's finalizer and
-// records must still reach the cleanup path, which is their only owner. Qualification and
-// cleanup decisions stay in the handler so a Service that stops qualifying releases its rules.
 func (c *Controller) enqueueGwNftableLbService(key string) {
 	if c.addOrUpdateGwNftableLbSvcQueue == nil || key == "" {
 		return

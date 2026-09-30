@@ -17,13 +17,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	k8stesting "k8s.io/client-go/testing"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/set"
 
+	k8stesting "k8s.io/client-go/testing"
+
 	kubeovnfake "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned/fake"
-	kubeovnlister "github.com/kubeovn/kube-ovn/pkg/client/listers/kubeovn/v1"
 )
 
 // Test_enqueueDelIptablesDnatRule_wakesOwnerService pins the record-loss wake-up: deleting a
@@ -127,118 +126,6 @@ func Test_handleAddOrUpdateGwNftableLbService_restoresDeletedRecords(t *testing.
 	for _, item := range claimed.Items {
 		require.True(t, seen.Has(item.Name), "record %s must be re-claimed", item.Name)
 	}
-}
-
-// Test_nftableLbSvcIntentClaimsEip pins the EIP-release hold: while a live Service still declares
-// share DNAT on a wired EIP (and could restore its deleted records), the EIP's finalizer must not
-// be released; the hold lifts for unready EIPs, terminating Services and missing gateways, where
-// no claim can exist.
-func Test_nftableLbSvcIntentClaimsEip(t *testing.T) {
-	t.Parallel()
-
-	const gwName = "gw0"
-	newSvcIndexer := func(objs ...*v1.Service) cache.Indexer {
-		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
-			IndexGwNftableLbServiceByEip: indexGwNftableLbServiceByEip,
-		})
-		for _, obj := range objs {
-			require.NoError(t, indexer.Add(obj))
-		}
-		return indexer
-	}
-	newGwLister := func(gws ...*kubeovnv1.VpcNatGateway) kubeovnlister.VpcNatGatewayLister {
-		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-		for _, gw := range gws {
-			require.NoError(t, indexer.Add(gw))
-		}
-		return kubeovnlister.NewVpcNatGatewayLister(indexer)
-	}
-	svc := &v1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default", Name: "web",
-			Annotations: map[string]string{util.EipAnnotation: "eip0", util.VpcNatGatewayAnnotation: gwName},
-		}, Spec: v1.ServiceSpec{
-			Type:       v1.ServiceTypeLoadBalancer,
-			ClusterIP:  "10.96.1.5",
-			ClusterIPs: []string{"10.96.1.5"},
-			Ports:      []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
-		},
-	}
-	gw := &kubeovnv1.VpcNatGateway{ObjectMeta: metav1.ObjectMeta{Name: gwName}}
-	newController := func(svcIndexer cache.Indexer, gwLister kubeovnlister.VpcNatGatewayLister) *Controller {
-		return &Controller{
-			config:              &Configuration{EnableGwNftableLbSvc: true, EnableGwNftableSvcClusterIP: true},
-			svcIndexer:          svcIndexer,
-			vpcNatGatewayLister: gwLister,
-		}
-	}
-	readyEip := &kubeovnv1.IptablesEIP{
-		ObjectMeta: metav1.ObjectMeta{Name: "eip0"},
-		Status:     kubeovnv1.IptablesEIPStatus{IP: "203.0.113.10", Ready: true},
-	}
-
-	t.Run("holds while a live service declares the wired eip", func(t *testing.T) {
-		c := newController(newSvcIndexer(svc), newGwLister(gw))
-		require.True(t, c.nftableLbSvcIntentClaimsEip(readyEip))
-	})
-	t.Run("unready eip holds no claim", func(t *testing.T) {
-		unready := readyEip.DeepCopy()
-		unready.Status.Ready = false
-		c := newController(newSvcIndexer(svc), newGwLister(gw))
-		require.False(t, c.nftableLbSvcIntentClaimsEip(unready))
-	})
-	t.Run("no referencing service", func(t *testing.T) {
-		c := newController(newSvcIndexer(), newGwLister(gw))
-		require.False(t, c.nftableLbSvcIntentClaimsEip(readyEip))
-	})
-	t.Run("terminating service", func(t *testing.T) {
-		dying := svc.DeepCopy()
-		dying.DeletionTimestamp = &metav1.Time{Time: time.Now()}
-		c := newController(newSvcIndexer(dying), newGwLister(gw))
-		require.False(t, c.nftableLbSvcIntentClaimsEip(readyEip))
-	})
-	t.Run("missing gateway claims nothing", func(t *testing.T) {
-		c := newController(newSvcIndexer(svc), newGwLister())
-		require.False(t, c.nftableLbSvcIntentClaimsEip(readyEip))
-	})
-}
-
-// Test_handleUpdateIptablesEip_holdsWhileServiceClaims pins the release-path wiring of the hold:
-// with every accounting record of the claiming Service deleted, the EIP reconcile still keeps its
-// finalizer until no live Service declares the EIP any more.
-func Test_handleUpdateIptablesEip_holdsWhileServiceClaims(t *testing.T) {
-	f := newNftableLbSvcOwnershipFixture()
-	terminating := metav1.Time{Time: time.Now()}
-	eip := &kubeovnv1.IptablesEIP{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "owned-eip", UID: "owned-eip-uid",
-			Finalizers:        []string{util.KubeOVNControllerFinalizer},
-			DeletionTimestamp: &terminating,
-		},
-		Spec:   kubeovnv1.IptablesEIPSpec{NatGwDp: f.gw.Name, V4ip: "172.20.0.5"},
-		Status: kubeovnv1.IptablesEIPStatus{IP: "172.20.0.5", Ready: true},
-	}
-
-	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
-		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
-		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
-		Subnets:        []*kubeovnv1.Subnet{f.subnet},
-		Services:       []*v1.Service{f.svc},
-		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
-	})
-	require.NoError(t, err)
-	c := fc.fakeController
-	c.config.EnableGwNftableLbSvc = true
-	c.config.EnableGwNftableSvcClusterIP = true
-	c.updateIptablesEipQueue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
-	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
-
-	// The Service's records are gone (deleted out from under it), so the API read finds no rule.
-	require.NoError(t, c.handleUpdateIptablesEip("owned-eip"))
-	kept, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(context.Background(), "owned-eip", metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Contains(t, kept.Finalizers, util.KubeOVNControllerFinalizer,
-		"the eip finalizer must hold while a live service still declares the eip")
 }
 
 // honorFinalizersOnDnatDelete makes the fake clientset honor finalizers on delete like the API
