@@ -33,11 +33,13 @@ func (v *ValidatingHook) ServiceUpdateHook(_ context.Context, req admission.Requ
 	}
 	// Only a LoadBalancer Service consumes the EIP annotation (it names the EIP its ingress IP
 	// comes from); for a ClusterIP Service the annotation is inert, so editing it is harmless and
-	// must not force a delete/recreate.
-	if newSvc.Spec.Type == v1.ServiceTypeLoadBalancer &&
-		oldSvc.Annotations[util.EipAnnotation] != newSvc.Annotations[util.EipAnnotation] {
+	// must not force a delete/recreate. Removing the annotation is allowed: the reconcile then
+	// releases only the EIP identity and keeps the ClusterIP ones. Binding the Service to another
+	// EIP still asks for a fresh Service, so an identity is never silently re-homed.
+	oldEip, newEip := oldSvc.Annotations[util.EipAnnotation], newSvc.Annotations[util.EipAnnotation]
+	if newSvc.Spec.Type == v1.ServiceTypeLoadBalancer && oldEip != newEip && newEip != "" {
 		return ctrlwebhook.Errored(http.StatusBadRequest,
-			fmt.Errorf("service %s/%s eip cannot change; delete and recreate the service", newSvc.Namespace, newSvc.Name))
+			fmt.Errorf("service %s/%s eip cannot change; remove the annotation to release only the EIP identity, or delete and recreate the service", newSvc.Namespace, newSvc.Name))
 	}
 	return ctrlwebhook.Allowed("bypass")
 }

@@ -75,6 +75,19 @@ func TestServiceUpdateHook(t *testing.T) {
 		require.Contains(t, resp.Result.Message, "eip cannot change")
 	})
 
+	// The documented identity trimming flow: dropping the EIP annotation releases only the EIP
+	// identity while the ClusterIP identities keep being served.
+	t.Run("allows removing the eip of a LoadBalancer service", func(t *testing.T) {
+		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, loadBalancer("gw-a", "eip-a"), loadBalancer("gw-a", "")))
+		require.True(t, resp.Allowed)
+	})
+
+	t.Run("rejects late-binding an eip to a gateway-bound LoadBalancer service", func(t *testing.T) {
+		resp := hook.ServiceUpdateHook(context.Background(), updateRequest(t, loadBalancer("gw-a", ""), loadBalancer("gw-a", "eip-a")))
+		require.False(t, resp.Allowed)
+		require.Contains(t, resp.Result.Message, "eip cannot change")
+	})
+
 	// A ClusterIP Service never reads the eip annotation, so editing it must not force a
 	// delete/recreate of the Service.
 	t.Run("allows changing the eip annotation of a ClusterIP service", func(t *testing.T) {
