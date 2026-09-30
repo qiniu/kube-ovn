@@ -401,3 +401,43 @@ func Test_settleNftableLbRecords_retiresSnapshot(t *testing.T) {
 	_, err := client.KubeovnV1().IptablesDnatRules().Get(context.Background(), snapshot.Name, metav1.GetOptions{})
 	require.True(t, k8serrors.IsNotFound(err), "the retiring snapshot is deleted once the data plane converged")
 }
+
+// Test_handleUpdateIptablesEip_releasesOnceNoRecordsClaim pins the settled release path: with a
+// terminating EIP whose records are gone (the owning Service already ran its cleanup, which
+// tears down the data plane even without records), the EIP reconcile must finish the release -
+// no hold may spin on the Service's leftover annotation. The Service itself is kept out of the
+// way: it still declares the EIP, which is exactly the input a wrong hold would spin on.
+func Test_handleUpdateIptablesEip_releasesOnceNoRecordsClaim(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	terminating := metav1.Now()
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "released-eip", UID: "released-eip-uid",
+			Finalizers:        []string{util.KubeOVNControllerFinalizer},
+			DeletionTimestamp: &terminating,
+		},
+		Spec:   kubeovnv1.IptablesEIPSpec{NatGwDp: f.gw.Name, V4ip: "172.20.0.5"},
+		Status: kubeovnv1.IptablesEIPStatus{IP: "172.20.0.5", Ready: true},
+	}
+	// The annotated Service stays live and unchanged, as after its completed cleanup.
+	f.svc.Annotations[util.EipAnnotation] = eip.Name
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.updateIptablesEipQueue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	t.Cleanup(c.updateIptablesEipQueue.ShutDown)
+
+	require.NoError(t, c.handleUpdateIptablesEip(eip.Name))
+	released, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(context.Background(), eip.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, released.Finalizers, "with no records left the terminating EIP finishes its release")
+}
