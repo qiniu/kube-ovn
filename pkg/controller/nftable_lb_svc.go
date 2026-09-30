@@ -45,8 +45,9 @@ import (
 //     programmed forwarding in one layer and EIP accounting continues to work. A type=share
 //     object is only this ledger: its add/update/delete events never write or remove NAT state.
 //     The write order is claim, rule, Ready: a record is persisted before the gateway rule it
-//     accounts for, flips Ready only after the data plane converged, and a stale record is
-//     retired only after its rule is gone, so cleanup always finds a claim for what exists.
+//     accounts for, flips Ready only after the data plane converged, and a stale record (or the
+//     retired-generation snapshot of an identity-changing update) is retired only after its rule
+//     is gone, so cleanup always finds a claim for what exists.
 //   - The Kube-OVN controller finalizer claims the whole data plane. Cleanup removes nft identities, hairpin,
 //     loopback VIPs and routes, then deletes the records and finally releases the Service.
 //   - EIP, Pod and ordinary gateway events do not trigger this controller. Their state is read
@@ -367,14 +368,14 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 			return err
 		}
 	}
-	live, err := c.claimNftableLbRecords(cachedSvc, desired, existing)
+	live, retiring, err := c.claimNftableLbRecords(cachedSvc, desired, existing)
 	if err != nil {
 		return err
 	}
 	if err = c.programNftableLbServiceDirect(cachedSvc, natGw.Name, eipIP, desired, existing, yielded); err != nil {
 		return err
 	}
-	if err = c.settleNftableLbRecords(eipIP, gwName, desired, existing, live); err != nil {
+	if err = c.settleNftableLbRecords(eipIP, gwName, desired, existing, live, retiring); err != nil {
 		return err
 	}
 
@@ -457,8 +458,10 @@ func buildNftableLbIdentities(records map[string]*kubeovnv1.IptablesDnatRule, ei
 // re-enqueues the Service because the new instance starts empty, and an EIP reallocation changes
 // the programmed VIP while the records still carry the old one, so a record-based skip would leave
 // the fresh instance without rules and blackhole the Service.
+// protected holds the identities another Service currently claims: they are stale for this
+// Service but owned elsewhere, so their deletion is suppressed.
 func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs []nftableLbProgram,
-	existing []*kubeovnv1.IptablesDnatRule, yielded map[string]struct{},
+	existing []*kubeovnv1.IptablesDnatRule, protected map[string]struct{},
 ) error {
 	wanted := make(map[string]struct{}, len(programs))
 	addRules := make([]string, 0, len(programs))
@@ -495,11 +498,11 @@ func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs 
 		if _, ok := wanted[key]; ok {
 			continue
 		}
-		if _, ok := yielded[key]; ok {
-			// The Service lost this EIP identity to another Service winner, which owns the nft map
-			// and hairpin now: deleting here would tear down what the winner just programmed, and
-			// no event tells the winner to rebuild it. The loser's records already dropped the
-			// identity, so nothing else references it from this Service.
+		if _, ok := protected[key]; ok {
+			// The Service lost this EIP identity to another Service winner, whose claim proves it
+			// owns the nft map and hairpin now: deleting here would tear down what the winner just
+			// programmed, and no event tells the winner to rebuild it. The loser's records already
+			// dropped the identity, so nothing else references it from this Service.
 			continue
 		}
 		delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
@@ -522,7 +525,9 @@ func (c *Controller) programNftableLbServiceIdentities(pods []*v1.Pod, programs 
 // Service. The Service and EndpointSlices are the source of truth; the accounting records are
 // claimed before this runs. yielded holds the identities another Service won in
 // resolveNftableLbConflicts: they are stale for this Service but owned by the winner, so their
-// deletion is suppressed.
+// deletion is suppressed - but only while the winner actually claims them. With a backend-less
+// winner nothing covers the old map (no records, no programs): it would keep answering for the
+// address with loser's backends while claimed by nobody, so the loser tears it down itself.
 func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eipIP string,
 	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule, yielded map[string]struct{},
 ) error {
@@ -531,8 +536,27 @@ func (c *Controller) programNftableLbServiceDirect(svc *v1.Service, gateway, eip
 		return err
 	}
 
+	deleteProtected := yielded
+	if len(yielded) > 0 {
+		// The yield decision is intent-based and must stay so for adds (no rule may be
+		// programmed even briefly before the winner's exist). Deletion protection is the
+		// opposite direction: only the winner's live claim - read fresh from the API server -
+		// proves the map belongs to a takeover. Keep yielded itself intact for the caller's
+		// ingress bookkeeping.
+		claimed, err := c.nftableLbClaimedIdentities(gateway, svc.Namespace+"/"+svc.Name)
+		if err != nil {
+			return err
+		}
+		deleteProtected = maps.Clone(yielded)
+		for key := range deleteProtected {
+			if _, ok := claimed[key]; !ok {
+				delete(deleteProtected, key)
+			}
+		}
+	}
+
 	programs := buildNftableLbPrograms(desired, eipIP)
-	if err = c.programNftableLbServiceIdentities(pods, programs, existing, yielded); err != nil {
+	if err = c.programNftableLbServiceIdentities(pods, programs, existing, deleteProtected); err != nil {
 		return fmt.Errorf("failed to program share dnat identities of service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
 
@@ -603,23 +627,34 @@ func buildNftableLbPrograms(records map[string]*kubeovnv1.IptablesDnatRule, eipI
 // gateway sees the rules they cover: a share DNAT rule must never exist without a record that
 // accounts for it (and carries the EIP's UID claim). Records are written without status; Ready
 // is published by settleNftableLbRecords once the data plane converged. It returns the live
-// record object for each desired name a status can be published for.
+// record object for each desired name a status can be published for, plus the names of the
+// retiring snapshots this pass created.
+//
+// An in-place update that drops an identity (the EIP annotation removed, the ClusterIP gate
+// closed, a conflicting EIP identity yielded) would erase the only ledger the gateway cleanup
+// reads and release the old EIP's UID claim before the old nft map and hairpin are actually
+// removed: a failed gateway pass would then retry with records that no longer know what to
+// delete. Before such an update the record is therefore snapshotted under a derived name
+// (acquire the new claim, keep the old one): the snapshot preserves the old identities and UID
+// claim for retried passes, and settleNftableLbRecords retires it only after the data plane
+// converged - the same claim-outlives-rule order the stale-record path already follows.
 func (c *Controller) claimNftableLbRecords(svc *v1.Service,
 	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule,
-) (map[string]*kubeovnv1.IptablesDnatRule, error) {
+) (map[string]*kubeovnv1.IptablesDnatRule, []string, error) {
 	client := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules()
 	existingByName := make(map[string]*kubeovnv1.IptablesDnatRule, len(existing))
 	for _, current := range existing {
 		existingByName[current.Name] = current
 	}
 	live := make(map[string]*kubeovnv1.IptablesDnatRule, len(desired))
+	var retiring []string
 	for name, want := range desired {
 		current := existingByName[name]
 		switch {
 		case current == nil:
 			created, err := client.Create(context.Background(), want, metav1.CreateOptions{})
 			if err != nil {
-				return nil, fmt.Errorf("failed to create nftable LB record %s for Service %s/%s: %w", name, svc.Namespace, svc.Name, err)
+				return nil, nil, fmt.Errorf("failed to create nftable LB record %s for Service %s/%s: %w", name, svc.Namespace, svc.Name, err)
 			}
 			live[name] = created
 		case !current.DeletionTimestamp.IsZero():
@@ -628,11 +663,23 @@ func (c *Controller) claimNftableLbRecords(svc *v1.Service,
 			// carries the pre-upgrade controller finalizer that nobody clears any more: migrate it
 			// off so the record can finish terminating instead of blocking its recreate forever.
 			if err := c.releaseNftableLbRecordFinalizers(current); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			continue
 		default:
-			if !nftableLbDnatSpecEqual(&current.Spec, &want.Spec) || !maps.Equal(current.Labels, want.Labels) || len(current.Finalizers) != 0 {
+			specChanged := !nftableLbDnatSpecEqual(&current.Spec, &want.Spec)
+			claimChanged := current.Labels[util.EipV4IpLabel] != want.Labels[util.EipV4IpLabel] ||
+				current.Labels[util.EipUIDLabel] != want.Labels[util.EipUIDLabel]
+			if specChanged || claimChanged || !maps.Equal(current.Labels, want.Labels) || len(current.Finalizers) != 0 {
+				if specChanged || claimChanged {
+					// The update drops identity evidence or an EIP claim from the ledger: keep a
+					// snapshot of the retired content until the data plane caught up.
+					snapshotName, err := c.snapshotNftableLbRecord(svc, current)
+					if err != nil {
+						return nil, nil, err
+					}
+					retiring = append(retiring, snapshotName)
+				}
 				updated := current.DeepCopy()
 				updated.Spec = want.Spec
 				updated.Labels = maps.Clone(want.Labels)
@@ -640,13 +687,48 @@ func (c *Controller) claimNftableLbRecords(svc *v1.Service,
 				var err error
 				current, err = client.Update(context.Background(), updated, metav1.UpdateOptions{})
 				if err != nil {
-					return nil, fmt.Errorf("failed to update nftable LB record %s: %w", current.Name, err)
+					return nil, nil, fmt.Errorf("failed to update nftable LB record %s: %w", current.Name, err)
 				}
 			}
 			live[name] = current
 		}
 	}
-	return live, nil
+	return live, retiring, nil
+}
+
+// nftableLbRetireRuleName derives the deterministic name of a record's retiring snapshot. The
+// content hash distinguishes successive retired generations of one record (its UID never
+// changes), and makes the create idempotent when a pass crashed between snapshot and update.
+func nftableLbRetireRuleName(record *kubeovnv1.IptablesDnatRule) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%#v/%s/%s", record.Name, record.UID,
+		record.Spec, record.Labels[util.EipV4IpLabel], record.Labels[util.EipUIDLabel])))
+	suffix := hex.EncodeToString(sum[:])[:8]
+	base := record.Name
+	if len(base) > 63-len("-r")-len(suffix) {
+		base = base[:63-len("-r")-len(suffix)]
+	}
+	return base + "-r" + suffix
+}
+
+// snapshotNftableLbRecord persists a retiring snapshot of a record whose update drops identity
+// or claim evidence. The snapshot is a plain record: no finalizers to migrate, and no status
+// (the identity derivation of a snapshot falls back to its stored spec and EIP labels). It
+// carries the Service ownership labels, so it joins every later existing/ledger listing of this
+// Service until settle deletes it. An AlreadyExists create means an earlier pass crashed after
+// snapshotting the same content, which deterministically maps to the same name.
+func (c *Controller) snapshotNftableLbRecord(svc *v1.Service, current *kubeovnv1.IptablesDnatRule) (string, error) {
+	snapshot := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   nftableLbRetireRuleName(current),
+			Labels: maps.Clone(current.Labels),
+		},
+		Spec: *current.Spec.DeepCopy(),
+	}
+	_, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Create(context.Background(), snapshot, metav1.CreateOptions{})
+	if err != nil && !k8serrors.IsAlreadyExists(err) {
+		return "", fmt.Errorf("failed to snapshot retiring nftable LB record %s for Service %s/%s: %w", current.Name, svc.Namespace, svc.Name, err)
+	}
+	return snapshot.Name, nil
 }
 
 // releaseNftableLbRecordFinalizers removes the controller finalizers from a Service accounting
@@ -676,10 +758,12 @@ func (c *Controller) releaseNftableLbRecordFinalizers(record *kubeovnv1.Iptables
 }
 
 // settleNftableLbRecords runs once the gateway holds the desired data plane: it publishes Ready
-// status for the claimed records, then retires the records the Service no longer wants. A stale
-// record is deleted only here so its claim outlives the rule it covered.
+// status for the claimed records, then retires the records the Service no longer wants and the
+// retiring snapshots claimNftableLbRecords took of identity-changing updates. A stale record or
+// snapshot is deleted only here so its claim outlives the rule it covered.
 func (c *Controller) settleNftableLbRecords(eipIP, gateway string,
 	desired map[string]*kubeovnv1.IptablesDnatRule, existing []*kubeovnv1.IptablesDnatRule, live map[string]*kubeovnv1.IptablesDnatRule,
+	retiring []string,
 ) error {
 	client := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules()
 	for _, current := range existing {
@@ -694,6 +778,13 @@ func (c *Controller) settleNftableLbRecords(eipIP, gateway string,
 		// would hold its EIP claim forever.
 		if err := c.releaseNftableLbRecordFinalizers(current); err != nil {
 			return err
+		}
+	}
+	for _, name := range retiring {
+		// Snapshots carry no finalizers: their old EIP UID claim is released by this delete,
+		// which runs only after the data-plane cleanup of the identities they preserved.
+		if err := client.Delete(context.Background(), name, metav1.DeleteOptions{}); err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete retiring nftable LB record snapshot %s: %w", name, err)
 		}
 	}
 	for name := range desired {
@@ -801,6 +892,77 @@ func (c *Controller) clearNftableLbSvcIngressIP(svc *v1.Service) error {
 	return nil
 }
 
+// nftableLbClaimedIdentities returns the share DNAT identities of one gateway that the
+// accounting records of Services other than selfKey claim. The write order (claim, rule, Ready)
+// makes a live record the exact handover witness: the successor's claim precedes its data plane,
+// so an identity another Service's record carries may already be programmed for that successor.
+// Read through the API server: a record claimed moments ago may not be in the informer cache
+// yet, and deleting on that stale view would tear down the successor's identity (the same
+// release-side rule getIptablesEipNatFromAPI follows for an EIP's finalizer).
+func (c *Controller) nftableLbClaimedIdentities(gwName, selfKey string) (map[string]struct{}, error) {
+	rules, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().List(context.Background(), metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{util.VpcNatGatewayNameLabel: gwName}).String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list share records claiming identities of nat gw %s: %w", gwName, err)
+	}
+	var others []*kubeovnv1.IptablesDnatRule
+	for i := range rules.Items {
+		rule := &rules.Items[i]
+		if rule.Spec.Type != kubeovnv1.DnatRuleTypeShare || !util.IsNftableLbSvcRecord(rule.Labels) ||
+			util.NftableLbSvcOwnerKey(rule.Labels) == selfKey {
+			continue
+		}
+		others = append(others, rule)
+	}
+	claimed := make(map[string]struct{})
+	for key := range nftableLbExistingIdentities(others) {
+		claimed[key] = struct{}{}
+	}
+	return claimed, nil
+}
+
+// nftableLbSvcTeardownLedger synthesizes the ledger entries a Service's own intent still
+// witnesses when its accounting records are gone: one per served port, carrying the EIP address
+// it published and its ClusterIP. Only identity fields are filled - deletion is keyed by
+// vip/port/protocol, so backends are irrelevant. The EIP address comes from the EIP object, or
+// from the published ingress IP: this controller only ever sets it to the EIP's address, which
+// makes it a durable witness once the EIP itself is gone.
+func (c *Controller) nftableLbSvcTeardownLedger(svc *v1.Service) []*kubeovnv1.IptablesDnatRule {
+	eipIP := ""
+	if eipName := svc.Annotations[util.EipAnnotation]; eipName != "" {
+		if eip, err := c.iptablesEipsLister.Get(eipName); err != nil {
+			klog.Warningf("nftable lb service %s/%s teardown: failed to resolve eip %s: %v", svc.Namespace, svc.Name, eipName, err)
+		} else {
+			eipIP = eip.Status.IP
+		}
+	}
+	if eipIP == "" && len(svc.Status.LoadBalancer.Ingress) == 1 {
+		eipIP = svc.Status.LoadBalancer.Ingress[0].IP
+	}
+	clusterIP := nftableLbSvcClusterIP(svc)
+	var ledger []*kubeovnv1.IptablesDnatRule
+	for _, port := range svc.Spec.Ports {
+		protocol := strings.ToLower(string(port.Protocol))
+		if protocol != "tcp" && protocol != "udp" {
+			// Matches what the generation programs (share DNAT supports tcp/udp only).
+			continue
+		}
+		rule := &kubeovnv1.IptablesDnatRule{
+			Spec: kubeovnv1.IptablesDnatRuleSpec{
+				ClusterIP:    clusterIP,
+				ExternalPort: strconv.Itoa(int(port.Port)),
+				Protocol:     protocol,
+			},
+		}
+		if eipIP != "" {
+			rule.Labels = map[string]string{util.EipV4IpLabel: eipIP}
+		}
+		ledger = append(ledger, rule)
+	}
+	return ledger
+}
+
 // cleanupNftableLbService removes all share DNAT rules generated for the given Service and clears
 // the LoadBalancer ingress IP this controller marked as managed. Existing rules are also evidence
 // of ownership when cleanup resumes after a controller restart.
@@ -827,6 +989,17 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 			byGateway[gw] = append(byGateway[gw], rule)
 		}
 	}
+	if svc != nil && slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer) {
+		// The records may be gone while their rules are not: claim-before-rule proves a record
+		// precedes its rule, not that it outlives it, and a Service whose records were deleted
+		// can enter teardown before the restore pass ran. The Service's own intent (its ports
+		// and addresses) is the remaining witness of which identities could exist; the deletes
+		// below are idempotent and the claim check still protects any identity a successor
+		// took over, so widening the ledger with intent tears down exactly the leftovers.
+		if gw := nftableLbSvcGateway(svc); gw != "" {
+			byGateway[gw] = append(byGateway[gw], c.nftableLbSvcTeardownLedger(svc)...)
+		}
+	}
 	for gw, ledger := range byGateway {
 		gone, err := c.natGwDataPlaneGone(gw)
 		if err != nil {
@@ -839,9 +1012,20 @@ func (c *Controller) cleanupNftableLbService(svc *v1.Service, namespace, name st
 		if err != nil {
 			return err
 		}
+		claimed, err := c.nftableLbClaimedIdentities(gw, namespace+"/"+name)
+		if err != nil {
+			return err
+		}
 		delRules := make([]string, 0, len(ledger))
 		hairpinDelRules := make([]string, 0, len(ledger))
-		for _, identity := range nftableLbExistingIdentities(ledger) {
+		for key, identity := range nftableLbExistingIdentities(ledger) {
+			if _, ok := claimed[key]; ok {
+				// Another Service's record claims this identity: it owns the nft map and hairpin
+				// now (its claim precedes its programming, and its add rewrote the complete
+				// backend set). Deleting here would tear down the wiring of a successor no event
+				// wakes to repair - the same handover the program phase honors via yielded.
+				continue
+			}
 			delRules = append(delRules, nftDnatMapDelRule(identity.protocol, identity.vip, identity.externalPort))
 			hairpinDelRules = append(hairpinDelRules, fmt.Sprintf("%s,%s,%s", identity.vip, identity.externalPort, identity.protocol))
 		}

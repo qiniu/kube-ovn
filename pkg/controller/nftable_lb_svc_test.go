@@ -5,6 +5,7 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -1987,6 +1988,22 @@ func Test_handleAddOrUpdateGwNftableLbService_yieldKeepsWinnerIdentity(t *testin
 			InternalIP: backend, InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
 		}, Status: kubeovnv1.IptablesDnatRuleStatus{Ready: true, V4ip: eipIP, NatGwDp: gwName},
 	}
+	// The winner already claimed the identity: its record is the takeover witness (claim, rule,
+	// Ready) that suppresses the loser's delete even before the winner's programming lands.
+	winnerRecord := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nftableLbDnatRuleName(f.namespace, "a-winner", "tcp", "80", "10.0.7.22", "8080"),
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: f.namespace, util.NftableLbSvcNameLabel: "a-winner",
+				util.NftableLbSvcUIDLabel: string(winner.UID), util.NftableLbSvcRecordLabel: "true",
+				util.VpcNatGatewayNameLabel: gwName,
+				util.EipV4IpLabel:           eipIP, util.EipUIDLabel: "owned-eip-uid",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: eipName, ClusterIP: "10.96.1.50", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.7.22", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		}, Status: kubeovnv1.IptablesDnatRuleStatus{Ready: true, V4ip: eipIP, NatGwDp: gwName},
+	}
 
 	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
 		Vpcs:              []*kubeovnv1.Vpc{f.vpc},
@@ -1995,7 +2012,7 @@ func Test_handleAddOrUpdateGwNftableLbService_yieldKeepsWinnerIdentity(t *testin
 		Services:          []*v1.Service{winner, loser},
 		EndpointSlices:    []*discoveryv1.EndpointSlice{slice},
 		IptablesEIPs:      []*kubeovnv1.IptablesEIP{f.eip},
-		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{record},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{record, winnerRecord},
 		Pods:              gatewayPods(gwName, "10.0.7.254"),
 	})
 	require.NoError(t, err)
@@ -2040,6 +2057,303 @@ func Test_handleAddOrUpdateGwNftableLbService_yieldKeepsWinnerIdentity(t *testin
 	require.NoError(t, err)
 	require.Empty(t, updated.Spec.EIP, "the loser's claim drops the identity it yielded")
 	require.Equal(t, loserIP, updated.Spec.ClusterIP)
+}
+
+// Test_handleAddOrUpdateGwNftableLbService_backendlessWinnerKeepsNoStaleMap pins the other half
+// of the handoff: a winner with no ready endpoints claims nothing and programs nothing, so the
+// yielded identity has no takeover to protect - the loser must tear its own stale map and
+// hairpin down instead of leaving the address answered with the loser's backends while claimed
+// by nobody. When the winner gains endpoints later, its endpoint event reconciles and programs
+// the identity itself.
+func Test_handleAddOrUpdateGwNftableLbService_backendlessWinnerKeepsNoStaleMap(t *testing.T) {
+	const (
+		gwName    = "owned-gw"
+		eipName   = "owned-eip"
+		eipIP     = "172.20.0.5"
+		loserName = "z-owner"
+		loserIP   = "10.96.1.60"
+		backend   = "10.0.7.21"
+	)
+	f := newNftableLbSvcOwnershipFixture()
+	newLbSvc := func(name, clusterIP string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.namespace, Name: name, UID: types.UID(name + "-uid"),
+				Annotations: map[string]string{util.EipAnnotation: eipName, util.VpcNatGatewayAnnotation: gwName},
+				Finalizers:  []string{util.KubeOVNControllerFinalizer},
+			}, Spec: v1.ServiceSpec{
+				Type:       v1.ServiceTypeLoadBalancer,
+				ClusterIP:  clusterIP,
+				ClusterIPs: []string{clusterIP},
+				Ports:      []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
+			},
+		}
+	}
+	// "a-winner" sorts first but has no endpoints at all: no slice exists for it.
+	winner, loser := newLbSvc("a-winner", "10.96.1.50"), newLbSvc(loserName, loserIP)
+	loserSlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: f.namespace, Name: loserName + "-abc",
+			Labels: map[string]string{discoveryv1.LabelServiceName: loserName},
+		}, AddressType: discoveryv1.AddressTypeIPv4,
+		Ports:     []discoveryv1.EndpointPort{{Name: new("http"), Port: new(int32(8080)), Protocol: new(v1.ProtocolTCP)}},
+		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{backend}, Conditions: discoveryv1.EndpointConditions{Ready: new(true)}}},
+	}
+	// The previous owner's ledger from when it still held the identity.
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nftableLbDnatRuleName(f.namespace, loserName, "tcp", "80", backend, "8080"),
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: f.namespace, util.NftableLbSvcNameLabel: loserName,
+				util.NftableLbSvcUIDLabel: string(loser.UID), util.NftableLbSvcRecordLabel: "true",
+				util.VpcNatGatewayNameLabel: gwName,
+				util.EipV4IpLabel:           eipIP, util.EipUIDLabel: "owned-eip-uid",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: eipName, ClusterIP: loserIP, ExternalPort: "80", Protocol: "tcp",
+			InternalIP: backend, InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		}, Status: kubeovnv1.IptablesDnatRuleStatus{Ready: true, V4ip: eipIP, NatGwDp: gwName},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:              []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:           []*kubeovnv1.Subnet{f.subnet},
+		Services:          []*v1.Service{winner, loser},
+		EndpointSlices:    []*discoveryv1.EndpointSlice{loserSlice},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{f.eip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{record},
+		Pods:              gatewayPods(gwName, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.addOrUpdateGwNftableLbSvcQueue = newTypedRateLimitingQueue[string]("test-gw-nftable-lb-svc", nil)
+	t.Cleanup(c.addOrUpdateGwNftableLbSvcQueue.ShutDown)
+	c.resetIptablesEipQueue = newTypedRateLimitingQueue[string]("test-reset-eip", nil)
+	t.Cleanup(c.resetIptablesEipQueue.ShutDown)
+
+	type execCall struct {
+		op    string
+		rules []string
+	}
+	var execs []execCall
+	c.execRulesInPod = func(_ *v1.Pod, operation string, rules []string) error {
+		execs = append(execs, execCall{operation, append([]string(nil), rules...)})
+		return nil
+	}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(gwName), false).Return(nil, nil).AnyTimes()
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, gomock.Any()).Return(nil).AnyTimes()
+
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+loserName))
+
+	var staleDeletes, clusterIPAdds int
+	for _, call := range execs {
+		for _, rule := range call.rules {
+			if call.op == natGwNftDnatMapDel && strings.Contains(rule, eipIP) {
+				staleDeletes++
+			}
+			if call.op == natGwNftDnatMapAdd && strings.Contains(rule, loserIP) {
+				clusterIPAdds++
+			}
+		}
+	}
+	require.Positive(t, staleDeletes, "the loser tears down the stale EIP map the backend-less winner does not claim")
+	require.Positive(t, clusterIPAdds, "the loser keeps programming its own ClusterIP identity")
+
+	updated, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, updated.Spec.EIP, "the loser's claim drops the identity it yielded")
+
+	// The winner's own pass: nothing to claim and nothing to program, but nothing to delete
+	// either — the stale map is already gone.
+	execs = nil
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+winner.Name))
+	for _, call := range execs {
+		require.NotEqual(t, natGwNftDnatMapDel, call.op, "the winner has no stale wiring to remove")
+		if call.op == natGwNftDnatMapAdd {
+			for _, rule := range call.rules {
+				require.NotContains(t, rule, eipIP, "a backend-less winner must not program the EIP identity")
+			}
+		}
+	}
+	published, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), winner.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, []v1.LoadBalancerIngress{{IP: eipIP}}, published.Status.LoadBalancer.Ingress,
+		"the winner reports its ingress address; with no backends the address now refuses traffic instead of hitting the loser")
+}
+
+// Test_cleanupNftableLbService_keepsSuccessorIdentity pins the identity handover on the
+// teardown path: the conflict resolver lets a successor take over a terminating Service's EIP
+// identity, and the dying owner's cleanup must not delete the nft map and hairpin the
+// successor's claim (and possibly programming) covers - no event would wake the successor to
+// repair that. The owner's unmatched identities (here its ClusterIP leg) are still removed.
+func Test_cleanupNftableLbService_keepsSuccessorIdentity(t *testing.T) {
+	const (
+		gwName      = "owned-gw"
+		eipName     = "owned-eip"
+		eipIP       = "172.20.0.5"
+		ownerName   = "z-owner"
+		ownerIP     = "10.96.1.60"
+		successorIP = "10.96.1.50"
+		backend     = "10.0.7.21"
+	)
+	f := newNftableLbSvcOwnershipFixture()
+	newLbSvc := func(name, clusterIP string, uid types.UID) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: f.namespace, Name: name, UID: uid,
+				Annotations: map[string]string{util.EipAnnotation: eipName, util.VpcNatGatewayAnnotation: gwName},
+				Finalizers:  []string{util.KubeOVNControllerFinalizer},
+			}, Spec: v1.ServiceSpec{
+				Type:       v1.ServiceTypeLoadBalancer,
+				ClusterIP:  clusterIP,
+				ClusterIPs: []string{clusterIP},
+				Ports:      []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
+			},
+		}
+	}
+	owner := newLbSvc(ownerName, ownerIP, types.UID(ownerName+"-uid"))
+	now := metav1.Now()
+	owner.DeletionTimestamp = &now
+	successor := newLbSvc("a-winner", successorIP, types.UID("a-winner-uid"))
+	newRecord := func(svc *v1.Service, clusterIP string) *kubeovnv1.IptablesDnatRule {
+		return &kubeovnv1.IptablesDnatRule{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nftableLbDnatRuleName(f.namespace, svc.Name, "tcp", "80", backend, "8080"),
+				Labels: map[string]string{
+					util.NftableLbSvcNsLabel: f.namespace, util.NftableLbSvcNameLabel: svc.Name,
+					util.NftableLbSvcUIDLabel: string(svc.UID), util.NftableLbSvcRecordLabel: "true",
+					util.VpcNatGatewayNameLabel: gwName,
+					util.EipV4IpLabel:           eipIP, util.EipUIDLabel: "owned-eip-uid",
+				},
+			}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+				EIP: eipName, ClusterIP: clusterIP, ExternalPort: "80", Protocol: "tcp",
+				InternalIP: backend, InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+			}, Status: kubeovnv1.IptablesDnatRuleStatus{Ready: true, V4ip: eipIP, NatGwDp: gwName},
+		}
+	}
+	ownerRecord, successorRecord := newRecord(owner, ownerIP), newRecord(successor, successorIP)
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:              []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:           []*kubeovnv1.Subnet{f.subnet},
+		Services:          []*v1.Service{owner, successor},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{f.eip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{ownerRecord, successorRecord},
+		Pods:              gatewayPods(gwName, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+
+	type execCall struct {
+		op    string
+		rules []string
+	}
+	var execs []execCall
+	c.execRulesInPod = func(_ *v1.Pod, operation string, rules []string) error {
+		execs = append(execs, execCall{operation, append([]string(nil), rules...)})
+		return nil
+	}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(gwName), false).Return(nil, nil).AnyTimes()
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, gomock.Any()).Return(nil).AnyTimes()
+
+	require.NoError(t, c.cleanupNftableLbService(owner, f.namespace, ownerName))
+
+	var eipDeletes, clusterIPDeletes int
+	for _, call := range execs {
+		if call.op != natGwNftDnatMapDel && call.op != natGwVipHairpinDel {
+			continue
+		}
+		for _, rule := range call.rules {
+			if strings.Contains(rule, eipIP) {
+				eipDeletes++
+			}
+			if call.op == natGwNftDnatMapDel && strings.Contains(rule, ownerIP) {
+				clusterIPDeletes++
+			}
+		}
+	}
+	require.Zero(t, eipDeletes, "the terminating owner must not delete the identity the successor claimed")
+	require.Positive(t, clusterIPDeletes, "the old owner's own ClusterIP identity is still removed")
+
+	_, err = c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), ownerRecord.Name, metav1.GetOptions{})
+	require.True(t, k8serrors.IsNotFound(err), "the old owner's record is retired")
+	_, err = c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), successorRecord.Name, metav1.GetOptions{})
+	require.NoError(t, err, "the successor's record is untouched")
+}
+
+// Test_cleanupNftableLbService_recordlessTeardownDerivesIntent pins the record-deletion window:
+// a Service whose accounting records were deleted can enter teardown before the restore pass
+// ran. The ledger list then comes back empty, but the gateway still holds whatever the Service
+// programmed - the cleanup must derive the identities from the Service's own intent (ports,
+// EIP address, ClusterIP), run the data-plane teardown, and only then release the finalizer.
+func Test_cleanupNftableLbService_recordlessTeardownDerivesIntent(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	now := metav1.Now()
+	f.svc.DeletionTimestamp = &now
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+
+	// Every accounting record of the Service is gone (deleted out from under it; nothing was
+	// restored). The gateway keeps running, so the rules the records accounted for still exist.
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{f.eip},
+		Pods:           gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = true
+	c.config.EnableGwNftableSvcClusterIP = true
+
+	type execCall struct {
+		op    string
+		rules []string
+	}
+	var execs []execCall
+	c.execRulesInPod = func(_ *v1.Pod, operation string, rules []string) error {
+		execs = append(execs, execCall{operation, append([]string(nil), rules...)})
+		return nil
+	}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return(nil, nil).AnyTimes()
+
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+f.svc.Name))
+
+	var delVips []string
+	addrSynced := false
+	for _, call := range execs {
+		switch call.op {
+		case natGwNftDnatMapDel:
+			for _, rule := range call.rules {
+				delVips = append(delVips, strings.Split(rule, ",")[0])
+			}
+		case natGwVipAddrSync:
+			addrSynced = true
+		}
+	}
+	require.Contains(t, delVips, "172.20.0.5", "the EIP identity of the deleted-record service is torn down")
+	require.Contains(t, delVips, "10.96.1.5", "the ClusterIP identity of the deleted-record service is torn down")
+	require.True(t, addrSynced, "the lo address sync also runs without a surviving record")
+
+	released, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, released.Finalizers, "the finalizer is released only after the data-plane teardown")
+
+	rules, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Empty(t, rules.Items, "teardown creates no accounting records")
 }
 
 func TestClearNftableLbSvcIngressIP(t *testing.T) {

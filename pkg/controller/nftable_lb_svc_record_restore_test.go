@@ -13,6 +13,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -305,10 +306,11 @@ func Test_claimNftableLbRecords_migratesTerminatingRecord(t *testing.T) {
 	want.Finalizers = nil
 	want.ResourceVersion = ""
 
-	live, err := c.claimNftableLbRecords(svc, map[string]*kubeovnv1.IptablesDnatRule{record.Name: want},
+	live, retiring, err := c.claimNftableLbRecords(svc, map[string]*kubeovnv1.IptablesDnatRule{record.Name: want},
 		[]*kubeovnv1.IptablesDnatRule{terminating})
 	require.NoError(t, err)
 	require.Empty(t, live, "a terminating record is not claimed this pass")
+	require.Empty(t, retiring, "a terminating record is not snapshotted")
 
 	actions := client.Actions()
 	require.True(t, testHasAction(actions, "patch"),
@@ -346,7 +348,7 @@ func Test_settleNftableLbRecords_freesLegacyFinalizedRecords(t *testing.T) {
 
 	c := &Controller{config: &Configuration{KubeOvnClient: client}}
 	require.NoError(t, c.settleNftableLbRecords("203.0.113.10", "gw0", nil,
-		[]*kubeovnv1.IptablesDnatRule{created}, nil))
+		[]*kubeovnv1.IptablesDnatRule{created}, nil, nil))
 
 	actions := client.Actions()
 	require.True(t, testHasAction(actions, "delete"), "the stale record got its delete request")
@@ -421,4 +423,94 @@ func Test_cleanupNftableLbService_migratesLegacyFinalizers(t *testing.T) {
 	cleaned, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	require.Empty(t, cleaned.Finalizers, "the Service itself is released")
+}
+
+// Test_claimNftableLbRecords_snapshotsRetiringIdentity pins the claim lifecycle for an in-place
+// update that drops an identity: the closing ClusterIP gate strips Spec.ClusterIP from the
+// record, but the old nft map and hairpin are removed only by the program phase that follows. A
+// failed pass would retry with a ledger that no longer knows the old identity (Status.V4ip
+// records only the EIP when both legs share one record). The claim must therefore keep a
+// retiring snapshot of the old content until the data plane converged, and a retried claim must
+// not pile up further snapshots.
+func Test_claimNftableLbRecords_snapshotsRetiringIdentity(t *testing.T) {
+	t.Parallel()
+
+	client := kubeovnfake.NewSimpleClientset()
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gate-flip-record",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: "default", util.NftableLbSvcNameLabel: "web", util.NftableLbSvcRecordLabel: "true",
+				util.EipV4IpLabel: "203.0.113.10", util.EipUIDLabel: "eip0-uid",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip0", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.0.5", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	current, err := client.KubeovnV1().IptablesDnatRules().Create(context.Background(), record, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	want := record.DeepCopy()
+	want.Spec.ClusterIP = "" // the ClusterIP gate closed; the EIP leg stays desired
+	want.ResourceVersion = ""
+
+	c := &Controller{config: &Configuration{KubeOvnClient: client}}
+	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}}
+	live, retiring, err := c.claimNftableLbRecords(svc, map[string]*kubeovnv1.IptablesDnatRule{record.Name: want},
+		[]*kubeovnv1.IptablesDnatRule{current})
+	require.NoError(t, err)
+	require.Contains(t, live, record.Name)
+	require.Len(t, retiring, 1, "an identity-dropping update snapshots the retired content")
+
+	snapshot, err := client.KubeovnV1().IptablesDnatRules().Get(context.Background(), retiring[0], metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "10.96.1.5", snapshot.Spec.ClusterIP, "the snapshot keeps the retired identity")
+	require.Equal(t, "eip0-uid", snapshot.Labels[util.EipUIDLabel], "the snapshot keeps the old EIP claim until cleanup")
+	require.Empty(t, snapshot.Finalizers, "the snapshot needs no finalizer migration")
+
+	updated := live[record.Name]
+	require.Empty(t, updated.Spec.ClusterIP, "the accounting record itself converges to desired")
+
+	// The retry view after the failed program phase: the updated record alone has lost the old
+	// ClusterIP, the snapshot restores it for the cleanup derivation.
+	identities := nftableLbExistingIdentities([]*kubeovnv1.IptablesDnatRule{updated, snapshot})
+	require.Contains(t, identities, "10.96.1.5/80/tcp", "a retried pass must still find the retiring ClusterIP identity")
+
+	// A reconciled claim (specs equal) creates no further snapshot.
+	_, retiring, err = c.claimNftableLbRecords(svc, map[string]*kubeovnv1.IptablesDnatRule{record.Name: want},
+		[]*kubeovnv1.IptablesDnatRule{updated})
+	require.NoError(t, err)
+	require.Empty(t, retiring, "a converged record is not snapshotted again")
+}
+
+// Test_settleNftableLbRecords_retiresSnapshot pins the release order: the retiring snapshot's
+// delete only happens in settle, after the gateway cleanup of the identities it preserved, so
+// its old EIP UID claim outlives the rule it covered. Settle tolerates an already-deleted
+// snapshot (the delete of a crashed pass is replayed).
+func Test_settleNftableLbRecords_retiresSnapshot(t *testing.T) {
+	t.Parallel()
+
+	client := kubeovnfake.NewSimpleClientset()
+	snapshot := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gate-flip-record-r12345678",
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: "default", util.NftableLbSvcNameLabel: "web", util.NftableLbSvcRecordLabel: "true",
+				util.EipV4IpLabel: "203.0.113.10", util.EipUIDLabel: "eip0-uid",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "eip0", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.0.5", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		},
+	}
+	if _, err := client.KubeovnV1().IptablesDnatRules().Create(context.Background(), snapshot, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Controller{config: &Configuration{KubeOvnClient: client}}
+	require.NoError(t, c.settleNftableLbRecords("203.0.113.10", "gw0", nil, nil, nil,
+		[]string{snapshot.Name, "already-gone-snapshot"}))
+	_, err := client.KubeovnV1().IptablesDnatRules().Get(context.Background(), snapshot.Name, metav1.GetOptions{})
+	require.True(t, k8serrors.IsNotFound(err), "the retiring snapshot is deleted once the data plane converged")
 }
