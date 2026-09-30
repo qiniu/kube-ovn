@@ -356,6 +356,17 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	if err != nil {
 		return err
 	}
+	if !serveEIP && slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
+		return rule.Spec.EIP != ""
+	}) {
+		// The EIP identity is leaving: withdraw the address from the Service first, while the
+		// records still document the ownership. Clearing after the claim stripped the EIP would
+		// be unrepetable: a failed status write is retried with records that no longer carry the
+		// evidence, and the stale ingress IP would stay forever.
+		if err := c.clearNftableLbSvcIngressIP(cachedSvc); err != nil {
+			return err
+		}
+	}
 	live, err := c.claimNftableLbRecords(cachedSvc, desired, existing)
 	if err != nil {
 		return err
@@ -372,14 +383,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 		return c.clearNftableLbSvcIngressIP(cachedSvc)
 	}
 	if !serveEIP {
-		// The EIP identity is disabled: the Service already published an ingress IP only while
-		// it had one, so it is cleared here and left alone when there was nothing to clear.
-		hadEIP := slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
-			return rule.Spec.EIP != ""
-		})
-		if hadEIP {
-			return c.clearNftableLbSvcIngressIP(cachedSvc)
-		}
+		// The EIP identity is gone from the ledger; the ingress was withdrawn before the claim.
 		return nil
 	}
 	if err = c.ensureNftableLbSvcIngressIP(cachedSvc, eipIP); err != nil {

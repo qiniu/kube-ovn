@@ -2219,3 +2219,85 @@ func Test_gatewayAnnotatedServiceKeepsItsClassicLifecycle(t *testing.T) {
 		require.Equal(t, []string{"10.96.1.5:80"}, item.Vips)
 	})
 }
+
+// Test_handleAddOrUpdateGwNftableLbService_ingressClearIsRepeatable pins the retry semantics of
+// withdrawing the ingress IP on the gate flip: the address is withdrawn before the records stop
+// documenting the EIP ownership, so a failed status write is retried from intact evidence instead
+// of leaving the stale EXTERNAL-IP behind forever.
+func Test_handleAddOrUpdateGwNftableLbService_ingressClearIsRepeatable(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	f.svc.Status.LoadBalancer.Ingress = []v1.LoadBalancerIngress{{IP: "172.20.0.5"}}
+	record := &kubeovnv1.IptablesDnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nftableLbDnatRuleName(f.namespace, f.svc.Name, "tcp", "80", "10.0.7.2", "8080"),
+			Labels: map[string]string{
+				util.NftableLbSvcNsLabel: f.namespace, util.NftableLbSvcNameLabel: f.svc.Name,
+				util.NftableLbSvcUIDLabel: string(f.svc.UID), util.NftableLbSvcRecordLabel: "true",
+				util.VpcNatGatewayNameLabel: f.gw.Name,
+				util.EipV4IpLabel:           "172.20.0.5", util.EipUIDLabel: "owned-eip-uid",
+			},
+		}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+			EIP: "owned-eip", ClusterIP: "10.96.1.5", ExternalPort: "80", Protocol: "tcp",
+			InternalIP: "10.0.7.2", InternalPort: "8080", Type: kubeovnv1.DnatRuleTypeShare,
+		}, Status: kubeovnv1.IptablesDnatRuleStatus{Ready: true, V4ip: "172.20.0.5", NatGwDp: f.gw.Name},
+	}
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:              []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways:    []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:           []*kubeovnv1.Subnet{f.subnet},
+		Services:          []*v1.Service{f.svc},
+		EndpointSlices:    []*discoveryv1.EndpointSlice{f.slice},
+		IptablesEIPs:      []*kubeovnv1.IptablesEIP{f.eip},
+		IptablesDnatRules: []*kubeovnv1.IptablesDnatRule{record},
+		Pods:              gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	// The EIP gate is off, the ClusterIP gate stays on: the EIP identity retires.
+	c.config.EnableGwNftableLbSvc = false
+	c.config.EnableGwNftableSvcClusterIP = true
+
+	kubeClient, ok := c.config.KubeClient.(*k8sfake.Clientset)
+	require.True(t, ok)
+	injected := true
+	kubeClient.PrependReactor("update", "services", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if injected && action.(k8stesting.UpdateAction).GetSubresource() == "status" {
+			injected = false
+			return true, nil, errors.New("injected status write failure")
+		}
+		return false, nil, nil
+	})
+
+	var execs []string
+	c.execRulesInPod = func(_ *v1.Pod, operation string, _ []string) error {
+		execs = append(execs, operation)
+		return nil
+	}
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return(nil, nil).AnyTimes()
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, gomock.Any()).Return(nil).AnyTimes()
+
+	key := f.namespace + "/" + f.svc.Name
+	require.Error(t, c.handleAddOrUpdateGwNftableLbService(key), "the failed withdrawal aborts the pass")
+
+	stillService, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Len(t, stillService.Status.LoadBalancer.Ingress, 1, "the ingress stays published while the withdrawal could not complete")
+	stillRecord, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "owned-eip", stillRecord.Spec.EIP, "the ledger still documents the EIP claim, so the retry sees the same ownership")
+	require.Empty(t, execs, "nothing was reprogrammed before the address was withdrawn")
+
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(key), "the retry withdraws the address and retires the identity")
+	finished, err := c.config.KubeClient.CoreV1().Services(f.namespace).Get(context.Background(), f.svc.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, finished.Status.LoadBalancer.Ingress)
+	stripped, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().Get(context.Background(), record.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, stripped.Spec.EIP, "the ledger dropped the EIP only after the address was withdrawn")
+	require.Contains(t, execs, natGwNftDnatMapDel, "the EIP identity was removed from the gateway")
+	require.Contains(t, execs, natGwNftDnatMapAdd, "the ClusterIP identity kept being served")
+}
