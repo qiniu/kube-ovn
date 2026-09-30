@@ -369,12 +369,13 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	// Records deleted out of band before this pass leave no ledger for an identity the Service
 	// trimmed since (its EIP annotation is gone, or a gate closed): the restored records would
 	// only describe the identities still served, and the old nft map and hairpin would be
-	// deleted by nobody. Recover and persist the evidence first so any later failure replays it.
-	evidence, err := c.ensureNftableLbTrimmedIdentityRecords(cachedSvc, existing, serveEIP, serveClusterIP)
+	// deleted by nobody. Recover the evidence first so any later failure replays it.
+	evidence, clusterEvidence, err := c.ensureNftableLbTrimmedIdentityRecords(cachedSvc, existing, serveEIP, serveClusterIP)
 	if err != nil {
 		return err
 	}
 	ledger := append(slices.Clone(existing), evidence...)
+	ledger = append(ledger, clusterEvidence...)
 	if !serveEIP && slices.ContainsFunc(ledger, func(rule *kubeovnv1.IptablesDnatRule) bool {
 		return rule.Spec.EIP != "" || rule.Labels[util.EipV4IpLabel] != ""
 	}) {
@@ -393,7 +394,7 @@ func (c *Controller) handleAddOrUpdateGwNftableLbService(key string) error {
 	if err = c.programNftableLbServiceDirect(cachedSvc, natGw.Name, eipIP, desired, ledger); err != nil {
 		return err
 	}
-	if err = c.settleNftableLbRecords(eipIP, gwName, desired, ledger, live, retiring); err != nil {
+	if err = c.settleNftableLbRecords(eipIP, gwName, desired, append(slices.Clone(existing), evidence...), live, retiring); err != nil {
 		return err
 	}
 
@@ -972,65 +973,76 @@ func (c *Controller) nftableLbSvcTeardownLedger(svc *v1.Service) []*kubeovnv1.Ip
 // while its accounting records were missing. Records deleted out of band erase exactly the
 // evidence a trim reconcile needs to remove the old nft map and hairpin: the restored records
 // only describe the identities still served, and the ingress-clearing guard above would never
-// fire either. Persisting the recovered evidence (deterministic names, create is idempotent)
-// before the claim narrows the ledger keeps the old identities retrievable across failed
-// passes; settle retires these records together with the stale ones once the data plane
-// converged. A leg that was never programmed costs one idempotent delete; a leg another
-// Service took over is protected by the claim check in the program phase.
+// fire either. It returns the persisted EIP-leg tombstones (retired by settle once the data
+// plane converged) and the in-memory ClusterIP-leg entries, which join only the program view.
+// A leg another Service took over is protected by the claim check in the program phase.
 func (c *Controller) ensureNftableLbTrimmedIdentityRecords(svc *v1.Service,
 	existing []*kubeovnv1.IptablesDnatRule, serveEIP, serveClusterIP bool,
-) ([]*kubeovnv1.IptablesDnatRule, error) {
+) (persisted, inMemory []*kubeovnv1.IptablesDnatRule, err error) {
 	if !slices.Contains(svc.Finalizers, util.KubeOVNControllerFinalizer) {
 		// The finalizer claims everything the feature programmed; without it nothing exists.
-		return nil, nil
+		return nil, nil, nil
 	}
-	trimmedEip := !serveEIP && !slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
+	// Only recover identities a witness proves were wired, or every gate-flipped Service would
+	// churn create/delete tombstones per reconcile (their settle deletion wakes the owner again
+	// - a hot loop). The EIP leg's witness is the published ingress: this controller only ever
+	// puts the EIP's address there, and the trim clears it, so a finished trim stops qualifying.
+	// It is also consumed mid-pass (the ingress is withdrawn before the gateway is touched), so
+	// the evidence must be persisted to survive a failed pass.
+	trimmedEip := !serveEIP && len(svc.Status.LoadBalancer.Ingress) != 0 && !slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
 		return rule.Spec.EIP != "" || rule.Labels[util.EipV4IpLabel] != ""
 	})
-	trimmedCluster := !serveClusterIP && !slices.ContainsFunc(existing, func(rule *kubeovnv1.IptablesDnatRule) bool {
-		return rule.Spec.ClusterIP != ""
-	})
-	if !trimmedEip && !trimmedCluster {
-		return nil, nil
+	// The ClusterIP leg needs evidence only when the whole ledger was lost: its address is the
+	// immutable spec field, so a stripped record set or the in-flight pass above keeps it
+	// readable otherwise. The witness is never consumed, so the evidence stays in memory: no
+	// records to churn, and a failed pass rederives it identically.
+	lostClusterLedger := !serveClusterIP && len(existing) == 0 && nftableLbSvcClusterIP(svc) != ""
+	if !trimmedEip && !lostClusterLedger {
+		return nil, nil, nil
 	}
 
 	client := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules()
-	var evidence []*kubeovnv1.IptablesDnatRule
 	for _, intent := range c.nftableLbSvcTeardownLedger(svc) {
 		eipIP := intent.Labels[util.EipV4IpLabel]
-		if intent.Spec.ClusterIP == "" && eipIP == "" {
-			// No witness for either leg of this port.
-			continue
-		}
-		record := &kubeovnv1.IptablesDnatRule{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: nftableLbDnatRuleName(svc.Namespace, svc.Name, intent.Spec.Protocol, intent.Spec.ExternalPort, "trimmed", "evidence"),
-				Labels: map[string]string{
-					util.NftableLbSvcNsLabel:     svc.Namespace,
-					util.NftableLbSvcNameLabel:   svc.Name,
-					util.NftableLbSvcUIDLabel:    string(svc.UID),
-					util.NftableLbSvcRecordLabel: "true",
-					util.VpcNatGatewayNameLabel:  nftableLbSvcGateway(svc),
+		if trimmedEip && eipIP != "" {
+			record := &kubeovnv1.IptablesDnatRule{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: nftableLbDnatRuleName(svc.Namespace, svc.Name, intent.Spec.Protocol, intent.Spec.ExternalPort, "trimmed", "evidence"),
+					Labels: map[string]string{
+						util.NftableLbSvcNsLabel:     svc.Namespace,
+						util.NftableLbSvcNameLabel:   svc.Name,
+						util.NftableLbSvcUIDLabel:    string(svc.UID),
+						util.NftableLbSvcRecordLabel: "true",
+						util.VpcNatGatewayNameLabel:  nftableLbSvcGateway(svc),
+						util.EipV4IpLabel:            eipIP,
+					},
+				}, Spec: kubeovnv1.IptablesDnatRuleSpec{
+					ClusterIP:    intent.Spec.ClusterIP,
+					ExternalPort: intent.Spec.ExternalPort,
+					Protocol:     intent.Spec.Protocol,
+					Type:         kubeovnv1.DnatRuleTypeShare,
+					// A tombstone: only the identity (vip, port, protocol) is read back; the backend
+					// fields exist just to satisfy admission.
+					InternalIP: "0.0.0.0", InternalPort: "1",
 				},
-			}, Spec: kubeovnv1.IptablesDnatRuleSpec{
-				ClusterIP:    intent.Spec.ClusterIP,
-				ExternalPort: intent.Spec.ExternalPort,
-				Protocol:     intent.Spec.Protocol,
-				Type:         kubeovnv1.DnatRuleTypeShare,
-				// A tombstone: only the identity (vip, port, protocol) is read back; the backend
-				// fields exist just to satisfy admission.
-				InternalIP: "0.0.0.0", InternalPort: "1",
-			},
+			}
+			if _, err := client.Create(context.Background(), record, metav1.CreateOptions{}); err != nil && !k8serrors.IsAlreadyExists(err) {
+				return nil, nil, fmt.Errorf("failed to persist trimmed identity evidence %s for Service %s/%s: %w", record.Name, svc.Namespace, svc.Name, err)
+			}
+			persisted = append(persisted, record)
 		}
-		if eipIP != "" {
-			record.Labels[util.EipV4IpLabel] = eipIP
+		if lostClusterLedger && intent.Spec.ClusterIP != "" {
+			inMemory = append(inMemory, &kubeovnv1.IptablesDnatRule{
+				Spec: kubeovnv1.IptablesDnatRuleSpec{
+					ClusterIP:    intent.Spec.ClusterIP,
+					ExternalPort: intent.Spec.ExternalPort,
+					Protocol:     intent.Spec.Protocol,
+					Type:         kubeovnv1.DnatRuleTypeShare,
+				},
+			})
 		}
-		if _, err := client.Create(context.Background(), record, metav1.CreateOptions{}); err != nil && !k8serrors.IsAlreadyExists(err) {
-			return nil, fmt.Errorf("failed to persist trimmed identity evidence %s for Service %s/%s: %w", record.Name, svc.Namespace, svc.Name, err)
-		}
-		evidence = append(evidence, record)
 	}
-	return evidence, nil
+	return persisted, inMemory, nil
 }
 
 // cleanupNftableLbService removes all share DNAT rules generated for the given Service and clears

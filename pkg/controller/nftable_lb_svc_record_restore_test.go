@@ -632,3 +632,49 @@ func Test_handleUpdateIptablesEip_releasedWhenServiceServesOnlyClusterIP(t *test
 	require.NoError(t, err)
 	require.Empty(t, released.Finalizers, "a Service owing no EIP leg must not hold the release, finalizer or not")
 }
+
+// Test_handleAddOrUpdateGwNftableLbService_noTombstoneChurnAfterTrim pins the steady state after
+// a trim: a Service whose EIP leg is disabled and whose ingress is already withdrawn must not
+// recreate evidence records on every reconcile - a tombstone's settle deletion wakes the owner,
+// which would recreate it forever (and transiently hold a terminating EIP via its EIP label).
+// The pass touches only the still-served ClusterIP claim.
+func Test_handleAddOrUpdateGwNftableLbService_noTombstoneChurnAfterTrim(t *testing.T) {
+	f := newNftableLbSvcOwnershipFixture()
+	delete(f.svc.Annotations, util.EipAnnotation)
+	f.svc.Finalizers = []string{util.KubeOVNControllerFinalizer}
+	// No ingress published: either the EIP leg never served (gate always off) or its trim
+	// already completed. Neither can owe the gateway an EIP identity.
+
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{f.vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{f.gw},
+		Subnets:        []*kubeovnv1.Subnet{f.subnet},
+		Services:       []*v1.Service{f.svc},
+		EndpointSlices: []*discoveryv1.EndpointSlice{f.slice},
+		Pods:           gatewayPods(f.gw.Name, "10.0.7.254"),
+	})
+	require.NoError(t, err)
+	c := fc.fakeController
+	c.config.EnableGwNftableLbSvc = false
+	c.config.EnableGwNftableSvcClusterIP = true
+	c.execRulesInPod = func(_ *v1.Pod, _ string, _ []string) error { return nil }
+	fc.mockOvnClient.EXPECT().ListLogicalRouterPolicies(util.DefaultVpc, util.NatGatewayVipPolicyPriority,
+		natGwVipRouteExternalIDs(f.gw.Name), false).Return(nil, nil).AnyTimes()
+	fc.mockOvnClient.EXPECT().AddLogicalRouterPolicy(util.DefaultVpc, util.NatGatewayVipPolicyPriority, gomock.Any(),
+		string(kubeovnv1.PolicyRouteActionReroute), []string{"10.0.7.254"}, nil, gomock.Any()).Return(nil).AnyTimes()
+
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+f.svc.Name))
+	require.Eventually(t, func() bool {
+		rules, err := c.iptablesDnatRulesLister.List(labels.Everything())
+		return err == nil && len(rules) == 1
+	}, 5*time.Second, 10*time.Millisecond, "the informer observes the claimed record")
+
+	client, ok := c.config.KubeOvnClient.(*kubeovnfake.Clientset)
+	require.True(t, ok)
+	client.ClearActions()
+	require.NoError(t, c.handleAddOrUpdateGwNftableLbService(f.namespace+"/"+f.svc.Name))
+	for _, action := range client.Actions() {
+		require.NotEqual(t, "create", action.GetVerb(), "a settled ledger must not recreate evidence records")
+		require.NotEqual(t, "delete", action.GetVerb(), "a settled ledger has no tombstones or stale records to delete")
+	}
+}
