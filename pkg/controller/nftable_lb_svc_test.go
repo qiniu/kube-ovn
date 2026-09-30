@@ -2158,3 +2158,64 @@ func TestNftableLbExistingIdentities(t *testing.T) {
 	require.Contains(t, got, "203.0.113.10/80/tcp")
 	require.Contains(t, got, "10.96.1.5/80/tcp")
 }
+
+// Test_gatewayAnnotatedServiceKeepsItsClassicLifecycle pins the ownership partition between the
+// two implementations: the gateway nftable LB mode owns only a Service's EIP identity, so the
+// classic OVN paths keep managing its ClusterIP VIPs and backends. Without that, adding the
+// gateway annotations would freeze the ClusterIP's backend set, and deleting the Service would
+// leak its ClusterIP VIP in the OVN load balancer tables.
+func Test_gatewayAnnotatedServiceKeepsItsClassicLifecycle(t *testing.T) {
+	t.Parallel()
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default", Name: "web",
+			Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0", util.EipAnnotation: "eip0"},
+		}, Spec: v1.ServiceSpec{
+			Type:       v1.ServiceTypeLoadBalancer,
+			ClusterIP:  "10.96.1.5",
+			ClusterIPs: []string{"10.96.1.5"},
+			Ports:      []v1.ServicePort{{Name: "http", Port: 80, Protocol: v1.ProtocolTCP}},
+		},
+	}
+
+	t.Run("updates keep flowing to the OVN path", func(t *testing.T) {
+		gwQueue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+		delQueue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*vpcService]())
+		updateQueue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*updateSvcObject]())
+		t.Cleanup(gwQueue.ShutDown)
+		t.Cleanup(delQueue.ShutDown)
+		t.Cleanup(updateQueue.ShutDown)
+		c := &Controller{
+			config:                         &Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true},
+			addOrUpdateGwNftableLbSvcQueue: gwQueue,
+			deleteServiceQueue:             delQueue,
+			updateServiceQueue:             updateQueue,
+		}
+
+		oldSvc := svc.DeepCopy()
+		oldSvc.ResourceVersion = "1"
+		oldSvc.Annotations = nil
+		newSvc := svc.DeepCopy()
+		newSvc.ResourceVersion = "2"
+		c.enqueueUpdateService(oldSvc, newSvc)
+
+		require.Equal(t, 1, gwQueue.Len(), "gaining the annotations wakes the gateway reconcile")
+		require.Equal(t, 0, delQueue.Len(), "nothing is torn down for an update")
+		require.Equal(t, 1, updateQueue.Len(), "the OVN ClusterIP VIP resync keeps running for the gateway-managed service")
+	})
+
+	t.Run("deletes release the OVN ClusterIP VIPs", func(t *testing.T) {
+		delQueue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*vpcService]())
+		t.Cleanup(delQueue.ShutDown)
+		c := &Controller{
+			config:             &Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true},
+			deleteServiceQueue: delQueue,
+		}
+
+		c.enqueueDeleteService(svc.DeepCopy())
+		require.Equal(t, 1, delQueue.Len(), "the ClusterIP VIP cleanup of a gateway-managed service runs")
+		item, _ := delQueue.Get()
+		require.Equal(t, []string{"10.96.1.5:80"}, item.Vips)
+	})
+}

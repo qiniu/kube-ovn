@@ -156,11 +156,10 @@ func (c *Controller) handleUpdateEndpointSlice(key string) error {
 		klog.Error(err)
 		return err
 	}
-	if c.usesGwNftableLbService(cachedService) {
-		// The Service is served by the gateway nftables data plane, which consumes the same
-		// EndpointSlice events through its own queue; OVN must not program it as well.
-		return nil
-	}
+	// A Service pointing at a gateway nftable LB is not skipped: the gateway owns only its EIP
+	// identity, its ClusterIP VIPs and backends stay programmed by the classic OVN LB whenever
+	// that mode runs. (The full-takeover mode --enable-gw-nftable-svc-cluster-ip is mutually
+	// exclusive with --enable-lb, so this handler then sees no events at all.)
 	svc := cachedService.DeepCopy()
 
 	var (

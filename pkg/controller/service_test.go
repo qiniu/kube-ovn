@@ -16,19 +16,6 @@ import (
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-func TestUsesGwNftableLbService(t *testing.T) {
-	t.Parallel()
-
-	c := &Controller{config: &Configuration{EnableGwNftableLbSvc: true}}
-	svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{
-		Annotations: map[string]string{util.VpcNatGatewayAnnotation: "gw0"},
-	}, Spec: v1.ServiceSpec{Type: v1.ServiceTypeLoadBalancer}}
-	require.False(t, c.usesGwNftableLbService(svc), "a Service without an EIP must stay on the OVN path")
-
-	svc.Annotations[util.EipAnnotation] = "eip0"
-	require.True(t, c.usesGwNftableLbService(svc))
-}
-
 func Test_getVipIps(t *testing.T) {
 	t.Parallel()
 
