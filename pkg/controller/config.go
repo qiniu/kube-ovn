@@ -101,6 +101,9 @@ type Configuration struct {
 	EnableGwNftableLbSvc bool
 	// EnableGwNftableSvcClusterIP syncs Service ClusterIPs to gateway nftables.
 	EnableGwNftableSvcClusterIP bool
+	// EnableGwNftableLanipVip additionally serves every gateway-bound Service through the
+	// gateway's lanIP (nftables only, no routes and no loopback addresses needed).
+	EnableGwNftableLanipVip     bool
 	EnableBgpLbVip              bool
 	EnableOVNLBPreferLocal      bool
 	EnableMetrics               bool
@@ -206,6 +209,7 @@ func ParseFlags() (*Configuration, error) {
 		argEnablePodLbSvc              = pflag.Bool("enable-lb-svc", false, "Enable Pod-based LoadBalancer Service mode: the controller creates a dedicated Pod per LB Service to provide external IP connectivity via iptables NAT. Mutually exclusive with --enable-bgp-lb-vip")
 		argEnableGwNftableLbSvc        = pflag.Bool("enable-gw-nftable-lb-svc", false, "Enable LoadBalancer Service backed by VPC NAT Gateway nftables share DNAT: the gateway pod serves the Service's EIP identities (its ingress IP), replacing a load-balancer Pod")
 		argEnableGwNftableSvcClusterIP = pflag.Bool("enable-gw-nftable-svc-cluster-ip", false, "Serve Service ClusterIP identities through VPC NAT Gateway nftables share DNAT instead of the OVN switch load balancers")
+		argEnableGwNftableLanipVip     = pflag.Bool("enable-gw-nftable-lanip-vip", false, "Additionally serve every Service bound to a VPC NAT Gateway through the gateway's lanIP (nftables): the lanIP becomes a shared frontend where Services with the same port+protocol merge their backends; needs no routes and combines with every other load balancer mode")
 		argEnableBgpLbVip              = pflag.Bool("enable-bgp-lb-vip", false, "Enable BGP LB EIP mode: allocates a LoadBalancer external IP via a VIP CR (type=bgp_lb_vip) on a non-OVN subnet and announces it through the BGP speaker. No lb-svc Pod is created. Mutually exclusive with --enable-lb-svc")
 		argEnableOVNLBPreferLocal      = pflag.Bool("enable-ovn-lb-prefer-local", false, "Whether to support ovn loadbalancer prefer local")
 		argEnableMetrics               = pflag.Bool("enable-metrics", true, "Whether to support metrics query")
@@ -318,6 +322,7 @@ func ParseFlags() (*Configuration, error) {
 		EnablePodLbSvc:                 *argEnablePodLbSvc,
 		EnableGwNftableLbSvc:           *argEnableGwNftableLbSvc,
 		EnableGwNftableSvcClusterIP:    *argEnableGwNftableSvcClusterIP,
+		EnableGwNftableLanipVip:        *argEnableGwNftableLanipVip,
 		EnableBgpLbVip:                 *argEnableBgpLbVip,
 		EnableOVNLBPreferLocal:         *argEnableOVNLBPreferLocal,
 		EnableMetrics:                  *argEnableMetrics,
@@ -421,6 +426,12 @@ func (config *Configuration) validateModeFlags() error {
 //	ingress IP of a LB Service     iptables/ipvs in a per-Service LB Pod  --enable-lb-svc
 //	EIP identities of a LB Service nftables in its VPC NAT gateway pod    --enable-gw-nftable-lb-svc
 //	ClusterIP of any Service       nftables in VPC NAT gateway pods       --enable-gw-nftable-svc-cluster-ip
+//	lanIP frontends of all Services of a gateway   nftables in its VPC NAT gateway pod   --enable-gw-nftable-lanip-vip
+//
+// The lanIP switch is the only pure add-on: it serves extra frontends for the Services that
+// already point at a gateway, needs no other flag, and conflicts with none (its VIPs are pod
+// IPs no other implementation programs). Services that share a port+protocol on one lanIP merge
+// their backends into one identity rather than conflicting.
 //
 // A flag gates programming only: a reconcile never creates state for a disabled implementation,
 // but teardown of already-managed state runs regardless of the flag so finalizers and leftover

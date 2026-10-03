@@ -700,8 +700,10 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 		}
 	}
 	// Service records never redo themselves. Reconcile the Services bound to this gateway so the
-	// only share-DNAT writer restores the new gateway instance.
+	// only share-DNAT writer restores the new gateway instance. The lanIP identity partition is
+	// rebuilt by its own complete-set sync for the same reason.
 	c.enqueueGwNftableLbServicesForNatGw(natGwKey)
+	c.enqueueNatGwLanVipSync(natGwKey)
 	return nil
 }
 

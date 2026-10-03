@@ -70,6 +70,10 @@ func:
   ENABLE_LB_SVC: false
   ENABLE_GW_NFTABLE_LB_SVC: false
   ENABLE_GW_NFTABLE_SVC_CLUSTER_IP: false
+  # ENABLE_GW_NFTABLE_LANIP_VIP additionally serves every Service bound to a VPC NAT gateway
+  # through the gateway's lanIP (nftables only; no routes needed). It combines with every
+  # other load balancer mode, and Services sharing a port+protocol on one lanIP merge backends.
+  ENABLE_GW_NFTABLE_LANIP_VIP: false
   ENABLE_BGP_LB_VIP: false
   ENABLE_KEEP_VM_IP: true
   LS_DNAT_MOD_DL_DST: true

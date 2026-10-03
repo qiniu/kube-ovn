@@ -842,6 +842,7 @@ false
   "SET_VXLAN_TX_OFF": false,
   "enableBgpLbVip": false,
   "enableExternalVpcs": false,
+  "enableGwNftableLanipVip": false,
   "enableGwNftableLoadbalancerService": false,
   "enableGwNftableServiceClusterIp": false,
   "enableHardwareOffload": false,
@@ -887,6 +888,15 @@ false
 </pre>
 </td>
 			<td>Enable Kube-OVN nftable share DNAT based loadbalancer services on vpc nat gateway. Mutually exclusive with enableLoadbalancerService.</td>
+		</tr>
+		<tr>
+			<td>features.enableGwNftableLanipVip</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Additionally serve every Service bound to a VPC NAT gateway through the gateway's lanIP (nftables only; no routes needed). Combines with every other load balancer mode; Services sharing a port+protocol on one lanIP merge their backends.</td>
 		</tr>
 		<tr>
 			<td>features.enableGwNftableServiceClusterIp</td>
