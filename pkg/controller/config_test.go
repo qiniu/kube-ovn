@@ -115,6 +115,13 @@ func TestConfigurationValidateServiceFeatureGates(t *testing.T) {
 			config:  Configuration{EnableOvnLB: true, EnableGwNftableSvcClusterIP: true},
 			wantErr: "--enable-gw-nftable-svc-cluster-ip and --enable-lb are mutually exclusive",
 		},
+		{
+			// the lanIP vip switch is a pure add-on: it must combine with every mode,
+			// including on its own
+			name:   "lanip vip combines with every mode",
+			config: Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true, EnableGwNftableLanipVip: true},
+		},
+		{name: "lanip vip alone", config: Configuration{EnableGwNftableLanipVip: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

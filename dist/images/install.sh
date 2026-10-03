@@ -26,6 +26,7 @@ CNI_CONFIG_PRIORITY=${CNI_CONFIG_PRIORITY:-01}
 ENABLE_LB_SVC=${ENABLE_LB_SVC:-false}
 ENABLE_GW_NFTABLE_LB_SVC=${ENABLE_GW_NFTABLE_LB_SVC:-false}
 ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=${ENABLE_GW_NFTABLE_SVC_CLUSTER_IP:-false}
+ENABLE_GW_NFTABLE_LANIP_VIP=${ENABLE_GW_NFTABLE_LANIP_VIP:-false}
 ENABLE_BGP_LB_VIP=${ENABLE_BGP_LB_VIP:-false}
 ENABLE_NAT_GW=${ENABLE_NAT_GW:-true}
 ENABLE_KEEP_VM_IP=${ENABLE_KEEP_VM_IP:-true}
@@ -207,6 +208,7 @@ echo "Enable LB:            $ENABLE_LB"
 echo "Enable LB SVC:        $ENABLE_LB_SVC"
 echo "Enable GW NFT LB SVC: $ENABLE_GW_NFTABLE_LB_SVC"
 echo "Enable GW NFT SVC ClusterIP: $ENABLE_GW_NFTABLE_SVC_CLUSTER_IP"
+echo "Enable GW NFT LANIP VIP: $ENABLE_GW_NFTABLE_LANIP_VIP"
 echo "Enable BGP LB VIP:    $ENABLE_BGP_LB_VIP"
 echo "Enable Networkpolicy: $ENABLE_NP"
 echo "Enable EIP and SNAT:  $ENABLE_EIP_SNAT"
@@ -5430,6 +5432,7 @@ spec:
           - --enable-lb-svc=$ENABLE_LB_SVC
           - --enable-gw-nftable-lb-svc=$ENABLE_GW_NFTABLE_LB_SVC
           - --enable-gw-nftable-svc-cluster-ip=$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP
+          - --enable-gw-nftable-lanip-vip=$ENABLE_GW_NFTABLE_LANIP_VIP
           - --enable-bgp-lb-vip=$ENABLE_BGP_LB_VIP
           - --keep-vm-ip=$ENABLE_KEEP_VM_IP
           - --enable-metrics=$ENABLE_METRICS

@@ -204,6 +204,9 @@ features:
   # -- Enable ClusterIP services through nftable share DNAT on a VPC NAT gateway. Mutually exclusive with enableLoadbalancer and enableLoadbalancerService.
   # @section -- Opt-in/out Features
   enableGwNftableServiceClusterIp: false
+  # -- Additionally serve every Service bound to a VPC NAT gateway through the gateway's lanIP (nftables only; no routes needed). Combines with every other load balancer mode; Services sharing a port+protocol on one lanIP merge their backends.
+  # @section -- Opt-in/out Features
+  enableGwNftableLanipVip: false
   # -- Enable BGP LB VIP: use a bgp_lb_vip CRD as the IP source for LoadBalancer Services
   # instead of a NAT-gateway EIP. Mutually exclusive with enableLoadbalancerService.
   # @section -- Opt-in/out Features

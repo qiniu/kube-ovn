@@ -150,6 +150,9 @@ spec:
           {{- if .Values.features.enableGwNftableServiceClusterIp }}
           - --enable-gw-nftable-svc-cluster-ip={{- .Values.features.enableGwNftableServiceClusterIp }}
           {{- end }}
+          {{- if .Values.features.enableGwNftableLanipVip }}
+          - --enable-gw-nftable-lanip-vip={{- .Values.features.enableGwNftableLanipVip }}
+          {{- end }}
           - --enable-bgp-lb-vip={{- .Values.features.enableBgpLbVip }}
           - --keep-vm-ip={{- .Values.features.enableKeepVmIps }}
           - --enable-metrics={{- .Values.networking.enableMetrics }}
