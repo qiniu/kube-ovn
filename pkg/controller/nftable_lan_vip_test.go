@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"slices"
 	"testing"
 
@@ -164,10 +165,28 @@ func TestHandleSyncNatGwLanVipProgramsPartition(t *testing.T) {
 	require.Equal(t, natGwNftLanVipSync, calls[0].op)
 	require.Len(t, calls[0].rules, 2)
 
-	// idempotent: a second sync re-programs the identical complete set
+	// the partition state is informer-derived; re-syncing an unchanged instance+rule set would
+	// program byte-identical nft state, so the redundant gateway exec is skipped
 	require.NoError(t, c.handleSyncNatGwLanVip(f.gw.Name))
-	require.Len(t, calls, 2)
-	require.Equal(t, calls[0].rules, calls[1].rules)
+	require.Len(t, calls, 1, "unchanged partition skips the redundant gateway exec")
+
+	// a recreated gateway instance (new pod UID) invalidates the cache and re-programs
+	// (the gateway pods are read through the kube client, so the fake one is updated)
+	pod := gatewayPods(f.gw.Name, f.gw.Spec.LanIP)[0]
+	pod.UID = "recreated-uid"
+	_, err := c.config.KubeClient.CoreV1().Pods(pod.Namespace).Update(context.Background(), pod, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, c.handleSyncNatGwLanVip(f.gw.Name))
+	require.Len(t, calls, 2, "new gateway instance forces re-program")
+
+	// intent changes re-program too (deleting svc-b shrinks the shared 80/tcp identity to
+	// svc-a's backends), again only once per actual change
+	require.NoError(t, fc.fakeInformers.serviceInformer.Informer().GetIndexer().Delete(f.svcs[1]))
+	require.NoError(t, c.handleSyncNatGwLanVip(f.gw.Name))
+	require.Len(t, calls, 3, "intent change forces re-program")
+	require.NotEqual(t, calls[1].rules, calls[2].rules)
+	require.NoError(t, c.handleSyncNatGwLanVip(f.gw.Name))
+	require.Len(t, calls, 3, "and the identical follow-up sync is skipped again")
 }
 
 func TestHandleSyncNatGwLanVipFlagOffWipesPartition(t *testing.T) {

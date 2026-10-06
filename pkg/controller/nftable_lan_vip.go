@@ -286,6 +286,7 @@ func (c *Controller) handleSyncNatGwLanVip(gwName string) error {
 		if k8serrors.IsNotFound(err) {
 			// The gateway is gone and its Pods (and their rules) cascade away with it.
 			c.natGwLanVipMergeNotes.Delete(gwName)
+			c.natGwLanVipLastSync.Delete(gwName)
 			return nil
 		}
 		return err
@@ -333,9 +334,36 @@ func (c *Controller) handleSyncNatGwLanVip(gwName string) error {
 		}
 		return nil
 	}
+
+	// The desired set is computed purely from informer state and the script reconciles the
+	// partition to exactly that set, so while the gateway instance set (pod UIDs) and the rule
+	// set are both unchanged, a re-exec would program byte-identical nft state. Skip it:
+	// EndpointSlice churn drives this path heavily, and execing per event per gateway is the
+	// dominant cost of the feature at scale. A restarted instance (new UID) or any intent
+	// change invalidates the signature and re-programs. No periodic self-heal is attempted
+	// for out-of-band nft edits inside the gateway Pod; the instance redo (UID change) or the
+	// next intent change re-syncs.
+	sig := natGwLanVipSyncSignature(pods, rules)
+	if prev, ok := c.natGwLanVipLastSync.Load(gwName); ok && prev == sig {
+		klog.V(3).Infof("nat gw %s: lanIP vip partition unchanged, skipping exec", gwName)
+		return nil
+	}
 	if err = c.execNatGwRulesInPods(pods, natGwNftLanVipSync, rules); err != nil {
 		return fmt.Errorf("failed to sync lanIP vip identities of nat gw %s: %w", gwName, err)
 	}
+	c.natGwLanVipLastSync.Store(gwName, sig)
 	klog.Infof("nat gw %s: synced %d lanIP vip identities to %d pod(s)", gwName, len(rules), len(pods))
 	return nil
+}
+
+// natGwLanVipSyncSignature identifies the exact gateway state a sync would program: which
+// instances would receive it (their UIDs, so a recreated Pod can never be mistaken for the
+// old one) plus the full desired rule set (already deterministically ordered).
+func natGwLanVipSyncSignature(pods []*v1.Pod, rules []string) string {
+	uids := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		uids = append(uids, string(pod.UID))
+	}
+	slices.Sort(uids)
+	return strings.Join(uids, " ") + "\x00" + strings.Join(rules, "\n")
 }

@@ -288,9 +288,12 @@ type Controller struct {
 	// natGwLanVipMergeNotes stores the last emitted affinity-merge signature per gateway, so a
 	// steady Service session-affinity disagreement logs/events only on change, not per sync.
 	natGwLanVipMergeNotes sync.Map
-	deleteServiceQueue    workqueue.TypedRateLimitingInterface[*vpcService]
-	updateServiceQueue    workqueue.TypedRateLimitingInterface[*updateSvcObject]
-	svcKeyMutex           keymutex.KeyMutex
+	// natGwLanVipLastSync stores the last successfully programmed partition signature per
+	// gateway (instance pod UIDs + desired rules), so byte-identical re-syncs skip the pod exec.
+	natGwLanVipLastSync sync.Map
+	deleteServiceQueue  workqueue.TypedRateLimitingInterface[*vpcService]
+	updateServiceQueue  workqueue.TypedRateLimitingInterface[*updateSvcObject]
+	svcKeyMutex         keymutex.KeyMutex
 
 	endpointSlicesLister          discoveryv1.EndpointSliceLister
 	endpointSlicesSynced          cache.InformerSynced

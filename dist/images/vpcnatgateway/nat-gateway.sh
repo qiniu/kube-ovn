@@ -1205,6 +1205,11 @@ function sync_nft_lanvip() {
             if [ "$wanted" = true ]; then
                 continue
             fi
+            # Same single-replica assumption as the hairpin-SNAT TODO above: the partition is
+            # scoped to the instance's own VPC address (spec.lanIp), so teardown also depends
+            # on local_vpc_ipv4 succeeding. Under HA the per-replica partitions must be keyed
+            # by their own VPC addresses, and a replica whose address lookup fails must skip
+            # the wipe rather than strand it.
             if [ "$e_vip" = "$local_ip" ] || [ "$vip_scoped" = true ]; then
                 del_nft_dnat_map "$e_vip,$e_port,$e_proto"
             fi
@@ -1251,6 +1256,13 @@ function sync_nft_lanvip() {
             "add rule ip $NFT_TABLE $NFT_POSTROUTING_CHAIN oifname \"$VPC_INTERFACE\" jump $NFT_LANVIP_SNAT_CHAIN"
             "flush chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN"
         )
+        # The 0x1 packet mark comes from the gateway boot-time iptables mangle rule
+        # (VPC_MARK: `$iptables_cmd -t mangle -A VPC_MARK -i "$VPC_INTERFACE" -j MARK
+        # --set-xmark 0x1/0x1`), which labels connections that entered through the VPC
+        # interface. skb->mark is set on the packet itself, so the nft match sees it no
+        # matter whether the image's iptables binary is the legacy or the nf_tables backend;
+        # what matters is that the boot rule ran. Without the mark the rule would match every
+        # DNAT'd flow out of the VPC interface, not just VIP inbound ones.
         for ((i=0; i<want_count; i++)); do
             cmds+=("add rule ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN meta mark and 0x1 == 0x1 oifname \"$VPC_INTERFACE\" meta l4proto ${r_proto[$i]} ct status dnat ct original ip daddr ${r_vip[$i]} ct original proto-dst ${r_port[$i]} snat to $local_ip fully-random comment \"ko-lanvip-snat\"")
         done
