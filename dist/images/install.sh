@@ -15,7 +15,18 @@ U2O_INTERCONNECTION=${U2O_INTERCONNECTION:-false}
 ENABLE_MIRROR=${ENABLE_MIRROR:-false}
 VLAN_NIC=${VLAN_NIC:-}
 HW_OFFLOAD=${HW_OFFLOAD:-false}
-ENABLE_LB=${ENABLE_LB:-true}
+# The gateway nftables Service modes default to on (the default data plane of this fork). The
+# gateway ClusterIP mode replaces --enable-lb, so ENABLE_LB defaults off while it is on, and back
+# on when the operator opts the gateway ClusterIP mode out. Explicit ENABLE_LB=true combined with
+# an enabled gateway ClusterIP mode is rejected below (mutually exclusive).
+ENABLE_GW_NFTABLE_LB_SVC=${ENABLE_GW_NFTABLE_LB_SVC:-true}
+ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=${ENABLE_GW_NFTABLE_SVC_CLUSTER_IP:-true}
+ENABLE_GW_NFTABLE_LANIP_VIP=${ENABLE_GW_NFTABLE_LANIP_VIP:-true}
+if [[ "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" ]]; then
+  ENABLE_LB=${ENABLE_LB:-false}
+else
+  ENABLE_LB=${ENABLE_LB:-true}
+fi
 ENABLE_NP=${ENABLE_NP:-true}
 NP_ENFORCEMENT=${NP_ENFORCEMENT:-standard}
 ENABLE_EIP_SNAT=${ENABLE_EIP_SNAT:-true}
@@ -24,9 +35,6 @@ LS_CT_SKIP_DST_LPORT_IPS=${LS_CT_SKIP_DST_LPORT_IPS:-true}
 ENABLE_EXTERNAL_VPC=${ENABLE_EXTERNAL_VPC:-false}
 CNI_CONFIG_PRIORITY=${CNI_CONFIG_PRIORITY:-01}
 ENABLE_LB_SVC=${ENABLE_LB_SVC:-false}
-ENABLE_GW_NFTABLE_LB_SVC=${ENABLE_GW_NFTABLE_LB_SVC:-false}
-ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=${ENABLE_GW_NFTABLE_SVC_CLUSTER_IP:-false}
-ENABLE_GW_NFTABLE_LANIP_VIP=${ENABLE_GW_NFTABLE_LANIP_VIP:-false}
 ENABLE_BGP_LB_VIP=${ENABLE_BGP_LB_VIP:-false}
 ENABLE_NAT_GW=${ENABLE_NAT_GW:-true}
 ENABLE_KEEP_VM_IP=${ENABLE_KEEP_VM_IP:-true}
@@ -217,6 +225,21 @@ echo "-------------------------------"
 
 if [[ "$ENABLE_BGP_LB_VIP" = "true" && "$ENABLE_LB_SVC" = "true" ]]; then
   echo "ERROR: ENABLE_BGP_LB_VIP and ENABLE_LB_SVC are mutually exclusive"
+  exit 1
+fi
+
+# gateway nftables modes conflict markers, mirroring the controller's validateServiceFeatureGates
+if [[ "$ENABLE_LB_SVC" = "true" && "$ENABLE_GW_NFTABLE_LB_SVC" = "true" ]]; then
+  echo "ERROR: ENABLE_LB_SVC and ENABLE_GW_NFTABLE_LB_SVC are mutually exclusive (pick one egress-IP datapath)"
+  exit 1
+fi
+if [[ "$ENABLE_LB_SVC" = "true" && "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" ]]; then
+  echo "ERROR: ENABLE_LB_SVC and ENABLE_GW_NFTABLE_SVC_CLUSTER_IP are mutually exclusive"
+  exit 1
+fi
+if [[ "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" && "$ENABLE_LB" = "true" ]]; then
+  echo "ERROR: ENABLE_GW_NFTABLE_SVC_CLUSTER_IP and ENABLE_LB are mutually exclusive"
+  echo "       (the gateway ClusterIP mode replaces the OVN load balancers; set ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=false to keep ENABLE_LB)"
   exit 1
 fi
 
