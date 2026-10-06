@@ -385,3 +385,21 @@ func TestNatGwLanVipAffinityMergeEventOnlyOnChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, drainEvents(c.recorder), "and it goes silent again afterwards")
 }
+
+// Deleting a gateway must also drop its lanVIP controller-side caches: nothing re-enqueues the
+// partition sync afterwards (the Services leave the gateway index), so without the explicit
+// cleanup the maps would grow by one entry per gateway ever created.
+func TestHandleDelVpcNatGwClearsLanVipCaches(t *testing.T) {
+	f := newLanVipFixture()
+	fc := newLanVipController(t, f, true)
+	c := fc.fakeController
+
+	c.natGwLanVipMergeNotes.Store(f.gw.Name, "80/tcp|ns/svc|clientIP=true timeout=300")
+	c.natGwLanVipLastSync.Store(f.gw.Name, "uid1\x00rules")
+
+	require.NoError(t, c.handleDelVpcNatGw("kube-system/"+f.gw.Name))
+	_, ok := c.natGwLanVipMergeNotes.Load(f.gw.Name)
+	require.False(t, ok, "merge notes forgotten on gateway delete")
+	_, ok = c.natGwLanVipLastSync.Load(f.gw.Name)
+	require.False(t, ok, "last-sync signature forgotten on gateway delete")
+}
