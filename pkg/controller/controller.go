@@ -285,9 +285,12 @@ type Controller struct {
 	addServiceQueue                workqueue.TypedRateLimitingInterface[string]
 	addOrUpdateGwNftableLbSvcQueue workqueue.TypedRateLimitingInterface[string]
 	natGwLanVipSyncQueue           workqueue.TypedRateLimitingInterface[string]
-	deleteServiceQueue             workqueue.TypedRateLimitingInterface[*vpcService]
-	updateServiceQueue             workqueue.TypedRateLimitingInterface[*updateSvcObject]
-	svcKeyMutex                    keymutex.KeyMutex
+	// natGwLanVipMergeNotes stores the last emitted affinity-merge signature per gateway, so a
+	// steady Service session-affinity disagreement logs/events only on change, not per sync.
+	natGwLanVipMergeNotes sync.Map
+	deleteServiceQueue    workqueue.TypedRateLimitingInterface[*vpcService]
+	updateServiceQueue    workqueue.TypedRateLimitingInterface[*updateSvcObject]
+	svcKeyMutex           keymutex.KeyMutex
 
 	endpointSlicesLister          discoveryv1.EndpointSliceLister
 	endpointSlicesSynced          cache.InformerSynced

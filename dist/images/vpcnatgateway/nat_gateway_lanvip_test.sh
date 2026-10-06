@@ -42,7 +42,13 @@ nft_handle_batch_line() {
         "add table ip $NFT_TABLE") touch "$TABLE" ;;
         "add chain ip $NFT_TABLE "*)
             name=$(echo "$line" | awk '{print $5}')
-            grep -qxF "$name" "$CHAINS" || echo "$name" >> "$CHAINS"
+            if grep -qxF "$name" "$CHAINS"; then
+                # real nft: `add chain` on an existing chain fails with EEXIST and the whole
+                # `nft -f` batch aborts. Report a fatal (2) so the batch runner below stops.
+                echo "Error: Could not process rule: File exists (add chain $name)" >&2
+                return 2
+            fi
+            echo "$name" >> "$CHAINS"
             ;;
         "flush chain ip $NFT_TABLE "*)
             name=$(echo "$line" | awk '{print $5}')
@@ -64,7 +70,12 @@ nft_handle_batch_line() {
             ;;
         "add set ip $NFT_TABLE "*)
             name=$(echo "$line" | awk '{print $5}')
-            grep -qxF "$name" "$SETS" || echo "$name" >> "$SETS"
+            if grep -qxF "$name" "$SETS"; then
+                # same EEXIST strictness as `add chain`
+                echo "Error: Could not process rule: File exists (add set $name)" >&2
+                return 2
+            fi
+            echo "$name" >> "$SETS"
             ;;
         "delete set ip $NFT_TABLE "*)
             name=$(echo "$line" | awk '{print $5}')
@@ -97,11 +108,16 @@ nft_handle_batch_line() {
 nft() {
     case "$*" in
         "-f -"|"-f /dev/stdin")
-            local rc=0 line
+            local rc=0 line line_rc
             while IFS= read -r line; do
                 [ -z "$line" ] && continue
                 printf 'batch %s\n' "$line" >> "$tmp_dir/cmd.log"
-                nft_handle_batch_line "$line" || rc=1
+                nft_handle_batch_line "$line"
+                line_rc=$?
+                # fatal errors (EEXIST & friends) abort the rest of the batch, like the
+                # single netlink transaction a real `nft -f` submits
+                [ "$line_rc" -eq 2 ] && return 2
+                [ "$line_rc" -ne 0 ] && rc=1
             done
             return $rc
             ;;
@@ -128,6 +144,18 @@ nft() {
             ;;
         "list map ip $NFT_TABLE $NFT_SERVICES_MAP")
             nft "list table ip $NFT_TABLE" || return 1
+            ;;
+        "list chain ip $NFT_TABLE "*)
+            local want_chain
+            want_chain=$(echo "$*" | awk '{print $5}')
+            [ -f "$TABLE" ] || return 1
+            grep -qxF "$want_chain" "$CHAINS"
+            ;;
+        "list set ip $NFT_TABLE "*)
+            local want_set
+            want_set=$(echo "$*" | awk '{print $5}')
+            [ -f "$TABLE" ] || return 1
+            grep -qxF "$want_set" "$SETS"
             ;;
         "delete element ip $NFT_TABLE "*)
             local inner vip proto port
@@ -193,6 +221,15 @@ assert_eq 1 "$(grep -c '^aff-' "$SETS")" "one affinity set for the udp identity"
 # numeric chains exist for both identities, plus the foreign one
 assert_eq 3 "$(grep -c '^dnat-' "$CHAINS")" "two lanVIP identity chains + the foreign one"
 assert_eq 2 "$(grep -c "^$NFT_TABLE $NFT_LANVIP_SNAT_CHAIN " "$RULES_LOG")" "two snat rules"
+
+echo "== re-sync the identical set (chains already exist => still succeeds, SNAT chain rebuilt)"
+: > "$RULES_LOG"
+sync_nft_lanvip \
+    "$vpc_addr,80,tcp,none,0,10.0.7.11:8080@10.0.7.12:8080" \
+    "$vpc_addr,53,udp,clientip,600,10.0.7.13:53"
+assert_eq 3 "$(wc -l < "$ELEMENTS" | tr -d ' ')" "repeat sync: identities unchanged"
+assert_eq 2 "$(grep -c "^$NFT_TABLE $NFT_LANVIP_SNAT_CHAIN " "$RULES_LOG")" "repeat sync: snat chain rebuilt with both rules"
+assert_file_contains "$RULES_LOG" " $NFT_POSTROUTING_CHAIN oifname \"$VPC_INTERFACE\" jump $NFT_LANVIP_SNAT_CHAIN"
 
 echo "== shrink to one identity"
 sync_nft_lanvip "$vpc_addr,53,udp,clientip,600,10.0.7.13:53"

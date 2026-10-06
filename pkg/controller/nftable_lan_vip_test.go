@@ -8,6 +8,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/util"
@@ -279,4 +280,89 @@ func TestHandleSyncNatGwLanVipSkipsWhenGatewayUnavailable(t *testing.T) {
 	}
 	require.NoError(t, c.handleSyncNatGwLanVip(f.gw.Name))
 	require.False(t, executed, "with no running gateway instance nothing is programmed")
+}
+
+func drainEvents(recorder record.EventRecorder) []string {
+	faker, ok := recorder.(*record.FakeRecorder)
+	if !ok {
+		return nil
+	}
+	var events []string
+	for {
+		select {
+		case e := <-faker.Events:
+			events = append(events, e)
+		default:
+			return events
+		}
+	}
+}
+
+// A shared-port affinity disagreement must merge deterministically: the seed contributor and
+// the resulting identities cannot depend on the informer index iteration order (random per
+// call), and a steady disagreement must not re-fire its Warning event on every pass.
+func TestDesiredNatGwLanVipRulesDeterministicMergeAttribution(t *testing.T) {
+	f := newLanVipFixture()
+	fc := newLanVipController(t, f, true)
+	c := fc.fakeController
+
+	reference, err := c.desiredNatGwLanVipRules(f.gw)
+	require.NoError(t, err)
+	events := drainEvents(c.recorder)
+	require.Len(t, events, 1, "exactly one affinity-merge event: svc-b merges into svc-a on 80/tcp")
+	require.Contains(t, events[0], "NatGwLanVipAffinityMerged")
+	// the message carries the merged Service's own summary (svc-b: no affinity) and names the
+	// seed contributor (svc-a: sorted first) — both are order-independent now
+	require.Contains(t, events[0], "clientIP=false timeout=0", "the event reports svc-b's summary")
+	require.Contains(t, events[0], "default/svc-a", "the seed contributor is the sorted-first Service")
+
+	for i := 0; i < 10; i++ {
+		rules, err := c.desiredNatGwLanVipRules(f.gw)
+		require.NoError(t, err)
+		require.Equal(t, reference, rules, "iteration %d: merge output must be deterministic", i)
+	}
+	require.Empty(t, drainEvents(c.recorder), "a steady disagreement re-emits nothing")
+}
+
+// The merge warning fires on changes of the gateway's disagreement set only: an unchanged
+// disagreement stays silent, a resolved disagreement resets the state, and re-introducing it
+// reports exactly once more.
+func TestNatGwLanVipAffinityMergeEventOnlyOnChange(t *testing.T) {
+	f := newLanVipFixture()
+	fc := newLanVipController(t, f, true)
+	c := fc.fakeController
+	updateSvc := func(svc *v1.Service) {
+		t.Helper()
+		require.NoError(t, fc.fakeInformers.serviceInformer.Informer().GetIndexer().Update(svc))
+	}
+
+	_, err := c.desiredNatGwLanVipRules(f.gw)
+	require.NoError(t, err)
+	require.Len(t, drainEvents(c.recorder), 1, "first emission for the fresh disagreement")
+
+	for i := 0; i < 3; i++ {
+		_, err := c.desiredNatGwLanVipRules(f.gw)
+		require.NoError(t, err)
+	}
+	require.Empty(t, drainEvents(c.recorder), "unchanged disagreement stays silent")
+
+	// Resolving the disagreement (svc-b adopts the identity's ClientIP/300s) resets the state.
+	svcB := f.svcs[1].DeepCopy()
+	svcB.Spec.SessionAffinity = v1.ServiceAffinityClientIP
+	svcB.Spec.SessionAffinityConfig = f.svcs[0].Spec.SessionAffinityConfig.DeepCopy()
+	updateSvc(svcB)
+	_, err = c.desiredNatGwLanVipRules(f.gw)
+	require.NoError(t, err)
+	require.Empty(t, drainEvents(c.recorder), "resolved disagreement emits nothing")
+
+	// Re-introducing the disagreement is a change again and reports exactly once more.
+	svcB.Spec.SessionAffinity = v1.ServiceAffinityNone
+	svcB.Spec.SessionAffinityConfig = nil
+	updateSvc(svcB)
+	_, err = c.desiredNatGwLanVipRules(f.gw)
+	require.NoError(t, err)
+	require.Len(t, drainEvents(c.recorder), 1, "a new disagreement fires exactly once")
+	_, err = c.desiredNatGwLanVipRules(f.gw)
+	require.NoError(t, err)
+	require.Empty(t, drainEvents(c.recorder), "and it goes silent again afterwards")
 }

@@ -925,17 +925,26 @@ function add_nft_dnat_map() {
             fi
         done
 
-        # Common infrastructure commands (idempotent): table, base chain, service vmap,
-        # and the base-chain dispatch rule. The base chain is share-dnat-exclusive; flushing
-        # it wipes any other rule in it (see NFT_PREROUTING_CHAIN).
+        # Common infrastructure commands: table + service vmap keep a constant spec and stay
+        # idempotent repeats; chains/sets are only created when missing because `add chain` on
+        # an existing chain fails with EEXIST on stricter nftables builds and rolls back the
+        # whole batch (an existing chain still gets flushed/rebuilt below, so set rebuilds
+        # stay complete). The base chain is share-dnat-exclusive; flushing it wipes any other
+        # rule in it (see NFT_PREROUTING_CHAIN).
         local -a cmds=(
             "add table ip $NFT_TABLE"
-            "add chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN { type nat hook prerouting priority -150 ; }"
             "add map ip $NFT_TABLE $NFT_SERVICES_MAP { type ipv4_addr . inet_proto . inet_service : verdict ; }"
+        )
+        if ! nft list chain ip "$NFT_TABLE" "$NFT_PREROUTING_CHAIN" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN { type nat hook prerouting priority -150 ; }")
+        fi
+        cmds+=(
             "flush chain ip $NFT_TABLE $NFT_PREROUTING_CHAIN"
             "add rule ip $NFT_TABLE $NFT_PREROUTING_CHAIN ip daddr . meta l4proto . th dport vmap @$NFT_SERVICES_MAP"
-            "add chain ip $NFT_TABLE $identity_chain"
         )
+        if ! nft list chain ip "$NFT_TABLE" "$identity_chain" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $identity_chain")
+        fi
 
         local keep_bkhashes=""
 
@@ -962,8 +971,14 @@ function add_nft_dnat_map() {
                 bkhashes[$i]="$bkhash"
                 keep_bkhashes="$keep_bkhashes $bkhash"
 
-                cmds+=("add set ip $NFT_TABLE $aff_set { type ipv4_addr ; flags dynamic,timeout ; timeout ${timeout}s ; }")
-                cmds+=("add chain ip $NFT_TABLE $ep_chain")
+                # create-only-when-missing (same EEXIST reasoning as above); an existing set
+                # keeps its affinity state for surviving clients when the chain is flushed
+                if ! nft list set ip "$NFT_TABLE" "$aff_set" >/dev/null 2>&1; then
+                    cmds+=("add set ip $NFT_TABLE $aff_set { type ipv4_addr ; flags dynamic,timeout ; timeout ${timeout}s ; }")
+                fi
+                if ! nft list chain ip "$NFT_TABLE" "$ep_chain" >/dev/null 2>&1; then
+                    cmds+=("add chain ip $NFT_TABLE $ep_chain")
+                fi
                 cmds+=("flush chain ip $NFT_TABLE $ep_chain")
                 cmds+=("add rule ip $NFT_TABLE $ep_chain update @$aff_set { ip saddr }")
                 cmds+=("add rule ip $NFT_TABLE $ep_chain meta l4proto $nft_proto dnat to ${ip}:${port}")
@@ -1221,9 +1236,17 @@ function sync_nft_lanvip() {
     # instance's own VPC address so a backend's reply always returns to the instance that holds
     # the conntrack entry (same reason as the iptables hairpin for the EIP/ClusterIP VIPs).
     if [ "$want_count" -gt 0 ]; then
-        local -a cmds=(
-            "add chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN { type nat hook postrouting priority 100 ; }"
-            "add chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN"
+        local -a cmds=()
+        # `add chain` on an existing chain fails with EEXIST and rolls back this whole batch,
+        # so create the feature-owned chains only when they are missing. Existing chains still
+        # get flushed and re-rule'd below, which is what keeps the set rebuild complete.
+        if ! nft list chain ip "$NFT_TABLE" "$NFT_POSTROUTING_CHAIN" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN { type nat hook postrouting priority 100 ; }")
+        fi
+        if ! nft list chain ip "$NFT_TABLE" "$NFT_LANVIP_SNAT_CHAIN" >/dev/null 2>&1; then
+            cmds+=("add chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN")
+        fi
+        cmds+=(
             "flush chain ip $NFT_TABLE $NFT_POSTROUTING_CHAIN"
             "add rule ip $NFT_TABLE $NFT_POSTROUTING_CHAIN oifname \"$VPC_INTERFACE\" jump $NFT_LANVIP_SNAT_CHAIN"
             "flush chain ip $NFT_TABLE $NFT_LANVIP_SNAT_CHAIN"

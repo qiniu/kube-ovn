@@ -85,6 +85,17 @@ type lanVipIdentity struct {
 	affinitySource string
 }
 
+// lanVipAffinityMerge records one Service whose session affinity merged into a shared lanIP
+// identity. The merge set is reported once per change, not on every reconcile (see
+// emitNatGwLanVipAffinityMerges).
+type lanVipAffinityMerge struct {
+	svc     *v1.Service
+	key     string // identity key "port/protocol"
+	summary string // this Service's "clientIP=<bool> timeout=<s>"
+	source  string // the identity's seed contributor (deterministic: Services are sorted)
+	lanIP   string
+}
+
 // desiredNatGwLanVipRules computes the complete lanIP identity set of one gateway in the
 // nft-dnat-map-add rule format, one rule per (servicePort, protocol): the backend union of
 // every candidate Service bound to the gateway, in a deterministic order. Identities with
@@ -98,10 +109,27 @@ func (c *Controller) desiredNatGwLanVipRules(gw *kubeovnv1.VpcNatGateway) ([]str
 		return nil, fmt.Errorf("failed to list services bound to nat gw %s: %w", gw.Name, err)
 	}
 
-	identities := make(map[string]*lanVipIdentity)
+	// The informer index returns Services in arbitrary order, but merge order decides which
+	// Service seeds an identity's affinitySource (and thus which Service the merge warning
+	// names). Sort by namespace/name so attribution is deterministic, like the identity keys
+	// and backends already are further down.
+	svcs := make([]*v1.Service, 0, len(svcObjs))
 	for _, svcObj := range svcObjs {
-		svc, ok := svcObj.(*v1.Service)
-		if !ok || !svc.DeletionTimestamp.IsZero() {
+		if svc, ok := svcObj.(*v1.Service); ok {
+			svcs = append(svcs, svc)
+		}
+	}
+	slices.SortFunc(svcs, func(a, b *v1.Service) int {
+		if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+
+	identities := make(map[string]*lanVipIdentity)
+	var merges []lanVipAffinityMerge
+	for _, svc := range svcs {
+		if !svc.DeletionTimestamp.IsZero() {
 			// A terminating Service stops contributing; its cleanup path re-syncs the partition.
 			continue
 		}
@@ -154,11 +182,11 @@ func (c *Controller) desiredNatGwLanVipRules(gw *kubeovnv1.VpcNatGateway) ([]str
 			case id.affinitySource == "":
 				id.affinitySource = fmt.Sprintf("%s/%s (%s)", svc.Namespace, svc.Name, summary)
 			case id.affinitySource != "" && !strings.HasSuffix(id.affinitySource, "("+summary+")"):
-				klog.Warningf("nat gw %s lanIP identity %s: session affinity %s of service %s/%s merges into %s (ClientIP with the max timeout wins)",
-					gw.Name, key, summary, svc.Namespace, svc.Name, id.affinitySource)
-				c.recorder.Eventf(svc, v1.EventTypeWarning, "NatGwLanVipAffinityMerged",
-					"session affinity (%s) of this port merges with %s on gateway %s lanIP %s: identity uses ClientIP with the maximum timeout",
-					summary, id.affinitySource, gw.Name, lanIP)
+				// The log/event emission is deferred to the end of the reconcile and gated by
+				// signature, so a steady disagreement does not spam every pass.
+				merges = append(merges, lanVipAffinityMerge{
+					svc: svc, key: key, summary: summary, source: id.affinitySource, lanIP: lanIP,
+				})
 			}
 
 			for _, endpointSlice := range endpointSlices {
@@ -216,7 +244,36 @@ func (c *Controller) desiredNatGwLanVipRules(gw *kubeovnv1.VpcNatGateway) ([]str
 		}
 		rules = append(rules, rule)
 	}
+	c.emitNatGwLanVipAffinityMerges(gw.Name, merges)
 	return rules, nil
+}
+
+// emitNatGwLanVipAffinityMerges reports Services whose session affinity merged on a shared
+// lanIP identity. desiredNatGwLanVipRules runs on every Service/EndpointSlice event of the
+// gateway, so the log line and the Warning event are emitted only when the merge set
+// changes; otherwise EndpointSlice churn would re-fire the same disagreement on every pass
+// and spam the event recorder.
+func (c *Controller) emitNatGwLanVipAffinityMerges(gwName string, merges []lanVipAffinityMerge) {
+	if len(merges) == 0 {
+		c.natGwLanVipMergeNotes.Delete(gwName)
+		return
+	}
+	parts := make([]string, 0, len(merges))
+	for _, m := range merges {
+		parts = append(parts, fmt.Sprintf("%s|%s/%s|%s", m.key, m.svc.Namespace, m.svc.Name, m.summary))
+	}
+	sig := strings.Join(parts, "\n")
+	if prev, ok := c.natGwLanVipMergeNotes.Load(gwName); ok && prev == sig {
+		return
+	}
+	c.natGwLanVipMergeNotes.Store(gwName, sig)
+	for _, m := range merges {
+		klog.Warningf("nat gw %s lanIP identity %s: session affinity %s of service %s/%s merges into %s (ClientIP with the max timeout wins)",
+			gwName, m.key, m.summary, m.svc.Namespace, m.svc.Name, m.source)
+		c.recorder.Eventf(m.svc, v1.EventTypeWarning, "NatGwLanVipAffinityMerged",
+			"session affinity (%s) of this port merges with %s on gateway %s lanIP %s: identity uses ClientIP with the maximum timeout",
+			m.summary, m.source, gwName, m.lanIP)
+	}
 }
 
 // handleSyncNatGwLanVip reconciles one gateway's lanIP identity partition. It runs whether
@@ -228,6 +285,7 @@ func (c *Controller) handleSyncNatGwLanVip(gwName string) error {
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			// The gateway is gone and its Pods (and their rules) cascade away with it.
+			c.natGwLanVipMergeNotes.Delete(gwName)
 			return nil
 		}
 		return err
