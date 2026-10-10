@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/workqueue"
 
@@ -698,4 +699,93 @@ func TestEnqueueAddIptablesSnatRule(t *testing.T) {
 		&kubeovnv1.IptablesSnatRule{ObjectMeta: metav1.ObjectMeta{Name: "live-snat"}},
 		&kubeovnv1.IptablesSnatRule{ObjectMeta: metav1.ObjectMeta{Name: "terminating-snat", DeletionTimestamp: &now}},
 	)
+}
+
+func TestNormalizeSnatInternalCIDR(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "", normalizeSnatInternalCIDR(""))
+	assert.Equal(t, "10.0.0.1/32", normalizeSnatInternalCIDR("10.0.0.1"))
+	assert.Equal(t, "10.0.0.0/24", normalizeSnatInternalCIDR("10.0.0.0/24"))
+}
+
+func TestResolveSnatMemberID(t *testing.T) {
+	t.Parallel()
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{util.NatGatewayMemberLabel: "member-a"},
+		},
+	}
+	snat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{util.NatGatewayMemberLabel: "member-b"},
+		},
+	}
+	// EIP takes precedence
+	assert.Equal(t, "member-a", resolveSnatMemberID(eip, snat))
+	// Fallback to snat
+	assert.Equal(t, "member-b", resolveSnatMemberID(nil, snat))
+	// Unsharded EIP takes precedence over snat
+	unshardedEip := &kubeovnv1.IptablesEIP{}
+	assert.Equal(t, "", resolveSnatMemberID(unshardedEip, snat))
+	// Legacy label
+	legacySnat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{util.NatGatewayMemberLegacyLabel: "member-legacy"},
+		},
+	}
+	assert.Equal(t, "member-legacy", resolveSnatMemberID(nil, legacySnat))
+}
+
+func TestFilterNatGwPodsByMember(t *testing.T) {
+	t.Parallel()
+	c := &Controller{}
+	pods := []*corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "gw-0",
+				Labels: map[string]string{util.NatGatewayMemberLabel: "member-a"},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "gw-1",
+				Labels: map[string]string{util.NatGatewayMemberLabel: "member-b"},
+			},
+		},
+	}
+
+	// Empty memberID matches all
+	matched, err := c.filterNatGwPodsByMember(pods, "")
+	require.NoError(t, err)
+	assert.Len(t, matched, 2)
+
+	// Matching member-a
+	matched, err = c.filterNatGwPodsByMember(pods, "member-a")
+	require.NoError(t, err)
+	require.Len(t, matched, 1)
+	assert.Equal(t, "gw-0", matched[0].Name)
+
+	// Non-existing member returns error
+	_, err = c.filterNatGwPodsByMember(pods, "non-existent")
+	assert.Error(t, err)
+}
+
+func TestResolveRecordedSnatMemberID(t *testing.T) {
+	t.Parallel()
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{util.NatGatewayMemberLabel: "member-new"},
+		},
+	}
+	snat := &kubeovnv1.IptablesSnatRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{util.NatGatewayMemberLabel: "member-old"},
+		},
+	}
+	// For recorded state cleanup, SNAT recorded member takes precedence over current EIP member
+	assert.Equal(t, "member-old", resolveRecordedSnatMemberID(snat, eip))
+	// Fallback to EIP if SNAT has no member metadata
+	assert.Equal(t, "member-new", resolveRecordedSnatMemberID(nil, eip))
+	// Unsharded returns empty
+	assert.Equal(t, "", resolveRecordedSnatMemberID(nil, nil))
 }

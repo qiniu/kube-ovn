@@ -60,6 +60,15 @@ const (
 	natGwVipHairpinAdd = "vip-hairpin-add"
 	natGwVipHairpinDel = "vip-hairpin-del"
 
+	natGwStatelessInit    = "stateless-init"
+	natGwStatelessApply   = "stateless-apply"
+	natGwStatelessFipAdd  = "stateless-fip-add"
+	natGwStatelessFipDel  = "stateless-fip-del"
+	natGwStatelessDnatAdd = "stateless-dnat-add"
+	natGwStatelessDnatDel = "stateless-dnat-del"
+	natGwStatelessSnatAdd = "stateless-snat-add"
+	natGwStatelessSnatDel = "stateless-snat-del"
+
 	getIptablesVersion = "get-iptables-version"
 )
 
@@ -80,6 +89,26 @@ func (c *Controller) natGwNamespaceByName(gwName string) string {
 		return c.config.PodNamespace
 	}
 	return c.natGwNamespace(gw)
+}
+
+func (c *Controller) ensureNatGwNamespaceDelegation(nsName string) {
+	if nsName == "" {
+		return
+	}
+	ns, err := c.namespacesLister.Get(nsName)
+	if err != nil {
+		klog.Warningf("failed to get namespace %s from lister: %v", nsName, err)
+		return
+	}
+	if ns.Annotations != nil && ns.Annotations[util.CiliumDelegateSourceIPVerification] == "true" {
+		return
+	}
+	patch := map[string]interface{}{
+		util.CiliumDelegateSourceIPVerification: "true",
+	}
+	if err := util.PatchAnnotations(c.config.KubeClient.CoreV1().Namespaces(), nsName, patch); err != nil {
+		klog.Errorf("failed to patch namespace %s with cilium delegation annotation: %v", nsName, err)
+	}
 }
 
 func (c *Controller) resyncVpcNatGwConfig() {
@@ -332,6 +361,8 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 	}
 	gwChanged := isVpcNatGwChanged(gw)
 	needPatchStatus := gwChanged
+
+	c.ensureNatGwNamespaceDelegation(c.natGwNamespace(gw))
 
 	newSts, err := c.genNatGwStatefulSet(gw, oldSts, natGwPodContainerRestartCount)
 	if err != nil {
@@ -1470,7 +1501,6 @@ func (c *Controller) getNatGwPods(name, namespace string, allPods bool) ([]*core
 	}
 
 	if len(activePods) == 0 {
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("no active pod now")
 	}
 
