@@ -283,7 +283,7 @@ func TestHandleAddOrUpdateVMIMigrationSkipsMissingVMIWithActiveMigration(t *test
 	require.NoError(t, fc.fakeController.handleAddOrUpdateVMIMigration(namespace+"/"+failedMigration.Name))
 }
 
-func TestHandleAddOrUpdateVMIMigrationPreservesNonMigrationPortOptionsWithoutVMI(t *testing.T) {
+func TestHandleAddOrUpdateVMIMigrationCleansPortOptionsWithoutVMI(t *testing.T) {
 	const (
 		namespace = "test"
 		vmiName   = "test-vmi"
@@ -317,6 +317,7 @@ func TestHandleAddOrUpdateVMIMigrationPreservesNonMigrationPortOptionsWithoutVMI
 				"activation-strategy": "rarp",
 			},
 		}}, nil)
+	fc.mockOvnClient.EXPECT().CleanLogicalSwitchPortMigrateOptions(portName).Return(nil)
 
 	require.NoError(t, fc.fakeController.handleAddOrUpdateVMIMigration(namespace+"/"+vmiMigration.Name))
 }
