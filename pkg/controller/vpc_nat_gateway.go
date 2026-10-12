@@ -54,6 +54,10 @@ const (
 	natGwSubnetRouteAdd   = "subnet-route-add"
 	natGwSubnetRouteDel   = "subnet-route-del"
 
+	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
+	// held on lo (see nft_dnat.go).
+	natGwVipAddrSync = "vip-addr-sync"
+
 	getIptablesVersion = "get-iptables-version"
 )
 
@@ -123,7 +127,6 @@ func (c *Controller) resyncVpcNatGwConfig() {
 
 func (c *Controller) enqueueAddVpcNatGw(obj any) {
 	gw := obj.(*kubeovnv1.VpcNatGateway)
-	c.enqueueNftableLbServicesForNatGw(gw.Name)
 	if !gw.DeletionTimestamp.IsZero() {
 		c.enqueueDeleteVpcNatGw(gw)
 		return
@@ -144,7 +147,8 @@ func (c *Controller) enqueueAddOrUpdateVpcNatGwByName(gwName, reason string) {
 func (c *Controller) enqueueUpdateVpcNatGw(oldObj, newObj any) {
 	oldGw := oldObj.(*kubeovnv1.VpcNatGateway)
 	newGw := newObj.(*kubeovnv1.VpcNatGateway)
-	c.enqueueNftableLbServicesForNatGw(newGw.Name)
+	// Service reconcile is the only share-DNAT writer. Gateway changes do not directly execute
+	// Service data-plane reconciliation; the DNAT rule workers replay the new instance instead.
 	key := cache.MetaObjectToName(newGw).String()
 	if newGw.DeletionTimestamp.IsZero() {
 		klog.V(3).Infof("enqueue update vpc-nat-gw %s", key)
@@ -174,8 +178,6 @@ func (c *Controller) enqueueDeleteVpcNatGw(obj any) {
 		klog.Warningf("unexpected type: %T", obj)
 		return
 	}
-	c.enqueueNftableLbServicesForNatGw(gw.Name)
-
 	// Use "namespace/gwName" as the queue key so the delete handler knows where the STS lives.
 	natGwNs := gw.Spec.Namespace
 	if natGwNs == "" {
@@ -208,11 +210,31 @@ func (c *Controller) handleDelVpcNatGw(key string) error {
 	defer func() { _ = c.vpcNatGwKeyMutex.UnlockKey(gwName) }()
 	stsName := util.GenNatGwName(gwName)
 	klog.Infof("delete vpc nat gw %s in namespace %s", stsName, stsNamespace)
+	// The lanIP-as-Service-VIP per-gateway notes/caches are keyed by gwName and keyed handlers
+	// stop firing once the object is gone (its Services leave the gateway index and nothing
+	// re-enqueues its partition sync), so forget them here to track live gateways only.
+	c.natGwLanVipMergeNotes.Delete(gwName)
+	c.natGwLanVipLastSync.Delete(gwName)
 	if err := c.config.KubeClient.AppsV1().StatefulSets(stsNamespace).Delete(context.Background(),
 		stsName, metav1.DeleteOptions{}); err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
 		}
+		klog.Error(err)
+		return err
+	}
+
+	// Release the share DNAT VIP policy routes this gateway owns. The gateway object may already
+	// be gone; the periodic GC covers that case.
+	gw, err := c.vpcNatGatewayLister.Get(gwName)
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			klog.Error(err)
+			return err
+		}
+		return nil
+	}
+	if err := c.OVNNbClient.DeleteLogicalRouterPolicies(gw.Spec.Vpc, util.NatGatewayVipPolicyPriority, natGwVipRouteExternalIDs(gw.Name)); err != nil {
 		klog.Error(err)
 		return err
 	}
@@ -351,6 +373,9 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 			return err
 		}
 	}
+
+	// Share-DNAT VIP state is written by Service reconcile only. Instance replacement is replayed
+	// through handleUpdateVpcDnat, which enqueues the Services after the gateway is ready.
 
 	// Handle QoS update (independent of StatefulSet changes)
 	var desiredQoS *kubeovnv1.QoSPolicy
@@ -663,6 +688,11 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 		return err
 	}
 	for _, dnat := range dnats {
+		// Every share object is an accounting record. This includes objects created by the old
+		// implementation before the record label existed; the Service reconcile migrates them.
+		if dnat.Spec.Type == kubeovnv1.DnatRuleTypeShare {
+			continue
+		}
 		if dnat.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo dnat %s", dnat.Name)
 			if err = c.redoDnat(dnat.Name, natGwCreatedAT, false); err != nil {
@@ -672,6 +702,11 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 			}
 		}
 	}
+	// Service records never redo themselves. Reconcile the Services bound to this gateway so the
+	// only share-DNAT writer restores the new gateway instance. The lanIP identity partition is
+	// rebuilt by its own complete-set sync for the same reason.
+	c.enqueueGwNftableLbServicesForNatGw(natGwKey)
+	c.enqueueNatGwLanVipSync(natGwKey)
 	return nil
 }
 
@@ -869,16 +904,26 @@ func (c *Controller) handleUpdateNatGwSubnetRoute(natGwKey string) error {
 	return nil
 }
 
-// TODO: Refactor to avoid shell command injection vulnerability.
-// Current implementation uses "bash -c" with string concatenation, which could be exploited
-// if any element in the rules slice contains shell metacharacters.
-// Recommended fix: Pass arguments directly as a slice instead of joining them into a shell command:
-//
-//	args := append([]string{"/kube-ovn/nat-gateway.sh", operation}, rules...)
-//	util.ExecuteCommandInContainer(..., args...)
-//
-// This requires updating nat-gateway.sh to accept arguments via $@ instead of parsing a single string.
-// Current risk is mitigated by CIDR format validation on all data sources reaching this function.
+// execNatGwRulesInPods runs one gateway script command on every given Pod, trying all of them so
+// a failing instance cannot starve the others.
+func (c *Controller) execNatGwRulesInPods(pods []*corev1.Pod, operation string, rules []string) error {
+	exec := c.execRulesInPod
+	if exec == nil {
+		exec = c.execNatGwRules
+	}
+	var errs []error
+	for _, pod := range pods {
+		if err := exec(pod, operation, rules); err != nil {
+			klog.Errorf("failed to run %s in nat gw pod %s/%s, err: %v", operation, pod.Namespace, pod.Name, err)
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// The rules are passed to the gateway script as argv, never interpolated into a shell command:
+// their values come from Services, EndpointSlices and CRs, and the script validates every field
+// itself, but argv keeps a payload from ever reaching a shell parser in the first place.
 func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []string) error {
 	lockKey := fmt.Sprintf("nat-gw-exec:%s/%s", pod.Namespace, pod.Name)
 
@@ -887,9 +932,10 @@ func (c *Controller) execNatGwRules(pod *corev1.Pod, operation string, rules []s
 		_ = c.vpcNatGwExecKeyMutex.UnlockKey(lockKey)
 	}()
 
-	cmd := fmt.Sprintf("bash %s %s %s", vpcNatGwScriptPath, operation, strings.Join(rules, " "))
-	klog.V(3).Infof("executing NAT gateway command: %s", cmd)
-	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, vpcNatGwContainerName, []string{"/bin/bash", "-c", cmd}...)
+	args := append([]string{vpcNatGwScriptPath, operation}, rules...)
+	klog.V(3).Infof("executing NAT gateway command: bash %s", strings.Join(args, " "))
+	stdOutput, errOutput, err := util.ExecuteCommandInContainer(c.config.KubeClient, c.config.KubeRestConfig, pod.Namespace, pod.Name, vpcNatGwContainerName,
+		append([]string{"bash"}, args...)...)
 	if err != nil {
 		if len(errOutput) > 0 {
 			klog.Errorf("NAT gateway command failed - stderr: %v", errOutput)
@@ -1342,6 +1388,91 @@ func (c *Controller) getNatGwPod(name, namespace string) (*corev1.Pod, error) {
 	}
 
 	return pods[0], nil
+}
+
+// listNatGwPodsByName lists the Pods of a VPC NAT gateway live. The redo tokens that decide
+// whether a rule still has to be re-applied are computed from live Pods, so applying rules from
+// the informer cache can leave an instance the token already claims as configured without its
+// rules, and no later event re-applies them.
+func (c *Controller) listNatGwPodsByName(name, namespace string) ([]*corev1.Pod, error) {
+	selector := labels.Set{"app": util.GenNatGwName(name), util.VpcNatGatewayLabel: "true"}.String()
+	podList, err := c.config.KubeClient.CoreV1().Pods(namespace).List(context.Background(),
+		metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods of vpc nat gateway %s: %w", name, err)
+	}
+	pods := make([]*corev1.Pod, 0, len(podList.Items))
+	for i := range podList.Items {
+		pods = append(pods, &podList.Items[i])
+	}
+	return pods, nil
+}
+
+// listNatGwPods lists the Pods of the given VPC NAT gateway live.
+func (c *Controller) listNatGwPods(gw *kubeovnv1.VpcNatGateway) ([]*corev1.Pod, error) {
+	return c.listNatGwPodsByName(gw.Name, c.natGwNamespace(gw))
+}
+
+func getNatGwNextHops(gw *kubeovnv1.VpcNatGateway, pods []*corev1.Pod) (map[string]string, error) {
+	// The gateway is getting deleted, do not return any next hop as we don't want to send the
+	// traffic to the gateway pods anymore.
+	if !gw.DeletionTimestamp.IsZero() {
+		return nil, nil
+	}
+
+	nextHops := make(map[string]string)
+	for _, pod := range pods {
+		if pod.Status.Phase != corev1.PodRunning || pod.DeletionTimestamp != nil {
+			continue
+		}
+		ready := true
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status != corev1.ConditionTrue {
+				ready = false
+				break
+			}
+		}
+		if !ready {
+			continue
+		}
+
+		if len(pod.Status.PodIPs) == 0 || pod.Spec.NodeName == "" {
+			continue
+		}
+		for _, podIP := range pod.Status.PodIPs {
+			// For dual-stack, prefer v4 or concatenate both
+			if _, exists := nextHops[pod.Spec.NodeName]; !exists {
+				nextHops[pod.Spec.NodeName] = podIP.IP
+			} else if util.CheckProtocol(podIP.IP) == kubeovnv1.ProtocolIPv4 {
+				nextHops[pod.Spec.NodeName] = podIP.IP
+			}
+		}
+	}
+	return nextHops, nil
+}
+
+// getNatGwPods returns the Pods a rule of the gateway has to be applied to: its running
+// instances, or every Pod when allPods is set.
+func (c *Controller) getNatGwPods(name, namespace string, allPods bool) ([]*corev1.Pod, error) {
+	pods, err := c.listNatGwPodsByName(name, namespace)
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+
+	activePods := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if allPods || (pod.Status.Phase == corev1.PodRunning && pod.DeletionTimestamp == nil) {
+			activePods = append(activePods, pod)
+		}
+	}
+
+	if len(activePods) == 0 {
+		time.Sleep(5 * time.Second)
+		return nil, errors.New("no active pod now")
+	}
+
+	return activePods, nil
 }
 
 func (c *Controller) initCreateAt(key string) (err error) {

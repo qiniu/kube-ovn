@@ -50,7 +50,7 @@ func TestConfigurationValidateModeFlags(t *testing.T) {
 
 			cfg := &Configuration{
 				EnableBgpLbVip: tt.enableBgpLb,
-				EnableLbSvc:    tt.enableLbSvc,
+				EnablePodLbSvc: tt.enableLbSvc,
 			}
 
 			err := cfg.validateModeFlags()
@@ -87,4 +87,150 @@ func TestRegisterBgpLbVipFlags(t *testing.T) {
 		require.Error(t, err)
 		require.False(t, *enabled)
 	})
+}
+
+func TestConfigurationValidateServiceFeatureGates(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		config  Configuration
+		wantErr string
+	}{
+		{name: "all disabled"},
+		{name: "ovn and gateway load balancer coexist", config: Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true}},
+		{name: "both gateway identities coexist", config: Configuration{EnableGwNftableLbSvc: true, EnableGwNftableSvcClusterIP: true}},
+		{
+			name:    "pod and gateway load balancer conflict",
+			config:  Configuration{EnableOvnLB: true, EnablePodLbSvc: true, EnableGwNftableLbSvc: true},
+			wantErr: "--enable-lb-svc and --enable-gw-nftable-lb-svc are mutually exclusive",
+		},
+		{
+			// no direct conflict: the lb-svc Pod DNATs to the ClusterIP, which the gateway
+			// ClusterIP mode can serve; only a warning is logged when no ClusterIP data
+			// plane is left at all (neither --enable-lb nor the gateway mode)
+			name:   "pod load balancer combines with gateway cluster ip",
+			config: Configuration{EnablePodLbSvc: true, EnableGwNftableSvcClusterIP: true},
+		},
+		{
+			// with --enable-lb pinned on, the remaining conflict is between the two
+			// ClusterIP implementations, not between lb-svc and the gateway mode
+			name:    "pod load balancer and gateway cluster ip conflict only through enable-lb",
+			config:  Configuration{EnableOvnLB: true, EnablePodLbSvc: true, EnableGwNftableSvcClusterIP: true},
+			wantErr: "--enable-gw-nftable-svc-cluster-ip and --enable-lb are mutually exclusive",
+		},
+		{
+			name:    "ovn and gateway cluster ip conflict",
+			config:  Configuration{EnableOvnLB: true, EnableGwNftableSvcClusterIP: true},
+			wantErr: "--enable-gw-nftable-svc-cluster-ip and --enable-lb are mutually exclusive",
+		},
+		{
+			// the lanIP vip switch is a pure add-on: it must combine with every mode,
+			// including on its own
+			name:   "lanip vip combines with every mode",
+			config: Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true, EnableGwNftableLanipVip: true},
+		},
+		{name: "lanip vip alone", config: Configuration{EnableGwNftableLanipVip: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.validateServiceFeatureGates()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// resolveServiceFeatureGateDefaults must compose the default-on gateway nftables modes with the
+// historical switches: explicit operator intent always wins, and a bare default startup must pass
+// validation with the OVN switch LB replaced by the gateway ClusterIP mode.
+func TestResolveServiceFeatureGateDefaults(t *testing.T) {
+	t.Parallel()
+
+	changedNone := func(string) bool { return false }
+	changedOf := func(flags ...string) func(string) bool {
+		return func(name string) bool {
+			for _, f := range flags {
+				if f == name {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	defaults := func() Configuration {
+		// the flag defaults as registered in ParseFlags
+		return Configuration{
+			EnableOvnLB:                 true, // --enable-lb historical default
+			EnableGwNftableLbSvc:        true,
+			EnableGwNftableSvcClusterIP: true,
+			EnableGwNftableLanipVip:     true,
+		}
+	}
+
+	tests := []struct {
+		name         string
+		changed      func(string) bool
+		mutate       func(*Configuration)
+		want         Configuration
+		wantValidErr bool
+	}{
+		{
+			name:    "bare defaults: gateway modes on, OVN LB auto-off",
+			changed: changedNone,
+			want:    Configuration{EnableGwNftableLbSvc: true, EnableGwNftableSvcClusterIP: true, EnableGwNftableLanipVip: true},
+		},
+		{
+			name:    "explicit enable-lb wins over the default-on gateway cluster-ip mode",
+			changed: changedOf("enable-lb"),
+			want:    Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true, EnableGwNftableLanipVip: true},
+		},
+		{
+			name:         "both sides pinned: resolver leaves them for the validator to reject",
+			changed:      changedOf("enable-lb", "enable-gw-nftable-svc-cluster-ip"),
+			want:         Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true, EnableGwNftableSvcClusterIP: true, EnableGwNftableLanipVip: true},
+			wantValidErr: true,
+		},
+		{
+			name:    "opt-out of gateway cluster-ip restores the OVN LB default",
+			changed: changedOf("enable-gw-nftable-svc-cluster-ip"),
+			mutate:  func(c *Configuration) { c.EnableGwNftableSvcClusterIP = false },
+			want:    Configuration{EnableOvnLB: true, EnableGwNftableLbSvc: true, EnableGwNftableLanipVip: true},
+		},
+		{
+			name:    "explicit enable-lb-svc makes the default-on gateway modes yield",
+			changed: changedOf("enable-lb-svc"),
+			mutate:  func(c *Configuration) { c.EnablePodLbSvc = true },
+			want:    Configuration{EnableOvnLB: true, EnablePodLbSvc: true, EnableGwNftableLanipVip: true},
+		},
+		{
+			name:    "enable-lb-svc pinned together with the gateway lb mode stays a validator error",
+			changed: changedOf("enable-lb-svc", "enable-gw-nftable-lb-svc"),
+			mutate:  func(c *Configuration) { c.EnablePodLbSvc = true },
+			// gw-lb-svc stays on (it was pinned, so the validator must reject the pair); the
+			// unpinned cluster-ip mode yields to the pinned enable-lb-svc.
+			want:         Configuration{EnableOvnLB: true, EnablePodLbSvc: true, EnableGwNftableLbSvc: true, EnableGwNftableLanipVip: true},
+			wantValidErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := defaults()
+			if tt.mutate != nil {
+				tt.mutate(&cfg)
+			}
+			resolveServiceFeatureGateDefaults(&cfg, tt.changed)
+			require.Equal(t, tt.want, cfg)
+			err := cfg.validateServiceFeatureGates()
+			if tt.wantValidErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

@@ -545,6 +545,10 @@ kind-install-metallb-pool-from-underlay: kind-install-metallb-pool-from-underlay
 .PHONY: kind-install-vpc-nat-gw
 kind-install-vpc-nat-gw:
 	@$(MAKE) kind-load-image-vpc-nat-gateway
+	# The gateway nftables Service modes are the default data plane since
+	# --enable-gw-nftable-{lb-svc,svc-cluster-ip,lanip-vip} default to true; install.sh derives
+	# ENABLE_LB=false from the ClusterIP mode, so no explicit opt-in flags are needed any more
+	# (and the default composition itself gets e2e coverage here).
 	@$(MAKE) ENABLE_NAT_GW=true CNI_CONFIG_PRIORITY=10 kind-install
 	@$(MAKE) kind-install-multus
 

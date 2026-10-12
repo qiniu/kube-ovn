@@ -77,7 +77,8 @@ func (c *Controller) gcLogicalRouterPort() error {
 
 	if err = c.OVNNbClient.DeleteLogicalRouterPorts(
 		map[string]string{"vendor": util.CniTypeName},
-		logicalRouterPortFilter(exceptPeerPorts)); err != nil {
+		logicalRouterPortFilter(exceptPeerPorts),
+	); err != nil {
 		klog.Errorf("delete non-existent peer logical router port: %v", err)
 		return err
 	}
@@ -583,7 +584,7 @@ func (c *Controller) gcLoadBalancer() error {
 		vpcLbs.Add(dnat.Name)
 	}
 
-	if !c.config.EnableLb {
+	if !c.config.EnableOvnLB {
 		// remove lb from logical switch
 		vpcs, err := c.vpcsLister.List(labels.Everything())
 		if err != nil {
@@ -1190,7 +1191,7 @@ func (c *Controller) gcLbSvcPods() error {
 }
 
 func (c *Controller) gcVPCDNS() error {
-	if !c.config.EnableLb {
+	if !c.config.EnableOvnLB {
 		return nil
 	}
 

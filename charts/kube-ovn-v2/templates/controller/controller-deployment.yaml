@@ -132,7 +132,7 @@ spec:
           - --ls-dnat-mod-dl-dst={{- .Values.features.LS_DNAT_MOD_DL_DST }}
           - --ls-ct-skip-dst-lport-ips={{- .Values.features.LS_CT_SKIP_DST_LPORT_IPS }}
           - --pod-nic-type={{- .Values.networking.podNicType }}
-          - --enable-lb={{- .Values.features.enableLoadbalancer }}
+          - --enable-lb={{ .Values.features.enableLoadbalancer }}
           - --enable-np={{- .Values.features.enableNetworkPolicies }}
           - --enable-eip-snat={{- .Values.networking.enableEipSnat }}
           - --enable-external-vpc={{- .Values.features.enableExternalVpcs }}
@@ -144,9 +144,11 @@ spec:
           - --log_file=/var/log/kube-ovn/kube-ovn-controller.log
           - --log_file_max_size=200
           - --enable-lb-svc={{- .Values.features.enableLoadbalancerService }}
-          {{- if .Values.features.enableNftableLoadbalancerService }}
-          - --enable-nftable-lb-svc=true
-          {{- end }}
+          # always rendered: with the controller default true, omitting the flag would silently
+          # keep a mode on even when the value is set to false
+          - --enable-gw-nftable-lb-svc={{- .Values.features.enableGwNftableLoadbalancerService }}
+          - --enable-gw-nftable-svc-cluster-ip={{- .Values.features.enableGwNftableServiceClusterIp }}
+          - --enable-gw-nftable-lanip-vip={{- .Values.features.enableGwNftableLanipVip }}
           - --enable-bgp-lb-vip={{- .Values.features.enableBgpLbVip }}
           - --keep-vm-ip={{- .Values.features.enableKeepVmIps }}
           - --enable-metrics={{- .Values.networking.enableMetrics }}

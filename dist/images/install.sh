@@ -15,7 +15,18 @@ U2O_INTERCONNECTION=${U2O_INTERCONNECTION:-false}
 ENABLE_MIRROR=${ENABLE_MIRROR:-false}
 VLAN_NIC=${VLAN_NIC:-}
 HW_OFFLOAD=${HW_OFFLOAD:-false}
-ENABLE_LB=${ENABLE_LB:-true}
+# The gateway nftables Service modes default to on (the default data plane of this fork). The
+# gateway ClusterIP mode replaces --enable-lb, so ENABLE_LB defaults off while it is on, and back
+# on when the operator opts the gateway ClusterIP mode out. Explicit ENABLE_LB=true combined with
+# an enabled gateway ClusterIP mode is rejected below (mutually exclusive).
+ENABLE_GW_NFTABLE_LB_SVC=${ENABLE_GW_NFTABLE_LB_SVC:-true}
+ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=${ENABLE_GW_NFTABLE_SVC_CLUSTER_IP:-true}
+ENABLE_GW_NFTABLE_LANIP_VIP=${ENABLE_GW_NFTABLE_LANIP_VIP:-true}
+if [[ "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" ]]; then
+  ENABLE_LB=${ENABLE_LB:-false}
+else
+  ENABLE_LB=${ENABLE_LB:-true}
+fi
 ENABLE_NP=${ENABLE_NP:-true}
 NP_ENFORCEMENT=${NP_ENFORCEMENT:-standard}
 ENABLE_EIP_SNAT=${ENABLE_EIP_SNAT:-true}
@@ -24,7 +35,6 @@ LS_CT_SKIP_DST_LPORT_IPS=${LS_CT_SKIP_DST_LPORT_IPS:-true}
 ENABLE_EXTERNAL_VPC=${ENABLE_EXTERNAL_VPC:-false}
 CNI_CONFIG_PRIORITY=${CNI_CONFIG_PRIORITY:-01}
 ENABLE_LB_SVC=${ENABLE_LB_SVC:-false}
-ENABLE_NFTABLE_LB_SVC=${ENABLE_NFTABLE_LB_SVC:-true}
 ENABLE_BGP_LB_VIP=${ENABLE_BGP_LB_VIP:-false}
 ENABLE_NAT_GW=${ENABLE_NAT_GW:-true}
 ENABLE_KEEP_VM_IP=${ENABLE_KEEP_VM_IP:-true}
@@ -204,7 +214,9 @@ echo "Default Subnet CIDR:  $POD_CIDR"
 echo "Join Subnet CIDR:     $JOIN_CIDR"
 echo "Enable LB:            $ENABLE_LB"
 echo "Enable LB SVC:        $ENABLE_LB_SVC"
-echo "Enable NFT LB SVC:    $ENABLE_NFTABLE_LB_SVC"
+echo "Enable GW NFT LB SVC: $ENABLE_GW_NFTABLE_LB_SVC"
+echo "Enable GW NFT SVC ClusterIP: $ENABLE_GW_NFTABLE_SVC_CLUSTER_IP"
+echo "Enable GW NFT LANIP VIP: $ENABLE_GW_NFTABLE_LANIP_VIP"
 echo "Enable BGP LB VIP:    $ENABLE_BGP_LB_VIP"
 echo "Enable Networkpolicy: $ENABLE_NP"
 echo "Enable EIP and SNAT:  $ENABLE_EIP_SNAT"
@@ -213,6 +225,23 @@ echo "-------------------------------"
 
 if [[ "$ENABLE_BGP_LB_VIP" = "true" && "$ENABLE_LB_SVC" = "true" ]]; then
   echo "ERROR: ENABLE_BGP_LB_VIP and ENABLE_LB_SVC are mutually exclusive"
+  exit 1
+fi
+
+# gateway nftables modes conflict markers, mirroring the controller's validateServiceFeatureGates
+if [[ "$ENABLE_LB_SVC" = "true" && "$ENABLE_GW_NFTABLE_LB_SVC" = "true" ]]; then
+  echo "ERROR: ENABLE_LB_SVC and ENABLE_GW_NFTABLE_LB_SVC are mutually exclusive (pick one egress-IP datapath)"
+  exit 1
+fi
+# No direct ENABLE_LB_SVC/ENABLE_GW_NFTABLE_SVC_CLUSTER_IP conflict: the lb-svc Pod DNATs the
+# external address to the Service ClusterIP, which either ClusterIP data plane can serve.
+if [[ "$ENABLE_LB_SVC" = "true" && "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" != "true" && "$ENABLE_LB" != "true" ]]; then
+  echo "WARNING: ENABLE_LB_SVC DNATs to the Service ClusterIP, but both ClusterIP data planes are off"
+  echo "         (ENABLE_LB and ENABLE_GW_NFTABLE_SVC_CLUSTER_IP); unless kube-proxy still serves the ClusterIPs the lb-svc datapath will not work"
+fi
+if [[ "$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP" = "true" && "$ENABLE_LB" = "true" ]]; then
+  echo "ERROR: ENABLE_GW_NFTABLE_SVC_CLUSTER_IP and ENABLE_LB are mutually exclusive"
+  echo "       (the gateway ClusterIP mode replaces the OVN load balancers; set ENABLE_GW_NFTABLE_SVC_CLUSTER_IP=false to keep ENABLE_LB)"
   exit 1
 fi
 
@@ -2020,9 +2049,12 @@ spec:
             spec:
               type: object
               properties:
+                clusterIP:
+                  type: string
+                  description: Kubernetes Service ClusterIP served by this rule for traffic from within the VPC.
                 eip:
                   type: string
-                  description: EIP name for DNAT rule
+                  description: Name of the EIP used as the rule's external address. Optional when ClusterIP is set.
                 externalPort:
                   type: string
                   description: External port number
@@ -2042,6 +2074,18 @@ spec:
                     - exclusive
                     - share
                   default: exclusive
+                sessionAffinity:
+                  type: string
+                  description: Client IP session affinity for share DNAT rules
+                  enum:
+                    - ''
+                    - ClientIP
+                sessionAffinityTimeoutSeconds:
+                  type: integer
+                  format: int32
+                  description: Client IP session affinity timeout in seconds
+                  minimum: 0
+                  maximum: 86400
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -5411,7 +5455,9 @@ spec:
           - --log_file=/var/log/kube-ovn/kube-ovn-controller.log
           - --log_file_max_size=200
           - --enable-lb-svc=$ENABLE_LB_SVC
-          - --enable-nftable-lb-svc=$ENABLE_NFTABLE_LB_SVC
+          - --enable-gw-nftable-lb-svc=$ENABLE_GW_NFTABLE_LB_SVC
+          - --enable-gw-nftable-svc-cluster-ip=$ENABLE_GW_NFTABLE_SVC_CLUSTER_IP
+          - --enable-gw-nftable-lanip-vip=$ENABLE_GW_NFTABLE_LANIP_VIP
           - --enable-bgp-lb-vip=$ENABLE_BGP_LB_VIP
           - --keep-vm-ip=$ENABLE_KEEP_VM_IP
           - --enable-metrics=$ENABLE_METRICS

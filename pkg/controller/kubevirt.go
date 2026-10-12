@@ -370,13 +370,6 @@ func (c *Controller) cleanupFailedVMIMigrationWithoutVMI(vmiMigration *kubevirtv
 	}
 
 	for _, lsp := range lsps {
-		if lsp.Options["activation-strategy"] != "rarp" {
-			continue
-		}
-		nodes := strings.Split(lsp.Options["requested-chassis"], ",")
-		if len(nodes) != 2 || nodes[0] == "" || nodes[1] == "" || nodes[0] == nodes[1] {
-			continue
-		}
 		if err := c.OVNNbClient.CleanLogicalSwitchPortMigrateOptions(lsp.Name); err != nil {
 			return fmt.Errorf("failed to clean migrate options for LSP %s: %w", lsp.Name, err)
 		}

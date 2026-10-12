@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -43,11 +44,21 @@ func findServiceKey(endpointSlice *discoveryv1.EndpointSlice) string {
 
 func (c *Controller) enqueueAddEndpointSlice(obj any) {
 	key := findServiceKey(obj.(*discoveryv1.EndpointSlice))
-	if key != "" {
-		c.enqueueNftableLbService(key)
-		klog.V(3).Infof("enqueue add endpointSlice %s", key)
-		c.addOrUpdateEndpointSliceQueue.Add(key)
+	if key == "" {
+		return
 	}
+	// The gateway nftable LB service feature consumes the EndpointSlice events too, and it works
+	// with --enable-lb=false, so its reconcile is enqueued before the OVN load balancer gate below.
+	c.enqueueGwNftableLbService(key)
+	if namespace, name, err := cache.SplitMetaNamespaceKey(key); err == nil {
+		c.enqueueNatGwLanVipForService(namespace, name)
+	}
+	if !c.config.EnableOvnLB {
+		return
+	}
+
+	klog.V(3).Infof("enqueue add endpointSlice %s", key)
+	c.addOrUpdateEndpointSliceQueue.Add(key)
 }
 
 func (c *Controller) enqueueUpdateEndpointSlice(oldObj, newObj any) {
@@ -57,15 +68,47 @@ func (c *Controller) enqueueUpdateEndpointSlice(oldObj, newObj any) {
 		return
 	}
 
+	oldKey := findServiceKey(oldEndpointSlice)
+	newKey := findServiceKey(newEndpointSlice)
 	if len(oldEndpointSlice.Endpoints) == 0 && len(newEndpointSlice.Endpoints) == 0 {
+		if oldKey != newKey {
+			c.enqueueGwNftableLbService(oldKey)
+			c.enqueueGwNftableLbService(newKey)
+		} else if !reflect.DeepEqual(oldEndpointSlice.Ports, newEndpointSlice.Ports) {
+			c.enqueueGwNftableLbService(newKey)
+		}
+		for _, k := range []string{oldKey, newKey} {
+			if namespace, name, err := cache.SplitMetaNamespaceKey(k); err == nil {
+				c.enqueueNatGwLanVipForService(namespace, name)
+			}
+		}
 		return
 	}
 
-	key := findServiceKey(newEndpointSlice)
-	if key != "" {
-		c.enqueueNftableLbService(key)
-		klog.V(3).Infof("enqueue update endpointSlice for service %s", key)
-		c.addOrUpdateEndpointSliceQueue.Add(key)
+	if reflect.DeepEqual(oldEndpointSlice.Endpoints, newEndpointSlice.Endpoints) &&
+		reflect.DeepEqual(oldEndpointSlice.Ports, newEndpointSlice.Ports) &&
+		oldKey == newKey {
+		return
+	}
+
+	// The feature's reconcile depends on the same fields, so it is enqueued after the churn
+	// filters above but before the OVN load balancer gate: it has to work with --enable-lb=false.
+	if oldKey != newKey {
+		c.enqueueGwNftableLbService(oldKey)
+	}
+	c.enqueueGwNftableLbService(newKey)
+	for _, k := range []string{oldKey, newKey} {
+		if namespace, name, err := cache.SplitMetaNamespaceKey(k); err == nil {
+			c.enqueueNatGwLanVipForService(namespace, name)
+		}
+	}
+	if !c.config.EnableOvnLB {
+		return
+	}
+
+	if newKey != "" {
+		klog.V(3).Infof("enqueue update endpointSlice for service %s", newKey)
+		c.addOrUpdateEndpointSliceQueue.Add(newKey)
 	}
 }
 
@@ -85,10 +128,22 @@ func (c *Controller) enqueueDeleteEndpointSlice(obj any) {
 		klog.Warningf("unexpected type: %T", obj)
 		return
 	}
-	if key := findServiceKey(endpointSlice); key != "" {
-		c.addOrUpdateEndpointSliceQueue.Add(key)
-		c.enqueueNftableLbService(key)
+	key := findServiceKey(endpointSlice)
+	if key == "" {
+		return
 	}
+	// See enqueueAddEndpointSlice: the feature needs the event even without the OVN load balancer.
+	c.enqueueGwNftableLbService(key)
+	if namespace, name, err := cache.SplitMetaNamespaceKey(key); err == nil {
+		// The Service usually still exists at this point; if it is gone its own delete event
+		// already queued the partition sync (this lookup is a no-op then).
+		c.enqueueNatGwLanVipForService(namespace, name)
+	}
+	if !c.config.EnableOvnLB {
+		return
+	}
+
+	c.addOrUpdateEndpointSliceQueue.Add(key)
 }
 
 func (c *Controller) handleUpdateEndpointSlice(key string) error {
@@ -119,6 +174,10 @@ func (c *Controller) handleUpdateEndpointSlice(key string) error {
 		klog.Error(err)
 		return err
 	}
+	// A Service pointing at a gateway nftable LB is not skipped: the gateway owns only its EIP
+	// identity, its ClusterIP VIPs and backends stay programmed by the classic OVN LB whenever
+	// that mode runs. (The full-takeover mode --enable-gw-nftable-svc-cluster-ip is mutually
+	// exclusive with --enable-lb, so this handler then sees no events at all.)
 	svc := cachedService.DeepCopy()
 
 	var (
@@ -140,7 +199,7 @@ func (c *Controller) handleUpdateEndpointSlice(key string) error {
 		return nil
 	}
 
-	if c.config.EnableLb && c.config.EnableOVNLBPreferLocal {
+	if c.config.EnableOvnLB && c.config.EnableOVNLBPreferLocal {
 		if svc.Spec.Type == v1.ServiceTypeLoadBalancer && svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal {
 			if len(svc.Status.LoadBalancer.Ingress) > 0 {
 				for _, ingress := range svc.Status.LoadBalancer.Ingress {

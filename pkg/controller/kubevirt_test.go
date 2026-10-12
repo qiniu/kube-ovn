@@ -1005,7 +1005,9 @@ func TestHandleAddOrUpdateVMIMigrationConfiguresPendingMigration(t *testing.T) {
 			Phase: kubevirtv1.MigrationPending,
 		},
 	}
-	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
+	vmi := &kubevirtv1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
+	}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient)
 	migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil)
@@ -1052,7 +1054,9 @@ func TestHandleAddOrUpdateVMIMigrationIgnoresHotplugAttachmentPod(t *testing.T) 
 			Phase: kubevirtv1.MigrationPending,
 		},
 	}
-	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: "source-node"}}
+	vmi := &kubevirtv1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: "source-node"},
+	}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient)
 	migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil)
@@ -1101,7 +1105,9 @@ func TestHandleAddOrUpdateVMIMigrationCleansFailedMigrationWithoutMigrationState
 			Phase: kubevirtv1.MigrationPending,
 		},
 	}
-	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
+	vmi := &kubevirtv1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
+	}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient).Times(3)
 	migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil).Times(2)
@@ -1167,7 +1173,9 @@ func TestHandleAddOrUpdateVMIMigrationCleansFailedMigrationAfterVMIDeletion(t *t
 					MigrationState: migrationState,
 				},
 			}
-			vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
+			vmi := &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
+			}
 
 			kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient).Times(3)
 			migrationClient.EXPECT().Get(gomock.Any(), migration, metav1.GetOptions{}).Return(vmiMigration, nil).Times(2)
@@ -1227,7 +1235,7 @@ func TestHandleAddOrUpdateVMIMigrationSkipsMissingVMIWithActiveMigration(t *test
 	require.NoError(t, fc.fakeController.handleAddOrUpdateVMIMigration(namespace+"/"+failedMigration.Name))
 }
 
-func TestHandleAddOrUpdateVMIMigrationPreservesNonMigrationPortOptionsWithoutVMI(t *testing.T) {
+func TestHandleAddOrUpdateVMIMigrationCleansPortOptionsWithoutVMI(t *testing.T) {
 	const (
 		namespace = "test"
 		vmiName   = "test-vmi"
@@ -1261,6 +1269,7 @@ func TestHandleAddOrUpdateVMIMigrationPreservesNonMigrationPortOptionsWithoutVMI
 				"activation-strategy": "rarp",
 			},
 		}}, nil)
+	fc.mockOvnClient.EXPECT().CleanLogicalSwitchPortMigrateOptions(portName).Return(nil)
 
 	require.NoError(t, fc.fakeController.handleAddOrUpdateVMIMigration(namespace+"/"+vmiMigration.Name))
 }
@@ -1300,7 +1309,9 @@ func TestHandleAddOrUpdateVMIMigrationSkipsStaleFailedMigrationCleanup(t *testin
 	migrationClient := kubecli.NewMockVirtualMachineInstanceMigrationInterface(mockCtrl)
 	vmiClient := kubecli.NewMockVirtualMachineInstanceInterface(mockCtrl)
 	fc.fakeController.config.KubevirtClient = kubevirtClient
-	vmi := &kubevirtv1.VirtualMachineInstance{ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode}}
+	vmi := &kubevirtv1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: vmiName, Namespace: namespace}, Status: kubevirtv1.VirtualMachineInstanceStatus{NodeName: sourceNode},
+	}
 
 	kubevirtClient.EXPECT().VirtualMachineInstanceMigration(namespace).Return(migrationClient).Times(3)
 	migrationClient.EXPECT().Get(gomock.Any(), pendingMigration.Name, metav1.GetOptions{}).Return(pendingMigration, nil)
