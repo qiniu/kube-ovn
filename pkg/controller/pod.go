@@ -189,6 +189,18 @@ func isPodStatusPhaseAlive(p *v1.Pod) bool {
 	return true
 }
 
+func isPodReadyConditionTrue(p *v1.Pod) bool {
+	if p == nil {
+		return false
+	}
+	for _, cond := range p.Status.Conditions {
+		if cond.Type == v1.PodReady {
+			return cond.Status == v1.ConditionTrue
+		}
+	}
+	return false
+}
+
 func (c *Controller) enqueueAddPod(obj any) {
 	p := obj.(*v1.Pod)
 	if p.Spec.HostNetwork {
@@ -268,6 +280,10 @@ func (c *Controller) enqueueDeletePod(obj any) {
 		return
 	}
 
+	if isGw, gwName := c.checkIsPodVpcNatGw(p); isGw {
+		c.enqueueAddOrUpdateVpcNatGwByName(gwName, "natgw-pod-delete")
+	}
+
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(p.Namespace)
 
@@ -294,6 +310,21 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 	oldPod := oldObj.(*v1.Pod)
 	newPod := newObj.(*v1.Pod)
 	c.enqueueVMIMigrationForBoundLauncher(oldPod, newPod)
+
+	if isGw, gwName := c.checkIsPodVpcNatGw(newPod); isGw {
+		oldReady := oldPod.Annotations[util.NatGatewayDataplaneReadyAnnotation]
+		newReady := newPod.Annotations[util.NatGatewayDataplaneReadyAnnotation]
+		oldLegacyReady := oldPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
+		newLegacyReady := newPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
+		oldTerminating := !oldPod.DeletionTimestamp.IsZero()
+		newTerminating := !newPod.DeletionTimestamp.IsZero()
+		if oldReady != newReady || oldLegacyReady != newLegacyReady ||
+			oldPod.Status.Phase != newPod.Status.Phase ||
+			oldTerminating != newTerminating ||
+			isPodReadyConditionTrue(oldPod) != isPodReadyConditionTrue(newPod) {
+			c.enqueueAddOrUpdateVpcNatGwByName(gwName, "natgw pod readiness/state changed")
+		}
+	}
 
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(oldPod.Namespace)
@@ -556,6 +587,13 @@ func (c *Controller) handleAddOrUpdatePod(key string) (err error) {
 			if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; !hasInit {
 				klog.Infof("init vpc nat gateway pod %s/%s with name %s", pod.Namespace, pod.Name, vpcGwName)
 				c.initVpcNatGatewayQueue.Add(vpcGwName)
+			}
+		}
+		if pod.DeletionTimestamp.IsZero() && pod.Status.Phase == v1.PodRunning {
+			podName := c.getNameByPod(pod)
+			portName := ovs.PodNameToPortName(podName, pod.Namespace, util.OvnProvider)
+			if err := c.OVNNbClient.EnablePortLayer2forward(portName); err != nil {
+				klog.V(4).Infof("failed to enable layer2 forward for nat gw port %s: %v", portName, err)
 			}
 		}
 		if needRestartNatGatewayPod(pod) {
@@ -881,7 +919,11 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 				return nil, err
 			}
 
-			if pod.Annotations[fmt.Sprintf(util.Layer2ForwardAnnotationTemplate, podNet.ProviderName)] == "true" {
+			isNatGw, _ := c.checkIsPodVpcNatGw(pod)
+			if isNatGw {
+				patch[fmt.Sprintf(util.Layer2ForwardAnnotationTemplate, podNet.ProviderName)] = "true"
+			}
+			if isNatGw || pod.Annotations[fmt.Sprintf(util.Layer2ForwardAnnotationTemplate, podNet.ProviderName)] == "true" {
 				if err := c.OVNNbClient.EnablePortLayer2forward(portName); err != nil {
 					c.recorder.Eventf(pod, v1.EventTypeWarning, "SetOVNPortL2ForwardFailed", err.Error())
 					klog.Errorf("%v", err)
@@ -949,6 +991,12 @@ func (c *Controller) reconcileAllocateSubnets(pod *v1.Pod, needAllocatePodNets [
 		if pod.DeletionTimestamp.IsZero() {
 			klog.Infof("init vpc nat gateway pod %s/%s with name %s", namespace, name, vpcGwName)
 			c.initVpcNatGatewayQueue.Add(vpcGwName)
+			podName := c.getNameByPod(pod)
+			portName := ovs.PodNameToPortName(podName, namespace, util.OvnProvider)
+			if err := c.OVNNbClient.EnablePortLayer2forward(portName); err != nil {
+				klog.Errorf("failed to enable layer2 forward for nat gw port %s: %v", portName, err)
+				return nil, err
+			}
 		}
 	}
 
