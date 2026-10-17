@@ -990,3 +990,26 @@ func TestGetSubnetV4Mask(t *testing.T) {
 	require.Equal(t, err, ErrNoAvailable)
 	require.Empty(t, mask)
 }
+func TestIPAMSelectIPPoolIPs(t *testing.T) {
+	ipam := NewIPAM()
+	require.NoError(t, ipam.AddOrUpdateSubnet("subnetSelect", "10.0.0.0/24", "10.0.0.1", []string{"10.0.0.1"}))
+
+	// selection and reservation happen in one call
+	v4, v6, err := ipam.SelectIPPoolIPs("subnetSelect", "pool1", nil, 2, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.2", "10.0.0.3"}, v4)
+	require.Empty(t, v6, "an IPv4 subnet has no free IPv6 address")
+
+	// the reservation holds: another pool cannot pick the same addresses
+	v4, _, err = ipam.SelectIPPoolIPs("subnetSelect", "pool2", nil, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.4"}, v4)
+
+	// re-selecting recovers the held selection, e.g. after a failed status update
+	v4, _, err = ipam.SelectIPPoolIPs("subnetSelect", "pool1", nil, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.2"}, v4)
+
+	_, _, err = ipam.SelectIPPoolIPs("unknownSubnet", "pool1", nil, 1, 0)
+	require.ErrorContains(t, err, "does not exist in IPAM")
+}
