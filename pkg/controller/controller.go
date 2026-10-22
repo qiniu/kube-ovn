@@ -1575,6 +1575,9 @@ func (c *Controller) startWorkers(ctx context.Context) {
 
 	go wait.Until(c.resyncProviderNetworkStatus, 30*time.Second, ctx.Done())
 	go wait.Until(c.exportSubnetMetrics, 30*time.Second, ctx.Done())
+	if c.config.EnableMetrics {
+		go wait.UntilWithContext(ctx, c.exportEipTrafficMetrics, 30*time.Second)
+	}
 	go wait.Until(c.checkSubnetGateway, 5*time.Second, ctx.Done())
 	go wait.Until(c.syncDistributedSubnetRoutes, 5*time.Second, ctx.Done())
 
@@ -1673,6 +1676,7 @@ func (c *Controller) allSubnetReady(subnets ...string) (bool, error) {
 
 func (c *Controller) initResourceOnce() {
 	c.registerSubnetMetrics()
+	registerEipTrafficMetrics()
 
 	if err := c.initNodeChassis(); err != nil {
 		util.LogFatalAndExit(err, "failed to initialize node chassis")

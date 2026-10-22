@@ -282,6 +282,73 @@ function del_vpc_external_route() {
     # done
 }
 
+# These filter hooks see every packet, unlike the NAT chains. Keep the counters
+# outside the share-DNAT table, whose rules are rebuilt on backend updates.
+EIP_METRICS_TABLE="kube_ovn_eip_metrics"
+
+function ensure_eip_metrics_table() {
+    if nft list table ip "$EIP_METRICS_TABLE" >/dev/null 2>&1; then
+        return
+    fi
+    if [[ ! "$EXTERNAL_INTERFACE" =~ ^[a-zA-Z0-9_.:-]+$ ]]; then
+        echo "Invalid external interface for EIP metrics: $EXTERNAL_INTERFACE" >&2
+        return 1
+    fi
+    nft -f - <<EOF
+add table ip $EIP_METRICS_TABLE
+add map ip $EIP_METRICS_TABLE ingress_eips { type ipv4_addr : counter; }
+add map ip $EIP_METRICS_TABLE egress_eips { type ipv4_addr : counter; }
+add chain ip $EIP_METRICS_TABLE ingress { type filter hook prerouting priority -151; policy accept; }
+add chain ip $EIP_METRICS_TABLE egress { type filter hook postrouting priority 101; policy accept; }
+add rule ip $EIP_METRICS_TABLE ingress iifname "$EXTERNAL_INTERFACE" counter name ip daddr map @ingress_eips
+add rule ip $EIP_METRICS_TABLE egress oifname "$EXTERNAL_INTERFACE" counter name ip saddr map @egress_eips
+EOF
+}
+
+function validate_eip_metric_identity() {
+    if [[ ! "$1" =~ ^[a-zA-Z0-9_-]+,[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "Invalid EIP metric identity (expected UID,IPv4): $1" >&2
+        return 1
+    fi
+}
+
+function sync_eip_metrics() {
+    local rule uid ip direction counter kind rest listing
+    local -A existing=() desired=()
+    local cmds=("flush map ip $EIP_METRICS_TABLE ingress_eips" "flush map ip $EIP_METRICS_TABLE egress_eips")
+    check_inited >/dev/null || return 1
+    for rule in "$@"; do
+        validate_eip_metric_identity "$rule" || return 1
+    done
+    ensure_eip_metrics_table || return 1
+    listing=$(nft list counters ip "$EIP_METRICS_TABLE") || return 1
+    while read -r kind counter rest; do
+        if [[ "$kind" == "counter" && "$counter" =~ ^(ingress|egress)_[a-zA-Z0-9_]+$ ]]; then
+            existing["$counter"]=1
+        fi
+    done <<< "$listing"
+    for rule in "$@"; do
+        IFS=',' read -r uid ip <<< "$rule"
+        for direction in ingress egress; do
+            counter="${direction}_${uid//-/_}"
+            desired["$counter"]=1
+            if [[ -z "${existing[$counter]+present}" ]]; then
+                cmds+=("add counter ip $EIP_METRICS_TABLE $counter")
+            fi
+            cmds+=("add element ip $EIP_METRICS_TABLE ${direction}_eips { $ip : \"$counter\" }")
+        done
+    done
+    for counter in "${!existing[@]}"; do
+        if [[ -z "${desired[$counter]+present}" ]]; then
+            cmds+=("delete counter ip $EIP_METRICS_TABLE $counter")
+        fi
+    done
+    # Replace both maps and remove stale UID counters in one transaction;
+    # retained counters keep their values even when an EIP reuses an address.
+    printf '%s\n' "${cmds[@]}" | nft -f - || return 1
+    nft -j list counters ip "$EIP_METRICS_TABLE"
+}
+
 function add_eip() {
     # make sure inited
     check_inited
@@ -2288,6 +2355,12 @@ case $opt in
     eip-del)
         echo "eip-del $*"
         del_eip "$@"
+        ;;
+    eip-metrics-sync)
+        sync_eip_metrics "$@"
+        ;;
+    eip-metrics-get)
+        nft -j list counters ip "$EIP_METRICS_TABLE"
         ;;
     vip-addr-sync)
         echo "vip-addr-sync $*"
