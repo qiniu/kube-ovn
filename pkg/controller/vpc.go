@@ -528,11 +528,36 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		policyRouteLogical                                         []*ovnnb.LogicalRouterPolicy
 	)
 
+	targetPolicyRoutes := make([]*kubeovnv1.PolicyRoute, len(vpc.Spec.PolicyRoutes))
+	for i, pr := range vpc.Spec.PolicyRoutes {
+		prCopy := *pr
+		if prCopy.Action == kubeovnv1.PolicyRouteActionReroute && prCopy.Gateway != "" {
+			// Dynamically resolve gateway member IPs from gateway name
+			gwIPs := c.getGatewayMemberLANIPs(prCopy.Gateway)
+			if len(gwIPs) > 0 {
+				prCopy.NextHopIP = strings.Join(gwIPs, ",")
+			} else {
+				// Degrade to drop when no gateway member is ready to prevent traffic blackhole
+				prCopy.Action = kubeovnv1.PolicyRouteActionDrop
+				prCopy.NextHopIP = ""
+				metricPolicyRouteResolveErrors.WithLabelValues(vpc.Name, prCopy.Gateway).Inc()
+			}
+		}
+		if prCopy.BfdID == "" && prCopy.NextHopIP != "" {
+			nextHops := splitNextHops(prCopy.NextHopIP)
+			bfdSessions := c.getVpcBfdSessions(vpc.Name, nextHops, "")
+			if len(bfdSessions) > 0 {
+				prCopy.BfdID = strings.Join(bfdSessions, ",")
+			}
+		}
+		targetPolicyRoutes[i] = &prCopy
+	}
+
 	if vpc.Name == c.config.ClusterRouter {
 		lastPolicies, _ := c.vpcLastPoliciesMap.Load(vpc.Name)
 		policyRouteExisted = reversePolicies(lastPolicies)
 		// diff list
-		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithExisted(policyRouteExisted, vpc.Spec.PolicyRoutes)
+		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithExisted(policyRouteExisted, targetPolicyRoutes)
 	} else {
 		policyRouteLogical, err = c.OVNNbClient.ListLogicalRouterPolicies(vpc.Name, -1, nil, true)
 		if err != nil {
@@ -540,7 +565,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 			return err
 		}
 		// diff vpc policy route
-		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithLogical(policyRouteLogical, vpc.Spec.PolicyRoutes)
+		policyRouteNeedDel, policyRouteNeedAdd = diffPolicyRouteWithLogical(policyRouteLogical, targetPolicyRoutes)
 	}
 	// delete policies non-exist
 	for _, item := range policyRouteNeedDel {
@@ -552,7 +577,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	}
 	// add new policies
 	for _, item := range policyRouteNeedAdd {
-		klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, externalID %v", vpc.Name, item.Match, string(item.Action), item.NextHopIP, externalIDs)
+		klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, bfdId %s, externalID %v", vpc.Name, item.Match, string(item.Action), item.NextHopIP, item.BfdID, externalIDs)
 		if err = c.addPolicyRouteToVpc(vpc.Name, item, externalIDs); err != nil {
 			return err
 		}
@@ -845,20 +870,69 @@ func (c *Controller) reconcileVpcBfdLRP(vpc *kubeovnv1.Vpc) (string, []string, e
 }
 
 func (c *Controller) addPolicyRouteToVpc(vpcName string, policy *kubeovnv1.PolicyRoute, externalIDs map[string]string) error {
-	var (
-		nextHops []string
-		err      error
-	)
+	nextHops := splitNextHops(policy.NextHopIP)
+	bfdSessions := c.getVpcBfdSessions(vpcName, nextHops, policy.BfdID)
 
-	if policy.NextHopIP != "" {
-		nextHops = strings.Split(policy.NextHopIP, ",")
-	}
-
-	if err = c.OVNNbClient.AddLogicalRouterPolicy(vpcName, policy.Priority, policy.Match, string(policy.Action), nextHops, nil, externalIDs); err != nil {
+	if err := c.OVNNbClient.AddLogicalRouterPolicy(vpcName, policy.Priority, policy.Match, string(policy.Action), nextHops, bfdSessions, externalIDs); err != nil {
 		klog.Errorf("add policy route to vpc %s failed, %v", vpcName, err)
 		return err
 	}
 	return nil
+}
+
+func (c *Controller) getVpcBfdSessions(vpcName string, nextHops []string, explicitBfdID string) []string {
+	if explicitBfdID != "" {
+		var sessions []string
+		for _, id := range strings.Split(explicitBfdID, ",") {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				sessions = append(sessions, trimmed)
+			}
+		}
+		if len(sessions) > 0 {
+			return sessions
+		}
+	}
+
+	if len(nextHops) == 0 {
+		return nil
+	}
+
+	if c.vpcsLister != nil {
+		vpc, err := c.vpcsLister.Get(vpcName)
+		if err == nil && vpc != nil {
+			if !vpc.Spec.EnableBfd && !vpc.Spec.BFDPort.IsEnabled() {
+				return nil
+			}
+		}
+	}
+
+	lrpNames := []string{
+		"bfd@" + vpcName,
+		fmt.Sprintf("%s-%s", vpcName, c.config.ExternalGatewaySwitch),
+	}
+
+	var bfdSessions []string
+	seen := make(map[string]bool)
+	for _, lrpName := range lrpNames {
+		for _, nextHop := range nextHops {
+			trimmedHop := strings.TrimSpace(nextHop)
+			if trimmedHop == "" {
+				continue
+			}
+			bfds, err := c.OVNNbClient.ListBFDs(lrpName, trimmedHop)
+			if err != nil {
+				klog.V(5).Infof("failed to list BFD for %s and %s: %v", lrpName, trimmedHop, err)
+				continue
+			}
+			for _, bfd := range bfds {
+				if bfd.UUID != "" && !seen[bfd.UUID] {
+					seen[bfd.UUID] = true
+					bfdSessions = append(bfdSessions, bfd.UUID)
+				}
+			}
+		}
+	}
+	return bfdSessions
 }
 
 func buildExternalIDsMapKey(match, action string, priority int) string {
@@ -872,15 +946,14 @@ func (c *Controller) batchAddPolicyRouteToVpc(name string, policies []*kubeovnv1
 	start := time.Now()
 	routerPolicies := make([]*ovnnb.LogicalRouterPolicy, 0, len(policies))
 	for _, policy := range policies {
-		var nextHops []string
-		if policy.NextHopIP != "" {
-			nextHops = strings.Split(policy.NextHopIP, ",")
-		}
+		nextHops := splitNextHops(policy.NextHopIP)
+		bfdSessions := c.getVpcBfdSessions(name, nextHops, policy.BfdID)
 		routerPolicies = append(routerPolicies, &ovnnb.LogicalRouterPolicy{
 			Priority:    policy.Priority,
 			Nexthops:    nextHops,
 			Action:      string(policy.Action),
 			Match:       policy.Match,
+			BFDSessions: bfdSessions,
 			ExternalIDs: externalIDs[buildExternalIDsMapKey(policy.Match, string(policy.Action), policy.Priority)],
 		})
 	}
@@ -1028,6 +1101,9 @@ func diffPolicyRouteWithLogical(exists []*ovnnb.LogicalRouterPolicy, target []*k
 			Action:    kubeovnv1.PolicyRouteAction(item.Action),
 			NextHopIP: getLogicalPolicyNextHopKey(item),
 		}
+		if len(item.BFDSessions) > 0 {
+			policy.BfdID = normalizeBfdIDs(strings.Join(item.BFDSessions, ","))
+		}
 		existsMap[getPolicyRouteItemKey(policy)] = policy
 	}
 	klog.Infof("diffPolicyRouteWithLogical existsMap: %v", existsMap)
@@ -1052,7 +1128,22 @@ func diffPolicyRouteWithLogical(exists []*ovnnb.LogicalRouterPolicy, target []*k
 }
 
 func getPolicyRouteItemKey(item *kubeovnv1.PolicyRoute) (key string) {
-	return fmt.Sprintf("%d:%s:%s:%s", item.Priority, item.Match, item.Action, normalizePolicyRouteNextHops(item.NextHopIP))
+	return fmt.Sprintf("%d:%s:%s:%s:%s", item.Priority, item.Match, item.Action, normalizePolicyRouteNextHops(item.NextHopIP), normalizeBfdIDs(item.BfdID))
+}
+
+func normalizeBfdIDs(bfdID string) string {
+	if bfdID == "" {
+		return ""
+	}
+	ids := strings.Split(bfdID, ",")
+	var result []string
+	for _, id := range ids {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	slices.Sort(result)
+	return strings.Join(result, ",")
 }
 
 func getLogicalPolicyNextHopKey(item *ovnnb.LogicalRouterPolicy) string {
@@ -1065,18 +1156,23 @@ func getLogicalPolicyNextHopKey(item *ovnnb.LogicalRouterPolicy) string {
 	return ""
 }
 
-func normalizePolicyRouteNextHops(nextHopIP string) string {
+func splitNextHops(nextHopIP string) []string {
 	if nextHopIP == "" {
-		return ""
+		return nil
 	}
 
-	nextHops := make([]string, 0)
+	var nextHops []string
 	for nextHop := range strings.SplitSeq(nextHopIP, ",") {
 		nextHop = strings.TrimSpace(nextHop)
 		if nextHop != "" {
 			nextHops = append(nextHops, nextHop)
 		}
 	}
+	return nextHops
+}
+
+func normalizePolicyRouteNextHops(nextHopIP string) string {
+	nextHops := splitNextHops(nextHopIP)
 	if len(nextHops) == 0 {
 		return ""
 	}
@@ -1160,10 +1256,18 @@ func (c *Controller) formatVpc(vpc *kubeovnv1.Vpc) (*kubeovnv1.Vpc, error) {
 				route.NextHopIP = ""
 				changed = true
 			}
+			if route.BfdID != "" {
+				route.BfdID = ""
+				changed = true
+			}
 		} else {
+			if route.Gateway != "" && route.NextHopIP == "" {
+				// Gateway is specified, nextHopIP will be dynamically resolved by controller
+				continue
+			}
 			// ecmp policy route may reroute to multiple next hop ips
 			for ipStr := range strings.SplitSeq(route.NextHopIP, ",") {
-				if ip := net.ParseIP(ipStr); ip == nil {
+				if ip := net.ParseIP(strings.TrimSpace(ipStr)); ip == nil {
 					err := fmt.Errorf("invalid next hop ips: %s", route.NextHopIP)
 					klog.Error(err)
 					return nil, err
@@ -1508,3 +1612,70 @@ func (c *Controller) updateVpcExternalStatus(key string) error {
 
 	return nil
 }
+
+// getGatewayMemberLANIPs dynamically resolves LAN IPs of ready member pods for the specified NAT gateway.
+// Supports exact VpcNatGateway name ("phase2-gw-m1"), comma-separated names ("phase2-gw-m1,phase2-gw-m2"),
+// and logical HA gateway prefix ("phase2-gw" -> ["phase2-gw-m1", "phase2-gw-m2"]).
+func (c *Controller) getGatewayMemberLANIPs(gatewayName string) []string {
+	if gatewayName == "" || c.vpcNatGatewayLister == nil {
+		return nil
+	}
+	var matchedGws []*kubeovnv1.VpcNatGateway
+	seenGw := make(map[string]bool)
+	for _, rawName := range strings.Split(gatewayName, ",") {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		if gw, err := c.vpcNatGatewayLister.Get(name); err == nil && gw != nil {
+			if !seenGw[gw.Name] {
+				seenGw[gw.Name] = true
+				matchedGws = append(matchedGws, gw)
+			}
+			continue
+		}
+		allGws, err := c.vpcNatGatewayLister.List(labels.Everything())
+		if err != nil {
+			klog.V(3).Infof("failed to list vpc nat gateways for %s: %v", name, err)
+			continue
+		}
+		prefix := name + "-m"
+		for _, gw := range allGws {
+			if gw == nil || seenGw[gw.Name] {
+				continue
+			}
+			if strings.HasPrefix(gw.Name, prefix) ||
+				(gw.Annotations != nil && gw.Annotations["ovn.kubernetes.io/ha-gateway-group"] == name) ||
+				(gw.Labels != nil && gw.Labels["ovn.kubernetes.io/ha-gateway-group"] == name) {
+				seenGw[gw.Name] = true
+				matchedGws = append(matchedGws, gw)
+			}
+		}
+	}
+	if len(matchedGws) == 0 {
+		klog.V(3).Infof("no matching vpc nat gateway found for %s", gatewayName)
+		return nil
+	}
+
+	seenIP := make(map[string]bool)
+	var ips []string
+	for _, gw := range matchedGws {
+		pods, err := c.listNatGwPods(gw)
+		if err != nil || len(pods) == 0 {
+			continue
+		}
+		nextHops, err := getNatGwNextHops(gw, pods)
+		if err != nil || len(nextHops) == 0 {
+			continue
+		}
+		for _, ip := range nextHops {
+			if ip != "" && !seenIP[ip] {
+				seenIP[ip] = true
+				ips = append(ips, ip)
+			}
+		}
+	}
+	sort.Strings(ips)
+	return ips
+}
+

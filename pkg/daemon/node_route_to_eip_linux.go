@@ -39,8 +39,11 @@ package daemon
 //   - EnableNodeLocalAccessVpcNatGwEIP config flag must be true (default)
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"syscall"
 
 	"github.com/pkg/errors"
@@ -55,13 +58,12 @@ import (
 )
 
 // eipRouteInfo holds information needed to add or delete an EIP route.
-// We store the macvlan interface name directly (computed at enqueue time) because:
-// 1. The EIP object may be gone from the API server after deletion
-// 2. Avoids redundant computation of interface name on each retry
+// Supports both legacy macvlan mode and high-performance veth-pair mode.
 type eipRouteInfo struct {
 	eipName     string // EIP name, used for add operations to check current state
 	v4ip        string // IPv4 address of the EIP
 	macvlanName string // macvlan sub-interface name for the route
+	mode        string // "macvlan" or "veth"
 }
 
 // parseEIPDestination parses an EIP address into a host route destination (/32 for IPv4, /128 for IPv6)
@@ -241,6 +243,132 @@ func deleteEIPRoute(eip, macvlanSubIfName string) error {
 	return nil
 }
 
+// addVethEIPRoute adds a route for EIP via the specified veth next-hop IP.
+func addVethEIPRoute(eip, nextHop string) error {
+	dst, err := parseEIPDestination(eip)
+	if err != nil {
+		return err
+	}
+	gw := net.ParseIP(nextHop)
+	if gw == nil {
+		return fmt.Errorf("invalid veth nextHop IP: %s", nextHop)
+	}
+
+	route := &netlink.Route{
+		Dst:   dst,
+		Gw:    gw,
+		Scope: netlink.SCOPE_UNIVERSE,
+	}
+
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("failed to add veth route for EIP %s via %s: %w", eip, nextHop, err)
+	}
+	klog.V(3).Infof("added veth route for EIP %s via %s", eip, nextHop)
+	return nil
+}
+
+// deleteVethEIPRoute deletes the route for EIP from host routing table.
+func deleteVethEIPRoute(eip string) error {
+	dst, err := parseEIPDestination(eip)
+	if err != nil {
+		return err
+	}
+	route := &netlink.Route{
+		Dst: dst,
+	}
+	if err := netlink.RouteDel(route); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("failed to delete veth route for EIP %s: %w", eip, err)
+	}
+	klog.Infof("deleted veth route for EIP %s", eip)
+	return nil
+}
+
+// cleanHostLocalTableRouteForEIP deletes hijacked local table routes (table 255) for EIP.
+func cleanHostLocalTableRouteForEIP(eip string) error {
+	dst, err := parseEIPDestination(eip)
+	if err != nil {
+		return err
+	}
+	filter := &netlink.Route{
+		Table: syscall.RT_TABLE_LOCAL,
+		Dst:   dst,
+	}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_TABLE|netlink.RT_FILTER_DST)
+	if err != nil {
+		return nil
+	}
+	for _, r := range routes {
+		if r.Type == syscall.RTN_LOCAL {
+			metricHostLocalRouteHijackedTotal.WithLabelValues(nodeName, eip).Inc()
+			if delErr := netlink.RouteDel(&r); delErr != nil {
+				metricHostLocalRouteCleanErrors.WithLabelValues(nodeName, eip).Inc()
+				klog.Warningf("failed to delete local table route for EIP %s: %v", eip, delErr)
+			} else {
+				klog.Infof("successfully deleted hijacked local table route for EIP %s", eip)
+			}
+		}
+	}
+	return nil
+}
+
+// cleanHostStaleLinkRoutesForEIP deletes any stale scope-link routes for EIP (e.g., from macbond1).
+func cleanHostStaleLinkRoutesForEIP(eip string) {
+	dst, err := parseEIPDestination(eip)
+	if err != nil {
+		return
+	}
+	filter := &netlink.Route{
+		Dst:   dst,
+		Scope: netlink.SCOPE_LINK,
+	}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, filter, netlink.RT_FILTER_DST|netlink.RT_FILTER_SCOPE)
+	if err == nil {
+		for _, r := range routes {
+			if delErr := netlink.RouteDel(&r); delErr == nil {
+				klog.Infof("successfully deleted stale scope-link route for EIP %s (linkIdx=%d)", eip, r.LinkIndex)
+			}
+		}
+	}
+}
+
+// ensureHostForwarding ensures host IPv4 forwarding is enabled.
+func ensureHostForwarding() {
+	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644)
+}
+
+// podNetworkStatusItem parses Multus network-status annotation.
+type podNetworkStatusItem struct {
+	Name      string   `json:"name"`
+	Interface string   `json:"interface"`
+	IPs       []string `json:"ips"`
+	Default   bool     `json:"default"`
+}
+
+// getPodPtpIP extracts the point-to-point IP from gateway pod network-status annotation.
+func getPodPtpIP(pod *corev1.Pod) string {
+	const fallbackIP = "169.254.100.2"
+	if pod == nil || pod.Annotations == nil {
+		return fallbackIP
+	}
+	rawStatus := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]
+	if rawStatus == "" {
+		return fallbackIP
+	}
+	var statuses []podNetworkStatusItem
+	if err := json.Unmarshal([]byte(rawStatus), &statuses); err == nil {
+		for _, st := range statuses {
+			if !st.Default || st.Interface != "eth0" {
+				for _, ip := range st.IPs {
+					if strings.HasPrefix(ip, "169.254.") {
+						return ip
+					}
+				}
+			}
+		}
+	}
+	return fallbackIP
+}
+
 // reconcileMacvlanSubnet is the main handler for macvlan subnet events.
 // It processes subnet add/update/delete events and manages macvlan sub-interfaces accordingly.
 // This function is called by the macvlan subnet worker with independent retry mechanism.
@@ -413,26 +541,51 @@ func (c *Controller) resyncLocalIptablesEipRoutes() {
 	}
 }
 
-// hasNatGwPodOnLocalNode checks if the NAT GW pod for the given NatGwDp is scheduled on the local node.
-// NAT GW pod name is generated from NatGwDp field using the pattern: vpc-nat-gw-{natGwDp}-0
-// Note: This only checks NodeName, not pod phase. The caller should check EIP Ready status
-// to ensure the NAT GW pod has successfully configured iptables rules.
-func (c *Controller) hasNatGwPodOnLocalNode(natGwDp string) bool {
+// findLocalNatGwPod finds the NAT GW pod for the given NatGwDp on the local node.
+// Supports both single-instance gateways and dual-member HA gateways (e.g. phase2-gw with phase2-gw-m1/m2).
+func (c *Controller) findLocalNatGwPod(natGwDp string) *corev1.Pod {
 	if natGwDp == "" {
-		return false
+		return nil
 	}
 
-	// In the current vpc-nat-gw CRD implementation, the StatefulSet has replicas=1,
-	// so there is only one NAT GW pod running at any time. The pod name is deterministic
-	// with suffix "-0" (e.g., vpc-nat-gw-mygateway-0).
+	// 1. Direct match with deterministic single-instance name
 	podName := util.GenNatGwPodName(natGwDp)
-	pod, err := c.podsLister.Pods(c.config.PodNamespace).Get(podName)
-	if err != nil {
-		klog.V(3).Infof("failed to get NAT GW pod %s: %v", podName, err)
-		return false
+	if pod, err := c.podsLister.Pods(c.config.PodNamespace).Get(podName); err == nil {
+		if pod.Spec.NodeName == c.config.NodeName {
+			return pod
+		}
 	}
 
-	return pod.Spec.NodeName == c.config.NodeName
+	// 2. Dual-member / HA match: find any local pod belonging to this logical gateway
+	pods, err := c.podsLister.Pods(c.config.PodNamespace).List(labels.Everything())
+	if err != nil {
+		return nil
+	}
+	prefix := "vpc-nat-gw-" + natGwDp + "-"
+	for _, pod := range pods {
+		if pod.Spec.NodeName != c.config.NodeName {
+			continue
+		}
+		// Match by pod name prefix (e.g. vpc-nat-gw-phase2-gw-m1-0 matches phase2-gw)
+		if strings.HasPrefix(pod.Name, prefix) {
+			return pod
+		}
+		// Match by labels
+		if pod.Labels != nil {
+			if gw := pod.Labels[util.VpcNatGatewayNameLabel]; gw == natGwDp || strings.HasPrefix(gw, natGwDp+"-") {
+				return pod
+			}
+			if app := pod.Labels["app"]; app == "vpc-nat-gw-"+natGwDp || strings.HasPrefix(app, prefix) {
+				return pod
+			}
+		}
+	}
+	return nil
+}
+
+// hasNatGwPodOnLocalNode checks if the NAT GW pod for the given NatGwDp is scheduled on the local node.
+func (c *Controller) hasNatGwPodOnLocalNode(natGwDp string) bool {
+	return c.findLocalNatGwPod(natGwDp) != nil
 }
 
 // shouldEnqueueIptablesEip checks if an EIP should be enqueued for route processing.
@@ -442,7 +595,7 @@ func shouldEnqueueIptablesEip(eip *kubeovnv1.IptablesEIP) bool {
 }
 
 // buildEipRouteInfo builds eipRouteInfo from an EIP object.
-// Returns nil if the EIP cannot be processed (e.g., subnet not found or no master annotation).
+// Returns nil if the EIP cannot be processed.
 func (c *Controller) buildEipRouteInfo(eip *kubeovnv1.IptablesEIP) *eipRouteInfo {
 	if eip.Spec.V4ip == "" {
 		return nil
@@ -454,22 +607,31 @@ func (c *Controller) buildEipRouteInfo(eip *kubeovnv1.IptablesEIP) *eipRouteInfo
 		return nil
 	}
 
-	master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
-	if master == "" {
-		klog.V(3).Infof("subnet %s has no macvlan master annotation for EIP %s", subnet.Name, eip.Name)
-		return nil
+	if util.IsMacvlanSubnet(subnet) {
+		if util.IsHAOrBgpEIP(eip) {
+			klog.Errorf("HA/BGP IptablesEIP %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", eip.Name, subnet.Name)
+			return nil
+		}
+		master := subnet.Annotations[util.NadMacvlanMasterAnnotation]
+		macvlanName, err := util.GenMacvlanIfaceName(master)
+		if err != nil {
+			klog.Errorf("failed to generate macvlan name for EIP %s (master=%s): %v", eip.Name, master, err)
+			return nil
+		}
+
+		return &eipRouteInfo{
+			eipName:     eip.Name,
+			v4ip:        eip.Spec.V4ip,
+			macvlanName: macvlanName,
+			mode:        "macvlan",
+		}
 	}
 
-	macvlanName, err := util.GenMacvlanIfaceName(master)
-	if err != nil {
-		klog.Errorf("failed to generate macvlan name for EIP %s (master=%s): %v", eip.Name, master, err)
-		return nil
-	}
-
+	// Non-macvlan subnet (e.g., ptp veth-pair subnet for HA / BGP Anycast)
 	return &eipRouteInfo{
-		eipName:     eip.Name,
-		v4ip:        eip.Spec.V4ip,
-		macvlanName: macvlanName,
+		eipName: eip.Name,
+		v4ip:    eip.Spec.V4ip,
+		mode:    "veth",
 	}
 }
 
@@ -594,7 +756,10 @@ func (c *Controller) processNextIptablesEipDeleteItem() bool {
 
 // handleDeleteIptablesEipRoute deletes the route for an IptablesEIP.
 func (c *Controller) handleDeleteIptablesEipRoute(info eipRouteInfo) error {
-	klog.Infof("deleting iptables-eip route for %s (v4ip=%s, macvlan=%s)", info.eipName, info.v4ip, info.macvlanName)
+	klog.Infof("deleting iptables-eip route for %s (v4ip=%s, mode=%s, macvlan=%s)", info.eipName, info.v4ip, info.mode, info.macvlanName)
+	if info.mode == "veth" {
+		return deleteVethEIPRoute(info.v4ip)
+	}
 	return deleteEIPRoute(info.v4ip, info.macvlanName)
 }
 
@@ -630,7 +795,7 @@ func (c *Controller) processNextIptablesEipItem() bool {
 // syncIptablesEipRoute syncs the route for an IptablesEIP.
 // It adds the route if NAT GW pod is on this node, or deletes the route if not.
 func (c *Controller) syncIptablesEipRoute(info eipRouteInfo) error {
-	klog.V(3).Infof("syncing iptables-eip route for %s", info.eipName)
+	klog.V(3).Infof("syncing iptables-eip route for %s (mode=%s)", info.eipName, info.mode)
 
 	// Check if EIP was deleted - skip if it was to prevent race conditions
 	if _, deleted := c.deletedEIPs.Load(info.eipName); deleted {
@@ -652,16 +817,57 @@ func (c *Controller) syncIptablesEipRoute(info eipRouteInfo) error {
 		return nil
 	}
 
+	// Clean any hijacked routes in table 255 (local) on all nodes for veth mode.
+	// Kube-proxy in IPVS mode binds LoadBalancer EIPs to kube-ipvs0 on every node,
+	// creating local table routes that intercept external/inter-node traffic.
+	if info.mode == "veth" {
+		_ = cleanHostLocalTableRouteForEIP(info.v4ip)
+	}
+
 	// If NAT GW pod is not on this node, delete routes (if any) and return
 	if !c.hasNatGwPodOnLocalNode(eip.Spec.NatGwDp) {
 		klog.V(3).Infof("NAT GW pod for iptables-eip %s not on local node, deleting routes if exist", info.eipName)
-		if err := deleteEIPRoute(info.v4ip, info.macvlanName); err != nil {
-			klog.V(3).Infof("failed to delete route for EIP %s (may not exist): %v", info.eipName, err)
+		if info.mode == "veth" {
+			_ = deleteVethEIPRoute(info.v4ip)
+		} else {
+			if err := deleteEIPRoute(info.v4ip, info.macvlanName); err != nil {
+				klog.V(3).Infof("failed to delete route for EIP %s (may not exist): %v", info.eipName, err)
+			}
 		}
 		return nil
 	}
 
-	// Add IPv4 route via macvlan sub-interface
+	// 1. High-performance veth-pair mode (L3 Point-to-Point / BGP Anycast)
+	if info.mode == "veth" {
+		// Clean any hijacked routes in table 255 (local)
+		_ = cleanHostLocalTableRouteForEIP(info.v4ip)
+		// Clean any stale scope-link routes (e.g. dev macbond1 scope link)
+		cleanHostStaleLinkRoutesForEIP(info.v4ip)
+		// Ensure host IPv4 forwarding is active
+		ensureHostForwarding()
+
+		// Dynamically obtain pod's real ptp IP from network-status
+		localPod := c.findLocalNatGwPod(eip.Spec.NatGwDp)
+		if localPod == nil {
+			klog.Errorf("failed to get local NAT GW pod for gateway %s", eip.Spec.NatGwDp)
+			return fmt.Errorf("local NAT GW pod for %s not found", eip.Spec.NatGwDp)
+		}
+		ptpIP := getPodPtpIP(localPod)
+
+		// Install penetration route via point-to-point interface
+		if err := addVethEIPRoute(info.v4ip, ptpIP); err != nil {
+			klog.Errorf("failed to add veth route for iptables-eip %s (V4ip=%s, ptpIP=%s): %v", info.eipName, info.v4ip, ptpIP, err)
+			return err
+		}
+
+		// Also clean any legacy macvlan route if existed
+		if info.macvlanName != "" {
+			_ = deleteEIPRoute(info.v4ip, info.macvlanName)
+		}
+		return nil
+	}
+
+	// 2. Legacy macvlan mode: Add IPv4 route via macvlan sub-interface
 	if err := addEIPRoute(info.v4ip, info.macvlanName); err != nil {
 		klog.Errorf("failed to add IPv4 route for iptables-eip %s (V4ip=%s, macvlan=%s): %v", info.eipName, info.v4ip, info.macvlanName, err)
 		return err

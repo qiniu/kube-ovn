@@ -430,3 +430,97 @@ func TestHandleNatGwPodDelete(t *testing.T) {
 		assert.Equal(t, 0, c.iptablesEipQueue.Len())
 	})
 }
+
+func TestBuildEipRouteInfoModes(t *testing.T) {
+	macvlanSubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "macvlan-sub",
+			Annotations: map[string]string{
+				util.NadMacvlanMasterAnnotation: "bond1",
+			},
+		},
+	}
+	vethSubnet := &kubeovnv1.Subnet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "veth-sub",
+		},
+	}
+
+	subnetIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, subnetIndexer.Add(macvlanSubnet))
+	require.NoError(t, subnetIndexer.Add(vethSubnet))
+
+	c := &Controller{
+		subnetsLister: kubeovnlister.NewSubnetLister(subnetIndexer),
+	}
+
+	// Case 1: Standard macvlan subnet without BGP annotation
+	macvlanEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip-macvlan"},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			V4ip:           "183.240.180.136",
+			ExternalSubnet: "macvlan-sub",
+		},
+	}
+	info1 := c.buildEipRouteInfo(macvlanEip)
+	require.NotNil(t, info1)
+	assert.Equal(t, "macvlan", info1.mode)
+	assert.Equal(t, "macbond1", info1.macvlanName)
+
+	// Case 2: Macvlan subnet with BGP Anycast or HA member label -> rejected (HA does not support macvlan)
+	bgpEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "eip-bgp",
+			Annotations: map[string]string{
+				util.BgpAnnotation: "true",
+			},
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			V4ip:           "183.240.180.136",
+			ExternalSubnet: "macvlan-sub",
+		},
+	}
+	info2 := c.buildEipRouteInfo(bgpEip)
+	assert.Nil(t, info2)
+
+	haMemberEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "eip-ha-member",
+			Labels: map[string]string{
+				util.NatGatewayMemberLabel: "gw-m1",
+			},
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			V4ip:           "183.240.180.136",
+			ExternalSubnet: "macvlan-sub",
+		},
+	}
+	assert.Nil(t, c.buildEipRouteInfo(haMemberEip))
+
+	// Case 3: Ptp / veth subnet without macvlan master annotation -> veth mode
+	vethEip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{Name: "eip-veth"},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			V4ip:           "183.240.180.136",
+			ExternalSubnet: "veth-sub",
+		},
+	}
+	info3 := c.buildEipRouteInfo(vethEip)
+	require.NotNil(t, info3)
+	assert.Equal(t, "veth", info3.mode)
+	assert.Empty(t, info3.macvlanName)
+}
+
+func TestGetPodPtpIPInDaemon(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				"k8s.v1.cni.cncf.io/network-status": `[
+					{"name": "generic-veth", "interface": "eth0", "ips": ["10.210.88.253"], "default": true},
+					{"name": "kube-system/public-veth-ptp", "interface": "net1", "ips": ["169.254.100.3"]}
+				]`,
+			},
+		},
+	}
+	assert.Equal(t, "169.254.100.3", getPodPtpIP(pod))
+}

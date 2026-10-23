@@ -99,6 +99,15 @@ type PolicyRoute struct {
 	// NextHopIP is an optional parameter. It needs to be provided only when 'action' is 'reroute'.
 	// +optional
 	NextHopIP string `json:"nextHopIP,omitempty"`
+	// +optional
+	BfdID string `json:"bfdId,omitempty"`
+	// Gateway references a VpcNatGateway to dynamically resolve next-hop member LAN IPs.
+	// When specified, nextHopIP can be omitted and will be automatically resolved by the controller.
+	// +optional
+	Gateway string `json:"gateway,omitempty"`
+	// GatewayType indicates the gateway type (default: "nat")
+	// +optional
+	GatewayType string `json:"gatewayType,omitempty"`
 }
 
 type BFDPortStatus struct {
