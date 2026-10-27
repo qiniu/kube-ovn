@@ -474,3 +474,104 @@ func TestDiffPolicyRouteWithLogical_HandlesLegacyNextHopField(t *testing.T) {
 	require.Empty(t, dels)
 	require.Empty(t, adds)
 }
+
+func Test_createVpcRouter_learnFromARPRequest(t *testing.T) {
+	t.Parallel()
+
+	t.Run("learnFromARPRequest true does not set always_learn_from_arp_request false", func(t *testing.T) {
+		fakeController := newFakeController(t)
+		ctrl := fakeController.fakeController
+		mockOvnClient := fakeController.mockOvnClient
+
+		vpcName := "vpc-learn-arp-true"
+		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
+			Name:    vpcName,
+			Options: map[string]string{},
+		}, nil)
+		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).DoAndReturn(func(lr *ovnnb.LogicalRouter, fields ...any) error {
+			require.NotContains(t, lr.Options, "always_learn_from_arp_request")
+			require.Equal(t, "300", lr.Options["mac_binding_age_threshold"])
+			require.Equal(t, "true", lr.Options["dynamic_neigh_routers"])
+			return nil
+		})
+
+		err := ctrl.createVpcRouter(vpcName, true)
+		require.NoError(t, err)
+	})
+
+	t.Run("learnFromARPRequest false sets always_learn_from_arp_request false", func(t *testing.T) {
+		fakeController := newFakeController(t)
+		ctrl := fakeController.fakeController
+		mockOvnClient := fakeController.mockOvnClient
+
+		vpcName := "vpc-learn-arp-false"
+		mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+		mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
+			Name:    vpcName,
+			Options: map[string]string{},
+		}, nil)
+		mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).DoAndReturn(func(lr *ovnnb.LogicalRouter, fields ...any) error {
+			require.Equal(t, "false", lr.Options["always_learn_from_arp_request"])
+			require.Equal(t, "300", lr.Options["mac_binding_age_threshold"])
+			require.Equal(t, "true", lr.Options["dynamic_neigh_routers"])
+			return nil
+		})
+
+		err := ctrl.createVpcRouter(vpcName, false)
+		require.NoError(t, err)
+	})
+}
+
+func Test_handleAddOrUpdateVpc_VpcPeerings_EnableArpLearning(t *testing.T) {
+	t.Parallel()
+
+	fakeController := newFakeController(t)
+	ctrl := fakeController.fakeController
+	fakeinformers := fakeController.fakeInformers
+	mockOvnClient := fakeController.mockOvnClient
+	ctrl.vpcKeyMutex = keymutex.NewHashed(500)
+
+	vpcName := "test-peering-vpc"
+	vpc := &kubeovnv1.Vpc{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: vpcName,
+		},
+		Spec: kubeovnv1.VpcSpec{
+			EnableExternal: false,
+			VpcPeerings: []*kubeovnv1.VpcPeering{
+				{
+					RemoteVpc:      "peer-vpc",
+					LocalConnectIP: "169.254.0.1/30",
+				},
+			},
+		},
+	}
+
+	_, err := ctrl.config.KubeOvnClient.KubeovnV1().Vpcs().Create(context.Background(), vpc, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = fakeinformers.vpcInformer.Informer().GetStore().Add(vpc)
+	require.NoError(t, err)
+
+	externalIDs := map[string]string{"vendor": util.CniTypeName}
+	mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+	mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
+		Name:    vpcName,
+		Options: map[string]string{},
+	}, nil)
+	mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).DoAndReturn(func(lr *ovnnb.LogicalRouter, fields ...any) error {
+		require.NotContains(t, lr.Options, "always_learn_from_arp_request", "VPC with peerings must keep ARP learning enabled")
+		return nil
+	})
+	mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(nil, nil)
+	mockOvnClient.EXPECT().ListLogicalRouterPolicies(vpcName, -1, nil, true).Return(nil, nil)
+	mockOvnClient.EXPECT().ListLogicalSwitch(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalSwitch{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().ListLogicalRouter(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalRouter{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().DeleteLogicalRouterPort(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+	mockOvnClient.EXPECT().DeleteHAChassisGroup(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+	mockOvnClient.EXPECT().GetLogicalRouter(gomock.Any(), gomock.Any()).Return(&ovnnb.LogicalRouter{Name: "peer-vpc"}, nil).AnyTimes()
+	mockOvnClient.EXPECT().CreatePeerRouterPort(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	err = ctrl.handleAddOrUpdateVpc(vpcName)
+	require.NoError(t, err)
+}
