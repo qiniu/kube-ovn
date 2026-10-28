@@ -76,3 +76,4 @@ func registerMetrics() {
 	metrics.Registry.MustRegister(metricSubnetIPAssignedInfo)
 	registerTunnelKeyMetrics()
 }
+

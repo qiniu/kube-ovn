@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	v1 "k8s.io/api/apps/v1"
@@ -32,8 +31,24 @@ import (
 var (
 	vpcNatEnabled   = "unknown"
 	VpcNatCmVersion = ""
-	natGwCreatedAT  = ""
 )
+
+func (c *Controller) getNatGwCreatedAt(key string) string {
+	if val, ok := c.natGwCreatedAt.Load(key); ok {
+		if s, ok := val.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func (c *Controller) setNatGwCreatedAt(key, createdAt string) {
+	c.natGwCreatedAt.Store(key, createdAt)
+}
+
+func (c *Controller) deleteNatGwCreatedAt(key string) {
+	c.natGwCreatedAt.Delete(key)
+}
 
 const (
 	natGwInit             = "init"
@@ -66,6 +81,15 @@ const (
 	// Share DNAT VIP state of a Service handled by the nftable LB service feature: the ClusterIPs
 	// held on lo (see nft_dnat.go).
 	natGwVipAddrSync = "vip-addr-sync"
+
+	natGwStatelessInit    = "stateless-init"
+	natGwStatelessApply   = "stateless-apply"
+	natGwStatelessFipAdd  = "stateless-fip-add"
+	natGwStatelessFipDel  = "stateless-fip-del"
+	natGwStatelessDnatAdd = "stateless-dnat-add"
+	natGwStatelessDnatDel = "stateless-dnat-del"
+	natGwStatelessSnatAdd = "stateless-snat-add"
+	natGwStatelessSnatDel = "stateless-snat-del"
 
 	getIptablesVersion = "get-iptables-version"
 )
@@ -224,6 +248,7 @@ func (c *Controller) handleDelVpcNatGw(key string) error {
 	// re-enqueues its partition sync), so forget them here to track live gateways only.
 	c.natGwLanVipMergeNotes.Delete(gwName)
 	c.natGwLanVipLastSync.Delete(gwName)
+	c.deleteNatGwCreatedAt(gwName)
 	if err := c.config.KubeClient.AppsV1().StatefulSets(stsNamespace).Delete(context.Background(),
 		stsName, metav1.DeleteOptions{}); err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -430,7 +455,6 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 			return err
 		}
 	}
-
 	// Share-DNAT VIP state is written by Service reconcile only. Instance replacement is replayed
 	// through handleUpdateVpcDnat, which enqueues the Services after the gateway is ready.
 
@@ -474,6 +498,10 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 				return err
 			}
 		}
+	}
+
+	if gw.Spec.Vpc != "" && c.addOrUpdateVpcQueue != nil {
+		c.addOrUpdateVpcQueue.Add(gw.Spec.Vpc)
 	}
 
 	// Return backfillErr last so the StatefulSet work above is always attempted,
@@ -534,7 +562,6 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	}
 
 	if pod.Status.Phase != corev1.PodRunning {
-		time.Sleep(10 * time.Second)
 		err = fmt.Errorf("failed to init vpc nat gateway %s, pod is not ready", key)
 		klog.Error(err)
 		return err
@@ -543,7 +570,8 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; hasInit {
 		return nil
 	}
-	natGwCreatedAT = pod.CreationTimestamp.Format("2006-01-02T15:04:05")
+	natGwCreatedAT := pod.CreationTimestamp.Format("2006-01-02T15:04:05")
+	c.setNatGwCreatedAt(key, natGwCreatedAT)
 	klog.V(3).Infof("nat gw pod '%s' inited at %s", key, natGwCreatedAT)
 	// During initialization, when KubeOVN is running on non primary cni mode, we need to ensure the NAT gateway interfaces
 	// are properly configured. We extract the interfaces from the runtime Pod annotations (network-status).
@@ -595,6 +623,13 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		// The init script may fail on first run but succeed on retry after chains are established
 		klog.Warningf("vpc nat gateway %s init attempt failed (will retry): %v", key, err)
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
+	}
+
+	if c.isStatelessDpMode(gw.Name) {
+		if err = c.execNatGwRules(pod, natGwStatelessInit, nil); err != nil {
+			klog.Warningf("vpc nat gateway %s stateless init attempt failed (will retry): %v", key, err)
+			return fmt.Errorf("failed to init vpc nat gateway stateless rules, %w", err)
+		}
 	}
 
 	// The state is recorded only after the command succeeded, so the status never claims a state
@@ -675,6 +710,7 @@ func (c *Controller) handleUpdateVpcFloatingIP(natGwKey string) error {
 		return err
 	}
 
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, fip := range fips {
 		if fip.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo fip %s", fip.Name)
@@ -708,6 +744,7 @@ func (c *Controller) handleUpdateVpcEip(natGwKey string) error {
 		klog.Error(err)
 		return err
 	}
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, eip := range eips {
 		if eip.Spec.NatGwDp == natGwKey && eip.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo eip %s", eip.Name)
@@ -741,6 +778,7 @@ func (c *Controller) handleUpdateVpcSnat(natGwKey string) error {
 		klog.Error(err)
 		return err
 	}
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, snat := range snats {
 		if snat.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo snat %s", snat.Name)
@@ -776,6 +814,7 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 		klog.Error(err)
 		return err
 	}
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, dnat := range dnats {
 		// Every share object is an accounting record. This includes objects created by the old
 		// implementation before the record label existed; the Service reconcile migrates them.
@@ -1272,6 +1311,11 @@ func (c *Controller) genNatGwStatefulSet(gw *kubeovnv1.VpcNatGateway, oldSts *v1
 		klog.Error(err)
 		return nil, err
 	}
+	if util.IsStatelessNatGateway(gw) && util.IsMacvlanSubnet(net1Subnet) {
+		err := fmt.Errorf("stateless HA VpcNatGateway %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", gw.Name, net1Subnet.Name)
+		klog.Error(err)
+		return nil, err
+	}
 
 	routes = routes[0:0]
 	net1V4Gateway, net1V6Gateway := util.SplitStringIP(net1Subnet.Spec.Gateway)
@@ -1469,10 +1513,8 @@ func (c *Controller) getNatGwPod(name, namespace string) (*corev1.Pod, error) {
 	case len(pods) == 0:
 		return nil, k8serrors.NewNotFound(v1.Resource("pod"), name)
 	case len(pods) != 1:
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("too many pod")
 	case pods[0].Status.Phase != corev1.PodRunning:
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("pod is not active now")
 	}
 
@@ -1512,6 +1554,11 @@ func getNatGwNextHops(gw *kubeovnv1.VpcNatGateway, pods []*corev1.Pod) (map[stri
 	nextHops := make(map[string]string)
 	for _, pod := range pods {
 		if pod.Status.Phase != corev1.PodRunning || pod.DeletionTimestamp != nil {
+			continue
+		}
+		if pod.Annotations != nil &&
+			(pod.Annotations[util.NatGatewayDataplaneReadyAnnotation] == "false" ||
+				pod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno] == "false") {
 			continue
 		}
 		ready := true
@@ -1557,7 +1604,6 @@ func (c *Controller) getNatGwPods(name, namespace string, allPods bool) ([]*core
 	}
 
 	if len(activePods) == 0 {
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("no active pod now")
 	}
 
@@ -1565,7 +1611,7 @@ func (c *Controller) getNatGwPods(name, namespace string, allPods bool) ([]*core
 }
 
 func (c *Controller) initCreateAt(key string) (err error) {
-	if natGwCreatedAT != "" {
+	if c.getNatGwCreatedAt(key) != "" {
 		return nil
 	}
 	gw, err := c.vpcNatGatewayLister.Get(key)
@@ -1578,7 +1624,7 @@ func (c *Controller) initCreateAt(key string) (err error) {
 		klog.Error(err)
 		return err
 	}
-	natGwCreatedAT = pod.CreationTimestamp.Format("2006-01-02T15:04:05")
+	c.setNatGwCreatedAt(key, pod.CreationTimestamp.Format("2006-01-02T15:04:05"))
 	return nil
 }
 

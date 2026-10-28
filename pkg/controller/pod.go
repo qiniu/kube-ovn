@@ -189,6 +189,18 @@ func isPodStatusPhaseAlive(p *v1.Pod) bool {
 	return true
 }
 
+func isPodReadyConditionTrue(p *v1.Pod) bool {
+	if p == nil {
+		return false
+	}
+	for _, cond := range p.Status.Conditions {
+		if cond.Type == v1.PodReady {
+			return cond.Status == v1.ConditionTrue
+		}
+	}
+	return false
+}
+
 func (c *Controller) enqueueAddPod(obj any) {
 	p := obj.(*v1.Pod)
 	if p.Spec.HostNetwork {
@@ -268,6 +280,10 @@ func (c *Controller) enqueueDeletePod(obj any) {
 		return
 	}
 
+	if isGw, gwName := c.checkIsPodVpcNatGw(p); isGw {
+		c.enqueueAddOrUpdateVpcNatGwByName(gwName, "natgw-pod-delete")
+	}
+
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(p.Namespace)
 
@@ -294,6 +310,21 @@ func (c *Controller) enqueueUpdatePod(oldObj, newObj any) {
 	oldPod := oldObj.(*v1.Pod)
 	newPod := newObj.(*v1.Pod)
 	c.enqueueVMIMigrationForBoundLauncher(oldPod, newPod)
+
+	if isGw, gwName := c.checkIsPodVpcNatGw(newPod); isGw {
+		oldReady := oldPod.Annotations[util.NatGatewayDataplaneReadyAnnotation]
+		newReady := newPod.Annotations[util.NatGatewayDataplaneReadyAnnotation]
+		oldLegacyReady := oldPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
+		newLegacyReady := newPod.Annotations[util.NatGatewayLegacyDataplaneReadyAnno]
+		oldTerminating := !oldPod.DeletionTimestamp.IsZero()
+		newTerminating := !newPod.DeletionTimestamp.IsZero()
+		if oldReady != newReady || oldLegacyReady != newLegacyReady ||
+			oldPod.Status.Phase != newPod.Status.Phase ||
+			oldTerminating != newTerminating ||
+			isPodReadyConditionTrue(oldPod) != isPodReadyConditionTrue(newPod) {
+			c.enqueueAddOrUpdateVpcNatGwByName(gwName, "natgw pod readiness/state changed")
+		}
+	}
 
 	// Pod might be targeted by manual endpoints and we need to recompute its port mappings
 	c.enqueueStaticEndpointUpdateInNamespace(oldPod.Namespace)

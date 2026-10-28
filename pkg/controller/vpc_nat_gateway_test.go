@@ -605,6 +605,34 @@ func TestGetExternalSubnetNad(t *testing.T) {
 	}
 }
 
+func TestHandleUpdateVpcEip_CascadesExternalSubnet(t *testing.T) {
+	vpcNatEnabled = "true"
+	gw := fakeGw("test-gw")
+	gw.Spec.ExternalSubnets = []string{"new-subnet"}
+	eip := &kubeovnv1.IptablesEIP{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-eip",
+		},
+		Spec: kubeovnv1.IptablesEIPSpec{
+			NatGwDp:        "test-gw",
+			ExternalSubnet: "old-subnet",
+		},
+	}
+	fc, err := newFakeControllerWithOptions(t, &FakeControllerOptions{
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		IptablesEIPs:   []*kubeovnv1.IptablesEIP{eip},
+		Pods:           []*corev1.Pod{runningNatGwPod("test-gw")},
+	})
+	require.NoError(t, err)
+
+	err = fc.fakeController.handleUpdateVpcEip("test-gw")
+	require.NoError(t, err)
+
+	updatedEip, err := fc.fakeController.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Get(t.Context(), "test-eip", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "new-subnet", updatedEip.Spec.ExternalSubnet)
+}
+
 // Hairpin SNAT is hot-applied: on a Pod whose state init already recorded, a spec change is
 // pushed and recorded, and the recorded state then stops the gateway from reprogramming the same
 // state on every resync.
@@ -913,4 +941,37 @@ func TestHandleInitVpcNatGwToleratesLegacyScript(t *testing.T) {
 			require.Equal(t, "true", initialized.Annotations[util.VpcNatGatewayInitAnnotation])
 		})
 	}
+}
+
+func TestNatGwCreatedAt_IsolatedPerGateway(t *testing.T) {
+	t.Parallel()
+
+	ctrl := &Controller{}
+	// Initially empty
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Set gw1
+	ctrl.setNatGwCreatedAt("gw1", "2026-10-28T10:00:00")
+	assert.Equal(t, "2026-10-28T10:00:00", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Set gw2
+	ctrl.setNatGwCreatedAt("gw2", "2026-10-28T10:05:00")
+	assert.Equal(t, "2026-10-28T10:00:00", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "2026-10-28T10:05:00", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Overwrite gw1 does not affect gw2
+	ctrl.setNatGwCreatedAt("gw1", "2026-10-28T10:10:00")
+	assert.Equal(t, "2026-10-28T10:10:00", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "2026-10-28T10:05:00", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Delete gw1 releases its entry and does not affect gw2
+	ctrl.deleteNatGwCreatedAt("gw1")
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw1"))
+	assert.Equal(t, "2026-10-28T10:05:00", ctrl.getNatGwCreatedAt("gw2"))
+
+	// Delete gw2
+	ctrl.deleteNatGwCreatedAt("gw2")
+	assert.Equal(t, "", ctrl.getNatGwCreatedAt("gw2"))
 }
