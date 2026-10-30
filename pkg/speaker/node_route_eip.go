@@ -38,6 +38,7 @@ package speaker
 import (
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -146,6 +147,11 @@ func (c *Controller) withdrawEIPRoutes(eip *kubeovnv1.IptablesEIP) {
 		if ip == "" {
 			continue
 		}
+		if c.config.EnableTcBpfRedirect {
+			if err := c.tcManager.DeleteEIP(net.ParseIP(ip)); err != nil {
+				errs = append(errs, err)
+			}
+		}
 		if !c.isRouteAnnounced(ip) {
 			klog.V(3).Infof("BGP route for EIP %s not announced, skipping withdraw", ip)
 			continue
@@ -230,12 +236,35 @@ func (c *Controller) handleAddOrUpdateNodeRouteEIP(eipName string) error {
 		return nil
 	}
 
-	// Announce routes only if not already announced (idempotent)
+	var targetInfo TargetInfo
+	if c.config.EnableTcBpfRedirect {
+		podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
+		pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
+		if err != nil {
+			klog.Warningf("failed to get NAT GW pod %s for TC BPF: %v", podName, err)
+		} else {
+			targetInfo, err = c.getNatGwTargetInfo(pod, eip)
+			if err != nil {
+				klog.Warningf("failed to resolve TC target info for EIP %s: %v", eipName, err)
+			} else {
+				if err := c.tcManager.Attach(c.config.TcBpfInterface); err != nil {
+					klog.Errorf("failed to attach TC BPF to %s: %v", c.config.TcBpfInterface, err)
+				}
+			}
+		}
+	}
+
 	var errs []error
 	var announced []string
 	for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 		if ip == "" {
 			continue
+		}
+		if c.config.EnableTcBpfRedirect && validTarget(targetInfo) {
+			if err := c.tcManager.AddEIP(net.ParseIP(ip), targetInfo); err != nil {
+				klog.Errorf("failed to add EIP %s to TC BPF map: %v", ip, err)
+				errs = append(errs, err)
+			}
 		}
 		if c.isRouteAnnounced(ip) {
 			klog.V(3).Infof("BGP route for EIP %s already announced, skipping", ip)
@@ -286,6 +315,8 @@ func (c *Controller) hasNatGwPodOnLocalNode(eip *kubeovnv1.IptablesEIP) bool {
 // can operate concurrently on the same speaker instance.
 func (c *Controller) syncNodeRouteEIPs() error {
 	expectedPrefixes := make(prefixMap)
+	expectedTcMap := make(map[string]TargetInfo)
+	var targetErrors []error
 
 	// EIP plane: announce IptablesEIP addresses for local NAT gateway pods.
 	eips, err := c.eipLister.List(labels.Everything())
@@ -304,10 +335,39 @@ func (c *Controller) syncNodeRouteEIPs() error {
 			continue
 		}
 
+		var targetInfo TargetInfo
+		if c.config.EnableTcBpfRedirect {
+			podName := util.GenNatGwPodName(eip.Spec.NatGwDp)
+			pod, err := c.gwPodsLister.Pods(c.config.VpcNatGwNamespace).Get(podName)
+			if err == nil {
+				targetInfo, err = c.getNatGwTargetInfo(pod, eip)
+			}
+			if err != nil {
+				targetErrors = append(targetErrors, err)
+				continue
+			}
+		}
+
 		for _, ip := range []string{eip.Spec.V4ip, eip.Spec.V6ip} {
 			if ip != "" {
 				addExpectedPrefix(ip, expectedPrefixes)
+				if c.config.EnableTcBpfRedirect {
+					expectedTcMap[ip] = targetInfo
+				}
 			}
+		}
+	}
+
+	if c.config.EnableTcBpfRedirect {
+		err := c.tcManager.Attach(c.config.TcBpfInterface)
+		if err == nil {
+			err = c.tcManager.SyncEIPs(expectedTcMap)
+		}
+		if err != nil {
+			// Do not announce an unprotected EIP, but still withdraw stale routes
+			// and reconcile the independent Service VIP plane below.
+			expectedPrefixes = make(prefixMap)
+			targetErrors = append(targetErrors, err)
 		}
 	}
 
@@ -330,7 +390,7 @@ func (c *Controller) syncNodeRouteEIPs() error {
 		}
 	}
 
-	return c.reconcileRoutes(expectedPrefixes)
+	return errors.Join(c.reconcileRoutes(expectedPrefixes), errors.Join(targetErrors...))
 }
 
 // startNodeRouteEIPWorkers starts the worker goroutines for processing EIP events.

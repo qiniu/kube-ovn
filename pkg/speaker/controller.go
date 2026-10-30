@@ -53,6 +53,10 @@ type Controller struct {
 	natgatewayLister kubeovnlister.VpcNatGatewayLister
 	natgatewaySynced cache.InformerSynced
 
+	// tcManager 负责管理物理宿主机网卡的 eBPF TC Ingress 过滤器生命周期与 BPF Map 路由表同步
+	tcManager        TCManager
+	tcCleanupPending bool
+
 	// eipQueue is used in node-route-eip-mode for processing EIP events
 	eipQueue workqueue.TypedRateLimitingInterface[string]
 
@@ -156,6 +160,8 @@ func NewController(config *Configuration) *Controller {
 		eipSynced:        eipInformer.Informer().HasSynced,
 		natgatewayLister: natgatewayInformer.Lister(),
 		natgatewaySynced: natgatewayInformer.Informer().HasSynced,
+		tcManager:        NewTCManager(config),
+		tcCleanupPending: config.NodeRouteEIPMode && !config.EnableTcBpfRedirect,
 
 		informerFactory:        informerFactory,
 		nodeInformerFactory:    nodeInformerFactory,
@@ -209,6 +215,14 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 
 	klog.Info("Started workers")
 
+	if c.config.NodeRouteEIPMode {
+		defer func() {
+			if err := c.tcManager.Close(); err != nil {
+				klog.Errorf("failed to close TC EIP manager: %v", err)
+			}
+		}()
+	}
+
 	// Start node-route-eip workers if in that mode
 	if c.config.NodeRouteEIPMode {
 		c.startNodeRouteEIPWorkers(stopCh, 1)
@@ -250,6 +264,14 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 //	    nat-gw-mode does not participate in Service VIP announcement; it only
 //	    announces NAT gateway EIPs from inside the gateway pod.
 func (c *Controller) Reconcile() {
+	if c.tcCleanupPending {
+		if err := c.tcManager.Close(); err != nil {
+			klog.Errorf("failed to clean up disabled TC EIP redirection: %v", err)
+			return
+		}
+		c.tcCleanupPending = false
+	}
+
 	switch {
 	case c.config.NatGwMode:
 		// EIP plane (nat-gw-mode): speaker runs inside the NAT gateway pod and
