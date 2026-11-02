@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/keymutex"
 
@@ -437,7 +438,7 @@ func TestDiffPolicyRouteWithLogical_NormalizesNextHopIPs(t *testing.T) {
 		Priority:  32000,
 		Match:     "ip4.src == 172.16.8.149/32",
 		Action:    kubeovnv1.PolicyRouteActionReroute,
-		NextHopIP: "172.31.255.253,172.31.255.254",
+		NextHopIP: " 172.31.255.253 , 172.31.255.254 ",
 	}}
 
 	existing := []*ovnnb.LogicalRouterPolicy{{
@@ -450,6 +451,14 @@ func TestDiffPolicyRouteWithLogical_NormalizesNextHopIPs(t *testing.T) {
 	dels, adds := diffPolicyRouteWithLogical(existing, target)
 	require.Empty(t, dels)
 	require.Empty(t, adds)
+}
+
+func TestSplitNextHops(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, splitNextHops(""))
+	require.Equal(t, []string{"172.31.255.253", "172.31.255.254"}, splitNextHops("172.31.255.253, 172.31.255.254"))
+	require.Equal(t, []string{"172.31.255.253", "172.31.255.254"}, splitNextHops("  172.31.255.253 ,  172.31.255.254  "))
 }
 
 func TestDiffPolicyRouteWithLogical_HandlesLegacyNextHopField(t *testing.T) {
@@ -473,4 +482,215 @@ func TestDiffPolicyRouteWithLogical_HandlesLegacyNextHopField(t *testing.T) {
 	dels, adds := diffPolicyRouteWithLogical(existing, target)
 	require.Empty(t, dels)
 	require.Empty(t, adds)
+}
+
+func TestDiffPolicyRouteWithLogical_HandlesBFDSessions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("matching bfd sessions normalized", func(t *testing.T) {
+		target := []*kubeovnv1.PolicyRoute{{
+			Priority:  32000,
+			Match:     "ip4.src == 172.16.8.149/32",
+			Action:    kubeovnv1.PolicyRouteActionReroute,
+			NextHopIP: "172.31.255.253,172.31.255.254",
+			BfdID:     "bfd-uuid-2, bfd-uuid-1",
+		}}
+
+		existing := []*ovnnb.LogicalRouterPolicy{{
+			Priority:    32000,
+			Match:       "ip4.src == 172.16.8.149/32",
+			Action:      string(kubeovnv1.PolicyRouteActionReroute),
+			Nexthops:    []string{"172.31.255.253", "172.31.255.254"},
+			BFDSessions: []string{"bfd-uuid-1", "bfd-uuid-2"},
+		}}
+
+		dels, adds := diffPolicyRouteWithLogical(existing, target)
+		require.Empty(t, dels)
+		require.Empty(t, adds)
+	})
+
+	t.Run("differing bfd sessions triggers update", func(t *testing.T) {
+		target := []*kubeovnv1.PolicyRoute{{
+			Priority:  32000,
+			Match:     "ip4.src == 172.16.8.149/32",
+			Action:    kubeovnv1.PolicyRouteActionReroute,
+			NextHopIP: "172.31.255.253",
+			BfdID:     "bfd-uuid-new",
+		}}
+
+		existing := []*ovnnb.LogicalRouterPolicy{{
+			Priority:    32000,
+			Match:       "ip4.src == 172.16.8.149/32",
+			Action:      string(kubeovnv1.PolicyRouteActionReroute),
+			Nexthops:    []string{"172.31.255.253"},
+			BFDSessions: []string{"bfd-uuid-old"},
+		}}
+
+		dels, adds := diffPolicyRouteWithLogical(existing, target)
+		require.Len(t, dels, 1)
+		require.Len(t, adds, 1)
+		require.Equal(t, "bfd-uuid-old", dels[0].BfdID)
+		require.Equal(t, "bfd-uuid-new", adds[0].BfdID)
+	})
+}
+
+func Test_handleAddOrUpdateVpc_policyRoutes_withBfd(t *testing.T) {
+	t.Parallel()
+
+	vpcName := "test-vpc-bfd-policy"
+	fakeController := newFakeController(t)
+	ctrl := fakeController.fakeController
+	fakeinformers := fakeController.fakeInformers
+	mockOvnClient := fakeController.mockOvnClient
+
+	ctrl.vpcKeyMutex = keymutex.NewHashed(500)
+
+	vpc := &kubeovnv1.Vpc{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: vpcName,
+		},
+		Spec: kubeovnv1.VpcSpec{
+			PolicyRoutes: []*kubeovnv1.PolicyRoute{
+				{
+					Priority:  100,
+					Match:     "ip4.dst == 10.1.0.0/16",
+					Action:    kubeovnv1.PolicyRouteActionReroute,
+					NextHopIP: "192.168.1.1,192.168.1.2",
+					BfdID:     "bfd-session-1,bfd-session-2",
+				},
+			},
+		},
+	}
+
+	_, err := ctrl.config.KubeOvnClient.KubeovnV1().Vpcs().Create(context.Background(), vpc, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	err = fakeinformers.vpcInformer.Informer().GetStore().Add(vpc)
+	require.NoError(t, err)
+
+	externalIDs := map[string]string{"vendor": util.CniTypeName}
+
+	mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+	mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
+	mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(nil, nil)
+	mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
+		Name: vpcName,
+		Nat:  []string{},
+	}, nil)
+	mockOvnClient.EXPECT().ListLogicalRouterPolicies(vpcName, -1, nil, true).Return(nil, nil)
+	mockOvnClient.EXPECT().AddLogicalRouterPolicy(
+		vpcName,
+		100,
+		"ip4.dst == 10.1.0.0/16",
+		string(kubeovnv1.PolicyRouteActionReroute),
+		[]string{"192.168.1.1", "192.168.1.2"},
+		[]string{"bfd-session-1", "bfd-session-2"},
+		externalIDs,
+	).Return(nil)
+	mockOvnClient.EXPECT().ListLogicalSwitch(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalSwitch{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().ListLogicalRouter(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalRouter{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().DeleteLogicalRouterPort(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+	mockOvnClient.EXPECT().DeleteHAChassisGroup(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+
+	err = ctrl.handleAddOrUpdateVpc(vpcName)
+	require.NoError(t, err)
+}
+
+func Test_handleAddOrUpdateVpc_policyRoutes_with_Gateway(t *testing.T) {
+	t.Parallel()
+
+	vpcName := "test-vpc-gw-policy"
+	gwName := "test-gw"
+
+	gw := &kubeovnv1.VpcNatGateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gwName,
+		},
+		Spec: kubeovnv1.VpcNatGatewaySpec{
+			Vpc:    vpcName,
+			Subnet: "net1",
+			LanIP:  "192.168.1.100",
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw-0",
+			Namespace: "kube-system",
+			Labels: map[string]string{
+				"app":                    util.GenNatGwName(gwName),
+				util.VpcNatGatewayLabel: "true",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node1",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+			PodIPs: []corev1.PodIP{
+				{IP: "192.168.1.10"},
+			},
+		},
+	}
+
+	vpc := &kubeovnv1.Vpc{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: vpcName,
+		},
+		Spec: kubeovnv1.VpcSpec{
+			PolicyRoutes: []*kubeovnv1.PolicyRoute{
+				{
+					Priority: 100,
+					Match:    "ip4.dst == 10.1.0.0/16",
+					Action:   kubeovnv1.PolicyRouteActionReroute,
+					Gateway:  gwName,
+				},
+			},
+		},
+	}
+
+	opts := &FakeControllerOptions{
+		Vpcs:           []*kubeovnv1.Vpc{vpc},
+		VpcNatGateways: []*kubeovnv1.VpcNatGateway{gw},
+		Pods:           []*corev1.Pod{pod},
+	}
+	fakeController, err := newFakeControllerWithOptions(t, opts)
+	require.NoError(t, err)
+
+	ctrl := fakeController.fakeController
+	mockOvnClient := fakeController.mockOvnClient
+	ctrl.vpcKeyMutex = keymutex.NewHashed(500)
+
+	externalIDs := map[string]string{"vendor": util.CniTypeName}
+
+	mockOvnClient.EXPECT().CreateLogicalRouter(vpcName).Return(nil)
+	mockOvnClient.EXPECT().UpdateLogicalRouter(gomock.Any(), gomock.Any()).Return(nil)
+	mockOvnClient.EXPECT().ListLogicalRouterStaticRoutes(vpcName, nil, nil, "", externalIDs).Return(nil, nil)
+	mockOvnClient.EXPECT().GetLogicalRouter(vpcName, false).Return(&ovnnb.LogicalRouter{
+		Name: vpcName,
+		Nat:  []string{},
+	}, nil)
+	mockOvnClient.EXPECT().ListLogicalRouterPolicies(vpcName, -1, nil, true).Return(nil, nil)
+	mockOvnClient.EXPECT().AddLogicalRouterPolicy(
+		vpcName,
+		100,
+		"ip4.dst == 10.1.0.0/16",
+		string(kubeovnv1.PolicyRouteActionReroute),
+		[]string{"192.168.1.10"},
+		nil,
+		externalIDs,
+	).Return(nil)
+	mockOvnClient.EXPECT().ListLogicalSwitch(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalSwitch{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().ListLogicalRouter(gomock.Any(), gomock.Any()).Return([]ovnnb.LogicalRouter{}, nil).AnyTimes()
+	mockOvnClient.EXPECT().DeleteLogicalRouterPort(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+	mockOvnClient.EXPECT().DeleteHAChassisGroup(fmt.Sprintf("bfd@%s", vpcName)).Return(nil)
+
+	err = ctrl.handleAddOrUpdateVpc(vpcName)
+	require.NoError(t, err)
 }

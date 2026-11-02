@@ -55,6 +55,20 @@ func (v *ValidatingHook) VpcNatGwCreateOrUpdateHook(ctx context.Context, req adm
 				gw.Name, gwOld.Spec.Vpc, gw.Spec.Vpc)
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
 		}
+
+		oldMode := ""
+		if gwOld.Annotations != nil {
+			oldMode = gwOld.Annotations[util.NatGatewayDataplaneModeAnnotation]
+		}
+		newMode := ""
+		if gw.Annotations != nil {
+			newMode = gw.Annotations[util.NatGatewayDataplaneModeAnnotation]
+		}
+		if oldMode != newMode {
+			err := fmt.Errorf("VpcNatGateway %q: annotation %q is immutable once initialized (old: %q, new: %q); delete and recreate gateway to switch dataplane mode",
+				gw.Name, util.NatGatewayDataplaneModeAnnotation, oldMode, newMode)
+			return ctrlwebhook.Errored(http.StatusBadRequest, err)
+		}
 	}
 
 	if err := v.ValidateVpcNatConfig(ctx); err != nil {
@@ -532,6 +546,22 @@ func (v *ValidatingHook) ValidateVpcNatGW(ctx context.Context, gw *ovnv1.VpcNatG
 		return err
 	}
 
+	if util.IsStatelessNatGateway(gw) {
+		extSubnetNames := gw.Spec.ExternalSubnets
+		if len(extSubnetNames) == 0 {
+			extSubnetNames = []string{util.GetNatGwExternalNetwork(nil)}
+		}
+		for _, extSubnetName := range extSubnetNames {
+			if extSubnetName == "" {
+				continue
+			}
+			extSubnet := &ovnv1.Subnet{}
+			if err := v.cache.Get(ctx, types.NamespacedName{Name: extSubnetName}, extSubnet); err == nil && util.IsMacvlanSubnet(extSubnet) {
+				return fmt.Errorf("stateless HA VpcNatGateway %q cannot use macvlan external subnet %q; HA mode only supports veth-ptp external subnets", gw.Name, extSubnet.Name)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -604,7 +634,18 @@ func (v *ValidatingHook) ValidateIptablesEIP(ctx context.Context, eip *ovnv1.Ipt
 	if err := validateQoSPolicyRef(ctx, v.cache, eip.Spec.QoSPolicy); err != nil {
 		return err
 	}
-	return v.validateIptablesEIPIPFields(ctx, eip)
+	if err := v.validateIptablesEIPIPFields(ctx, eip); err != nil {
+		return err
+	}
+	gw := &ovnv1.VpcNatGateway{}
+	if err := v.cache.Get(ctx, types.NamespacedName{Name: eip.Spec.NatGwDp}, gw); err == nil && util.IsStatelessNatGateway(gw) {
+		subnet := &ovnv1.Subnet{}
+		externalNetwork := util.GetExternalNetwork(eip.Spec.ExternalSubnet)
+		if err := v.cache.Get(ctx, types.NamespacedName{Name: externalNetwork}, subnet); err == nil && util.IsMacvlanSubnet(subnet) {
+			return fmt.Errorf("IptablesEIP %q attached to stateless HA VpcNatGateway %q cannot use macvlan external subnet %q; HA mode only supports veth-ptp external subnets", eip.Name, gw.Name, subnet.Name)
+		}
+	}
+	return nil
 }
 
 // validateIptablesEIPIPFields validates the IP format and subnet/CIDR fields of an
@@ -617,6 +658,10 @@ func (v *ValidatingHook) validateIptablesEIPIPFields(ctx context.Context, eip *o
 	key := types.NamespacedName{Name: externalNetwork}
 	if err := v.cache.Get(ctx, key, subnet); err != nil {
 		return err
+	}
+
+	if util.IsMacvlanSubnet(subnet) && util.IsHAOrBgpEIP(eip) {
+		return fmt.Errorf("HA/BGP IptablesEIP %q cannot use macvlan external subnet %q; HA mode only supports veth-ptp external subnets", eip.Name, subnet.Name)
 	}
 
 	if eip.Spec.V4ip != "" {

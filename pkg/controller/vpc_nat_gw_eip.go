@@ -101,11 +101,13 @@ func (c *Controller) enqueueIptablesEipReferrers(eip *kubeovnv1.IptablesEIP, usa
 				}
 				statusV4Cidr, _ := util.SplitStringIP(snat.Status.InternalCIDR)
 				specV4Cidr, _ := util.SplitStringIP(snat.Spec.InternalCIDR)
+				eipMember := getMemberIDFromMeta(eip.Labels, eip.Annotations)
+				snatMember := snat.Labels[util.NatGatewayMemberLabel]
 				switch {
 				case snat.Status.V4ip == "" || snat.Status.NatGwDp == "" || snat.Status.InternalCIDR == "":
 					c.addIptablesSnatRuleQueue.Add(snat.Name)
 				case !usable || snat.Status.V4ip != eip.Status.IP || snat.Status.NatGwDp != eip.Spec.NatGwDp ||
-					statusV4Cidr != specV4Cidr || boundUID != eipUID:
+					statusV4Cidr != specV4Cidr || boundUID != eipUID || snatMember != eipMember:
 					c.updateIptablesSnatRuleQueue.Add(snat.Name)
 				case !snat.Status.Ready:
 					c.addIptablesSnatRuleQueue.Add(snat.Name)
@@ -137,8 +139,11 @@ func (c *Controller) enqueueUpdateIptablesEip(oldObj, newObj any) {
 	// When the QoSLabel is cleared or switched, re-enqueue the previous QoS policy so it can drop
 	// its finalizer once unused (the queue key is the policy name).
 	c.enqueueQoSPolicyRelease(oldEip.Labels, newEip.Labels)
+	oldMember := getMemberIDFromMeta(oldEip.Labels, oldEip.Annotations)
+	newMember := getMemberIDFromMeta(newEip.Labels, newEip.Annotations)
 	if oldEip.Status.Ready != newEip.Status.Ready || oldEip.Status.IP != newEip.Status.IP ||
-		(oldEip.DeletionTimestamp.IsZero() && !newEip.DeletionTimestamp.IsZero()) {
+		(oldEip.DeletionTimestamp.IsZero() && !newEip.DeletionTimestamp.IsZero()) ||
+		oldMember != newMember {
 		usable := newEip.DeletionTimestamp.IsZero() && newEip.Status.Ready && newEip.Status.IP != ""
 		if err := c.enqueueIptablesEipReferrers(newEip, usable); err != nil {
 			klog.Errorf("failed to enqueue referrers of eip %s: %v", newEip.Name, err)
@@ -247,6 +252,18 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 	if err != nil {
 		klog.Errorf("failed to get subnet %s: %v", subnetName, err)
 		return err
+	}
+	if util.IsMacvlanSubnet(subnet) {
+		if util.IsHAOrBgpEIP(cachedEip) {
+			err := fmt.Errorf("HA/BGP IptablesEIP %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", cachedEip.Name, subnet.Name)
+			klog.Error(err)
+			return err
+		}
+		if gw, gwErr := c.vpcNatGatewayLister.Get(cachedEip.Spec.NatGwDp); gwErr == nil && util.IsStatelessNatGateway(gw) {
+			err := fmt.Errorf("IptablesEIP %s attached to stateless HA VpcNatGateway %s cannot use macvlan external subnet %s; HA mode only supports veth-ptp external subnets", cachedEip.Name, gw.Name, subnet.Name)
+			klog.Error(err)
+			return err
+		}
 	}
 
 	// v6 ip address can not use upper case

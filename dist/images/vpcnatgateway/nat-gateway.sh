@@ -117,8 +117,10 @@ function exec_cmd() {
 }
 
 function check_inited() {
-    $iptables_save_cmd -t nat | grep SNAT_FILTER | grep SHARED_SNAT
-    if [ $? -ne 0 ]; then
+    if nft list table ip "$STATELESS_NFT_TABLE" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! $iptables_save_cmd -t nat 2>/dev/null | grep SNAT_FILTER | grep -q SHARED_SNAT; then
         >&2 echo "nat gateway not initialized"
         exit 1
     fi
@@ -201,6 +203,11 @@ function init() {
 
     $iptables_cmd -t mangle -A PREROUTING -j VPC_MARK
     $iptables_cmd -t mangle -A VPC_MARK -i "$VPC_INTERFACE" -j MARK --set-xmark 0x1/0x1
+
+    # TCP MSS Clamping to prevent MTU blackholes over encapsulated overlay networks
+    if ! $iptables_save_cmd -t mangle 2>/dev/null | grep -q "TCPMSS --clamp-mss-to-pmtu"; then
+        $iptables_cmd -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    fi
 
     # Load IFB kernel module for ingress QoS traffic shaping
     # IFB (Intermediate Functional Block) is required for ingress rate limiting using HTB
@@ -285,21 +292,34 @@ function del_vpc_external_route() {
 function add_eip() {
     # make sure inited
     check_inited
+    local ptp_peer
+    ptp_peer=$(ip -4 route show dev "$EXTERNAL_INTERFACE" scope link 2>/dev/null | awk '/^169\.254\./ {print $1; exit}')
+    first_eip=""
     for rule in $@
     do
         eip=${rule}
         eip_without_prefix=(${eip//\// })
-        exec_cmd "ip addr replace $eip dev $EXTERNAL_INTERFACE"
-        exec_cmd "arping -I $EXTERNAL_INTERFACE -c 3 -U $eip_without_prefix"
+        [ -z "$first_eip" ] && first_eip="$eip_without_prefix"
+        if [ -n "$ptp_peer" ]; then
+            exec_cmd "ip addr replace ${eip_without_prefix}/32 dev $EXTERNAL_INTERFACE"
+        else
+            exec_cmd "ip addr replace $eip dev $EXTERNAL_INTERFACE"
+            exec_cmd "arping -I $EXTERNAL_INTERFACE -c 3 -U $eip_without_prefix"
+        fi
     done
 
-    # Use "onlink" to skip the kernel's "gateway must be directly reachable" check.
-    # This allows EIPs from a different external subnet to share the NAT gateway's
-    # default route, as long as the gateway is L2-reachable (same VLAN/broadcast domain).
-    # When the gateway IS on the same subnet, "onlink" has no behavioral difference
-    # from the non-onlink form — the forwarding path and ARP resolution are identical.
-    if [ -n "$GATEWAY_V4" ]; then
+    # In point-to-point (veth) mode, keep the default route pointing to the link-local host peer.
+    # In L2 (macvlan) mode, use "onlink" via GATEWAY_V4.
+    if [ -n "$ptp_peer" ]; then
+        if [ -n "$first_eip" ]; then
+            exec_cmd "ip route replace default via $ptp_peer dev $EXTERNAL_INTERFACE src $first_eip"
+        else
+            exec_cmd "ip route replace default via $ptp_peer dev $EXTERNAL_INTERFACE"
+        fi
+        ip route del default dev "$VPC_INTERFACE" 2>/dev/null || true
+    elif [ -n "$GATEWAY_V4" ]; then
         exec_cmd "ip route replace default via $GATEWAY_V4 dev $EXTERNAL_INTERFACE onlink"
+        ip route del default dev "$VPC_INTERFACE" 2>/dev/null || true
     fi
 
     if [ -n "$GATEWAY_V6" ]; then
@@ -1164,6 +1184,397 @@ function del_nft_dnat_map() {
     done
 }
 
+# ============================================================================
+# Stateless NFTables NAT (Bypassing Conntrack / 'notrack' for HA Gateways)
+# ============================================================================
+
+STATELESS_NFT_TABLE=${STATELESS_NFT_TABLE:-"kube_ovn_stateless_nat"}
+
+# Check if there are other NAT rewrite rules referencing an IP/port beyond the one being deleted.
+# Returns 0 (true) if other references exist, 1 (false) if none.
+function _has_other_nat_refs() {
+    local table=$1 chain=$2 match_pattern=$3 exclude_pattern=$4
+    local count
+    count=$(nft list chain ip "$table" "$chain" 2>/dev/null \
+        | grep -F "$match_pattern" \
+        | grep -Fv "$exclude_pattern" \
+        | grep -E -c "ip daddr set|ip saddr set|dport set|sport set" || true)
+    [ "${count:-0}" -gt 0 ]
+}
+
+function stateless_init() {
+    local table=${1:-$STATELESS_NFT_TABLE}
+    echo "Initializing stateless nftables table: $table"
+    if ! nft list table ip "$table" >/dev/null 2>&1; then
+        nft add table ip "$table" || return 1
+    fi
+    if ! nft list chain ip "$table" prerouting >/dev/null 2>&1; then
+        nft add chain ip "$table" prerouting '{ type filter hook prerouting priority raw; policy accept; }' || return 1
+    fi
+    if ! nft list chain ip "$table" postrouting >/dev/null 2>&1; then
+        nft add chain ip "$table" postrouting '{ type filter hook postrouting priority 100; policy accept; }' || return 1
+    fi
+    # TCP MSS clamping to prevent MTU blackholes over encapsulated overlay networks (with counter for Prometheus monitoring)
+    if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "maxseg size set rt mtu"; then
+        nft add rule ip "$table" postrouting tcp flags \& \(syn \| rst\) == syn counter tcp option maxseg size set rt mtu 2>/dev/null || true
+    fi
+    # Ensure traffic destined to the gateway's own VPC LAN IP is accepted in raw prerouting (never notrack)
+    ensure_lan_ip_bypass "$table"
+}
+
+function ensure_lan_ip_bypass() {
+    local table=${1:-$STATELESS_NFT_TABLE}
+    local vpc_ip
+    vpc_ip=$(local_vpc_ipv4 2>/dev/null || true)
+    if [ -n "$vpc_ip" ]; then
+        local first_rule
+        first_rule=$(nft list chain ip "$table" prerouting 2>/dev/null | grep -E "iifname|ip daddr|ip saddr" | head -n 1)
+        if [[ "$first_rule" != *"ip daddr $vpc_ip accept"* ]]; then
+            local handles
+            handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $vpc_ip accept" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            for h in $handles; do
+                nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+            done
+            nft insert rule ip "$table" prerouting iifname "$VPC_INTERFACE" ip daddr "$vpc_ip" accept 2>/dev/null || true
+        fi
+    fi
+}
+
+function stateless_stats() {
+    local table=${1:-$STATELESS_NFT_TABLE}
+    if ! nft list table ip "$table" >/dev/null 2>&1; then
+        return 0
+    fi
+    nft list table ip "$table"
+}
+
+function stateless_apply() {
+    # Reads an entire nftables ruleset from stdin and applies atomically in a single transaction
+    local table=${1:-$STATELESS_NFT_TABLE}
+    echo "Applying stateless nftables script for table: $table"
+    local tmp_batch
+    tmp_batch=$(mktemp)
+    trap 'rm -f "$tmp_batch"' EXIT INT TERM HUP
+    cat <<EOF > "$tmp_batch"
+table ip $table
+delete table ip $table
+table ip $table {
+    chain prerouting {
+        type filter hook prerouting priority raw; policy accept;
+    }
+    chain postrouting {
+        type filter hook postrouting priority 100; policy accept;
+        tcp flags & (syn | rst) == syn counter tcp option maxseg size set rt mtu
+    }
+}
+EOF
+    cat >> "$tmp_batch"
+    nft -f "$tmp_batch"
+    local ret=$?
+    rm -f "$tmp_batch"
+    return $ret
+}
+
+function stateless_fip_add() {
+    # Format: eip,internalIp
+    local table=$STATELESS_NFT_TABLE
+    stateless_init "$table" || return 1
+    for rule in "$@"; do
+        IFS=',' read -r eip internalIp <<< "$rule"
+        [ -n "$eip" ] && [ -n "$internalIp" ] || continue
+
+        # 1. Hairpin bypass: VPC internal traffic accessing EIP is accepted immediately in raw prerouting
+        # to skip notrack so it enters conntrack and iptables NAT pipeline.
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$VPC_INTERFACE\" ip daddr $eip accept"; then
+            nft insert rule ip "$table" prerouting iifname "$VPC_INTERFACE" ip daddr "$eip" accept || return 1
+        fi
+
+        # 2. North-South WAN Ingress: Disable conntrack and rewrite daddr for external traffic only
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$EXTERNAL_INTERFACE\" ip daddr $eip notrack"; then
+            nft insert rule ip "$table" prerouting iifname "$EXTERNAL_INTERFACE" ip daddr "$eip" notrack || return 1
+        fi
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$EXTERNAL_INTERFACE\" ip daddr $eip ip daddr set $internalIp"; then
+            nft add rule ip "$table" prerouting iifname "$EXTERNAL_INTERFACE" ip daddr "$eip" ip daddr set "$internalIp" || return 1
+        fi
+
+        # 3. North-South WAN Egress: Rewrite saddr to EIP on external interface, and bypass conntrack
+        if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "oifname \"$EXTERNAL_INTERFACE\" ip saddr $internalIp ip saddr set $eip"; then
+            nft insert rule ip "$table" postrouting oifname "$EXTERNAL_INTERFACE" ip saddr "$internalIp" ip saddr set "$eip" || return 1
+        fi
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$VPC_INTERFACE\" ip saddr $internalIp ip daddr != $eip notrack"; then
+            nft insert rule ip "$table" prerouting iifname "$VPC_INTERFACE" ip saddr "$internalIp" ip daddr != "$eip" notrack || return 1
+        fi
+
+        # 4. East-West Hairpin in iptables:
+        # Add DNAT in iptables for $VPC_INTERFACE and install Kube-OVN's built-in HAIRPIN_FIP rules
+        if ! $iptables_cmd -t nat -C EXCLUSIVE_DNAT -i "$VPC_INTERFACE" -d "$eip" -j DNAT --to-destination "$internalIp" >/dev/null 2>&1; then
+            exec_cmd "$iptables_cmd -t nat -A EXCLUSIVE_DNAT -i $VPC_INTERFACE -d $eip -j DNAT --to-destination $internalIp"
+        fi
+        add_hairpin_fip "$eip"
+    done
+    ensure_lan_ip_bypass "$table"
+}
+
+function stateless_fip_del() {
+    # Format: eip,internalIp or just eip
+    local table=$STATELESS_NFT_TABLE
+    for rule in "$@"; do
+        IFS=',' read -r eip internalIp <<< "$rule"
+        [ -n "$eip" ] || continue
+
+        # 1. Clean up iptables Hairpin & DNAT
+        if [ -n "$internalIp" ]; then
+            if $iptables_cmd -t nat -C EXCLUSIVE_DNAT -i "$VPC_INTERFACE" -d "$eip" -j DNAT --to-destination "$internalIp" >/dev/null 2>&1; then
+                exec_cmd "$iptables_cmd -t nat -D EXCLUSIVE_DNAT -i $VPC_INTERFACE -d $eip -j DNAT --to-destination $internalIp"
+            fi
+        else
+            local ipt_handles
+            ipt_handles=$($iptables_save_cmd -t nat 2>/dev/null | grep "EXCLUSIVE_DNAT" | grep -w -- "-d $eip/32" || true)
+            if [ -n "$ipt_handles" ]; then
+                while read -r line; do
+                    [ -z "$line" ] && continue
+                    local rule_spec=${line#-A }
+                    exec_cmd "$iptables_cmd -t nat -D $rule_spec"
+                done <<< "$ipt_handles"
+            fi
+        fi
+        del_hairpin_fip "$eip"
+
+        # 2. Clean up nftables rules
+        local pre_handles post_handles notrack_handles
+        if [ -n "$internalIp" ]; then
+            pre_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $eip" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -F "ip saddr $internalIp" | grep -F "ip saddr set $eip" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            notrack_handles=""
+            if ! _has_other_nat_refs "$table" prerouting "ip saddr $internalIp" "ip saddr $internalIp.*ip saddr set $eip"; then
+                local saddr_notrack
+                saddr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip saddr $internalIp" | grep -F "notrack" | grep -oE "handle [0-9]+" | awk '{print $2}')
+                notrack_handles="$saddr_notrack"
+            fi
+        else
+            pre_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "ip daddr $eip[[:space:]]" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -E "ip saddr set $eip[[:space:]]?" | grep -oE "handle [0-9]+" | awk '{print $2}')
+            notrack_handles=""
+            local internal_ips
+            internal_ips=$(nft list chain ip "$table" prerouting 2>/dev/null | grep -E "ip daddr $eip.*ip daddr set" | grep -oE "ip daddr set [0-9.]+" | awk '{print $4}')
+            for intIp in $internal_ips; do
+                local saddr_notrack
+                saddr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                    | grep -F "ip saddr $intIp" \
+                    | grep -F "notrack" \
+                    | grep -oE "handle [0-9]+" | awk '{print $2}')
+                for h in $saddr_notrack; do
+                    nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+                done
+            done
+        fi
+        for h in $pre_handles $notrack_handles; do
+            nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+        done
+        for h in $post_handles; do
+            nft delete rule ip "$table" postrouting handle "$h" 2>/dev/null || true
+        done
+    done
+}
+
+function stateless_dnat_add() {
+    # Format: eip,externalPort,protocol,internalIp,internalPort
+    local table=$STATELESS_NFT_TABLE
+    stateless_init "$table" || return 1
+    for rule in "$@"; do
+        IFS=',' read -r eip extPort proto intIp intPort <<< "$rule"
+        [ -n "$eip" ] && [ -n "$extPort" ] && [ -n "$proto" ] && [ -n "$intIp" ] && [ -n "$intPort" ] || continue
+        proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
+
+        # 1. Hairpin bypass: VPC internal traffic accessing EIP:port is accepted immediately in raw prerouting
+        # to skip notrack so it enters conntrack and iptables NAT pipeline.
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$VPC_INTERFACE\" ip daddr $eip $proto dport $extPort accept"; then
+            nft insert rule ip "$table" prerouting iifname "$VPC_INTERFACE" ip daddr "$eip" "$proto" dport "$extPort" accept || return 1
+        fi
+
+        # 2. North-South WAN Ingress:
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$EXTERNAL_INTERFACE\" ip daddr $eip $proto dport $extPort ip daddr set $intIp $proto dport set $intPort"; then
+            nft insert rule ip "$table" prerouting iifname "$EXTERNAL_INTERFACE" ip daddr "$eip" "$proto" dport "$extPort" ip daddr set "$intIp" "$proto" dport set "$intPort" || return 1
+        fi
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$EXTERNAL_INTERFACE\" ip daddr $eip $proto dport $extPort notrack"; then
+            nft insert rule ip "$table" prerouting iifname "$EXTERNAL_INTERFACE" ip daddr "$eip" "$proto" dport "$extPort" notrack || return 1
+        fi
+
+        # 3. North-South WAN Egress:
+        if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "oifname \"$EXTERNAL_INTERFACE\" ip saddr $intIp $proto sport $intPort ip saddr set $eip $proto sport set $extPort"; then
+            nft insert rule ip "$table" postrouting oifname "$EXTERNAL_INTERFACE" ip saddr "$intIp" "$proto" sport "$intPort" ip saddr set "$eip" "$proto" sport set "$extPort" || return 1
+        fi
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$VPC_INTERFACE\" ip saddr $intIp $proto sport $intPort ip daddr != $eip notrack"; then
+            nft insert rule ip "$table" prerouting iifname "$VPC_INTERFACE" ip saddr "$intIp" "$proto" sport "$intPort" ip daddr != "$eip" notrack || return 1
+        fi
+
+        # 4. East-West Hairpin in iptables:
+        # Install into SHARED_DNAT for $VPC_INTERFACE, fallback hairpin SNAT (MASQUERADE to lanIp) will handle source
+        if ! $iptables_cmd -t nat -C SHARED_DNAT -i "$VPC_INTERFACE" -p "$proto" -d "$eip" --dport "$extPort" -j DNAT --to-destination "$intIp:$intPort" >/dev/null 2>&1; then
+            exec_cmd "$iptables_cmd -t nat -A SHARED_DNAT -i $VPC_INTERFACE -p $proto -d $eip --dport $extPort -j DNAT --to-destination $intIp:$intPort"
+        fi
+    done
+    ensure_lan_ip_bypass "$table"
+}
+
+function stateless_dnat_del() {
+    # Format: eip,externalPort,protocol,internalIp,internalPort or eip,externalPort,protocol
+    local table=$STATELESS_NFT_TABLE
+    for rule in "$@"; do
+        IFS=',' read -r eip extPort proto intIp intPort <<< "$rule"
+        [ -n "$eip" ] && [ -n "$extPort" ] && [ -n "$proto" ] || continue
+        proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
+
+        # 1. Clean up iptables SHARED_DNAT
+        if [ -n "$intIp" ] && [ -n "$intPort" ]; then
+            if $iptables_cmd -t nat -C SHARED_DNAT -i "$VPC_INTERFACE" -p "$proto" -d "$eip" --dport "$extPort" -j DNAT --to-destination "$intIp:$intPort" >/dev/null 2>&1; then
+                exec_cmd "$iptables_cmd -t nat -D SHARED_DNAT -i $VPC_INTERFACE -p $proto -d $eip --dport $extPort -j DNAT --to-destination $intIp:$intPort"
+            fi
+        else
+            local ipt_handles
+            ipt_handles=$($iptables_save_cmd -t nat 2>/dev/null | grep "SHARED_DNAT" | grep -w -- "-d $eip/32" | grep -w -- "--dport $extPort" || true)
+            if [ -n "$ipt_handles" ]; then
+                while read -r line; do
+                    [ -z "$line" ] && continue
+                    local rule_spec=${line#-A }
+                    exec_cmd "$iptables_cmd -t nat -D $rule_spec"
+                done <<< "$ipt_handles"
+            fi
+        fi
+
+        # 2. Clean up nftables rules
+        local pre_handles post_handles notrack_handles
+        pre_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "ip daddr $eip.*$proto dport $extPort[[:space:]]" | grep -oE "handle [0-9]+" | awk '{print $2}')
+        notrack_handles=""
+        if [ -n "$intIp" ] && [ -n "$intPort" ]; then
+            notrack_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                | grep -E "ip saddr $intIp.*$proto sport $intPort" \
+                | grep -oE "handle [0-9]+" | awk '{print $2}')
+        else
+            local rewrite_line
+            rewrite_line=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -E "ip daddr $eip.*$proto dport $extPort .*ip daddr set" | head -n 1)
+            if [ -n "$rewrite_line" ]; then
+                local inferred_ip inferred_port
+                inferred_ip=$(echo "$rewrite_line" | sed -n 's/.*ip daddr set \([0-9.]*\).*/\1/p')
+                inferred_port=$(echo "$rewrite_line" | sed -n 's/.*dport set \([0-9]*\).*/\1/p')
+                if [ -n "$inferred_ip" ] && [ -n "$inferred_port" ]; then
+                    notrack_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                        | grep -E "ip saddr $inferred_ip.*$proto sport $inferred_port" \
+                        | grep -oE "handle [0-9]+" | awk '{print $2}')
+                fi
+            fi
+        fi
+        for h in $pre_handles $notrack_handles; do
+            nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+        done
+
+        if [ -n "$intPort" ]; then
+            post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -E "$proto sport $intPort.*ip saddr set $eip.*sport set $extPort[[:space:]]" | grep -oE "handle [0-9]+" | awk '{print $2}')
+        else
+            post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -E "ip saddr set $eip.*sport set $extPort[[:space:]]" | grep -oE "handle [0-9]+" | awk '{print $2}')
+        fi
+        for h in $post_handles; do
+            nft delete rule ip "$table" postrouting handle "$h" 2>/dev/null || true
+        done
+    done
+}
+
+function stateless_snat_add() {
+    # Format: eip,internalCIDR
+    local table=$STATELESS_NFT_TABLE
+    stateless_init "$table" || return 1
+    for rule in "$@"; do
+        IFS=',' read -r eip internalCIDR <<< "$rule"
+        [ -n "$eip" ] && [ -n "$internalCIDR" ] || continue
+        local internalIp="${internalCIDR%/*}"
+        local prefix="${internalCIDR#*/}"
+        local matchCIDR="$internalCIDR"
+        if [ "$prefix" = "32" ]; then
+            matchCIDR="$internalIp"
+        fi
+
+        # 1. Outgoing traffic: disable conntrack and rewrite source IP to EIP
+        if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip saddr $matchCIDR notrack"; then
+            nft insert rule ip "$table" prerouting ip saddr "$internalCIDR" notrack || return 1
+        fi
+        if [ -n "$EXTERNAL_INTERFACE" ]; then
+            if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $matchCIDR oifname \"$EXTERNAL_INTERFACE\" ip saddr set $eip"; then
+                nft add rule ip "$table" postrouting ip saddr "$internalCIDR" oifname "$EXTERNAL_INTERFACE" ip saddr set "$eip" || return 1
+            fi
+        else
+            if ! nft list chain ip "$table" postrouting 2>/dev/null | grep -F -q "ip saddr $matchCIDR ip saddr set $eip"; then
+                nft add rule ip "$table" postrouting ip saddr "$internalCIDR" ip saddr set "$eip" || return 1
+            fi
+        fi
+
+        # 2. Return (incoming) traffic for 1:1 mapping (when internalCIDR is a single host IP or /32):
+        # Disable conntrack on external ingress and rewrite destination IP back to internal host IP
+        if [ "$internalCIDR" = "$internalIp" ] || [ "$prefix" = "32" ]; then
+            if [ -n "$EXTERNAL_INTERFACE" ]; then
+                if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$EXTERNAL_INTERFACE\" ip daddr $eip notrack"; then
+                    nft insert rule ip "$table" prerouting iifname "$EXTERNAL_INTERFACE" ip daddr "$eip" notrack || return 1
+                fi
+                if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "iifname \"$EXTERNAL_INTERFACE\" ip daddr $eip ip daddr set $internalIp"; then
+                    nft add rule ip "$table" prerouting iifname "$EXTERNAL_INTERFACE" ip daddr "$eip" ip daddr set "$internalIp" || return 1
+                fi
+            else
+                if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip daddr $eip notrack"; then
+                    nft insert rule ip "$table" prerouting ip daddr "$eip" notrack || return 1
+                fi
+                if ! nft list chain ip "$table" prerouting 2>/dev/null | grep -F -q "ip daddr $eip ip daddr set $internalIp"; then
+                    nft add rule ip "$table" prerouting ip daddr "$eip" ip daddr set "$internalIp" || return 1
+                fi
+            fi
+        fi
+    done
+    ensure_lan_ip_bypass "$table"
+}
+
+function stateless_snat_del() {
+    # Format: eip,internalCIDR
+    local table=$STATELESS_NFT_TABLE
+    for rule in "$@"; do
+        IFS=',' read -r eip internalCIDR <<< "$rule"
+        [ -n "$eip" ] && [ -n "$internalCIDR" ] || continue
+        local internalIp="${internalCIDR%/*}"
+        local prefix="${internalCIDR#*/}"
+        local matchCIDR="$internalCIDR"
+        if [ "$prefix" = "32" ]; then
+            matchCIDR="$internalIp"
+        fi
+
+        local post_handles pre_handles
+        post_handles=$(nft -a list chain ip "$table" postrouting 2>/dev/null | grep -E "ip saddr $matchCIDR[[:space:]].*ip saddr set $eip[[:space:]]?" | grep -oE "handle [0-9]+" | awk '{print $2}')
+        for h in $post_handles; do
+            nft delete rule ip "$table" postrouting handle "$h" 2>/dev/null || true
+        done
+
+        pre_handles=$(nft -a list chain ip "$table" prerouting 2>/dev/null | grep -F "ip daddr $eip" | grep -F "ip daddr set $internalIp" | grep -oE "handle [0-9]+" | awk '{print $2}')
+        for h in $pre_handles; do
+            nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+        done
+
+        if ! _has_other_nat_refs "$table" postrouting "ip saddr $matchCIDR" "ip saddr $matchCIDR ip saddr set $eip"; then
+            local cidr_notrack
+            cidr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                | grep -F "ip saddr $matchCIDR notrack" \
+                | grep -oE "handle [0-9]+" | awk '{print $2}')
+            for h in $cidr_notrack; do
+                nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+            done
+        fi
+
+        if ! _has_other_nat_refs "$table" prerouting "ip daddr $eip" "ip daddr set $internalIp"; then
+            local daddr_notrack
+            daddr_notrack=$(nft -a list chain ip "$table" prerouting 2>/dev/null \
+                | grep -F "ip daddr $eip notrack" \
+                | grep -oE "handle [0-9]+" | awk '{print $2}')
+            for h in $daddr_notrack; do
+                nft delete rule ip "$table" prerouting handle "$h" 2>/dev/null || true
+            done
+        fi
+    done
+}
 
 function sync_nft_lanvip() {
     # Reconcile the lanIP-as-Service-VIP partition of the share-DNAT data plane to exactly the
@@ -2367,6 +2778,40 @@ case $opt in
     qos-del)
         echo "qos-del $*"
         qos_del "$@"
+        ;;
+    stateless-init)
+        echo "stateless-init $*"
+        stateless_init "$@"
+        ;;
+    stateless-apply)
+        stateless_apply "$@"
+        ;;
+    stateless-fip-add)
+        echo "stateless-fip-add $*"
+        stateless_fip_add "$@"
+        ;;
+    stateless-fip-del)
+        echo "stateless-fip-del $*"
+        stateless_fip_del "$@"
+        ;;
+    stateless-dnat-add)
+        echo "stateless-dnat-add $*"
+        stateless_dnat_add "$@"
+        ;;
+    stateless-dnat-del)
+        echo "stateless-dnat-del $*"
+        stateless_dnat_del "$@"
+        ;;
+    stateless-snat-add)
+        echo "stateless-snat-add $*"
+        stateless_snat_add "$@"
+        ;;
+    stateless-snat-del)
+        echo "stateless-snat-del $*"
+        stateless_snat_del "$@"
+        ;;
+    stateless-stats|stateless_stats)
+        stateless_stats "$@"
         ;;
     *)
         echo "Unknown command: $opt"
