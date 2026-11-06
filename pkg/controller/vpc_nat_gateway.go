@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	v1 "k8s.io/api/apps/v1"
@@ -32,8 +31,24 @@ import (
 var (
 	vpcNatEnabled   = "unknown"
 	VpcNatCmVersion = ""
-	natGwCreatedAT  = ""
 )
+
+func (c *Controller) getNatGwCreatedAt(key string) string {
+	if val, ok := c.natGwCreatedAt.Load(key); ok {
+		if s, ok := val.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func (c *Controller) setNatGwCreatedAt(key, createdAt string) {
+	c.natGwCreatedAt.Store(key, createdAt)
+}
+
+func (c *Controller) deleteNatGwCreatedAt(key string) {
+	c.natGwCreatedAt.Delete(key)
+}
 
 const (
 	natGwInit             = "init"
@@ -224,6 +239,7 @@ func (c *Controller) handleDelVpcNatGw(key string) error {
 	// re-enqueues its partition sync), so forget them here to track live gateways only.
 	c.natGwLanVipMergeNotes.Delete(gwName)
 	c.natGwLanVipLastSync.Delete(gwName)
+	c.deleteNatGwCreatedAt(gwName)
 	if err := c.config.KubeClient.AppsV1().StatefulSets(stsNamespace).Delete(context.Background(),
 		stsName, metav1.DeleteOptions{}); err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -534,7 +550,6 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	}
 
 	if pod.Status.Phase != corev1.PodRunning {
-		time.Sleep(10 * time.Second)
 		err = fmt.Errorf("failed to init vpc nat gateway %s, pod is not ready", key)
 		klog.Error(err)
 		return err
@@ -543,7 +558,8 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 	if _, hasInit := pod.Annotations[util.VpcNatGatewayInitAnnotation]; hasInit {
 		return nil
 	}
-	natGwCreatedAT = pod.CreationTimestamp.Format("2006-01-02T15:04:05")
+	natGwCreatedAT := pod.CreationTimestamp.Format("2006-01-02T15:04:05")
+	c.setNatGwCreatedAt(key, natGwCreatedAT)
 	klog.V(3).Infof("nat gw pod '%s' inited at %s", key, natGwCreatedAT)
 	// During initialization, when KubeOVN is running on non primary cni mode, we need to ensure the NAT gateway interfaces
 	// are properly configured. We extract the interfaces from the runtime Pod annotations (network-status).
@@ -675,6 +691,7 @@ func (c *Controller) handleUpdateVpcFloatingIP(natGwKey string) error {
 		return err
 	}
 
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, fip := range fips {
 		if fip.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo fip %s", fip.Name)
@@ -708,6 +725,7 @@ func (c *Controller) handleUpdateVpcEip(natGwKey string) error {
 		klog.Error(err)
 		return err
 	}
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, eip := range eips {
 		if eip.Spec.NatGwDp == natGwKey && eip.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo eip %s", eip.Name)
@@ -741,6 +759,7 @@ func (c *Controller) handleUpdateVpcSnat(natGwKey string) error {
 		klog.Error(err)
 		return err
 	}
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, snat := range snats {
 		if snat.Status.Redo != natGwCreatedAT {
 			klog.V(3).Infof("redo snat %s", snat.Name)
@@ -776,6 +795,7 @@ func (c *Controller) handleUpdateVpcDnat(natGwKey string) error {
 		klog.Error(err)
 		return err
 	}
+	natGwCreatedAT := c.getNatGwCreatedAt(natGwKey)
 	for _, dnat := range dnats {
 		// Every share object is an accounting record. This includes objects created by the old
 		// implementation before the record label existed; the Service reconcile migrates them.
@@ -1469,10 +1489,8 @@ func (c *Controller) getNatGwPod(name, namespace string) (*corev1.Pod, error) {
 	case len(pods) == 0:
 		return nil, k8serrors.NewNotFound(v1.Resource("pod"), name)
 	case len(pods) != 1:
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("too many pod")
 	case pods[0].Status.Phase != corev1.PodRunning:
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("pod is not active now")
 	}
 
@@ -1557,7 +1575,6 @@ func (c *Controller) getNatGwPods(name, namespace string, allPods bool) ([]*core
 	}
 
 	if len(activePods) == 0 {
-		time.Sleep(5 * time.Second)
 		return nil, errors.New("no active pod now")
 	}
 
@@ -1565,7 +1582,7 @@ func (c *Controller) getNatGwPods(name, namespace string, allPods bool) ([]*core
 }
 
 func (c *Controller) initCreateAt(key string) (err error) {
-	if natGwCreatedAT != "" {
+	if c.getNatGwCreatedAt(key) != "" {
 		return nil
 	}
 	gw, err := c.vpcNatGatewayLister.Get(key)
@@ -1578,7 +1595,7 @@ func (c *Controller) initCreateAt(key string) (err error) {
 		klog.Error(err)
 		return err
 	}
-	natGwCreatedAT = pod.CreationTimestamp.Format("2006-01-02T15:04:05")
+	c.setNatGwCreatedAt(key, pod.CreationTimestamp.Format("2006-01-02T15:04:05"))
 	return nil
 }
 
