@@ -52,6 +52,16 @@ const (
 	VpcEipAnnotation                        = "ovn.kubernetes.io/vpc_eip"
 	VpcDnatEPortLabel                       = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation                        = "ovn.kubernetes.io/vpc_nat"
+	NatGatewayDataplaneModeAnnotation   = "ovn.kubernetes.io/nat-dataplane-mode"
+	VpcNatTcpConnLimitAnnotation        = "ovn.kubernetes.io/tcp-connlimit"
+	VpcNatSynRateLimitAnnotation        = "ovn.kubernetes.io/tcp-syn-ratelimit"
+	VpcNatSynBurstLimitAnnotation       = "ovn.kubernetes.io/tcp-syn-burstlimit"
+	VpcNatSynSrcRateLimitAnnotation     = "ovn.kubernetes.io/tcp-syn-src-ratelimit"
+	VpcNatSynSrcBurstLimitAnnotation    = "ovn.kubernetes.io/tcp-syn-src-burstlimit"
+	VpcNatSynDstRateLimitAnnotation     = "ovn.kubernetes.io/tcp-syn-dst-ratelimit"
+	VpcNatSynDstBurstLimitAnnotation    = "ovn.kubernetes.io/tcp-syn-dst-burstlimit"
+	VpcNatSynHashlimitEntriesAnnotation = "ovn.kubernetes.io/tcp-syn-hashlimit-entries"
+	VpcNatSynHashlimitExpireAnnotation  = "ovn.kubernetes.io/tcp-syn-hashlimit-expire"
 	OvnEipTypeLabel                         = "ovn.kubernetes.io/ovn_eip_type"
 	EipV4IpLabel                            = "ovn.kubernetes.io/eip_v4_ip"
 	EipUIDLabel                             = "ovn.kubernetes.io/eip_uid"
@@ -217,6 +227,15 @@ const (
 	BanpACLTier        = 3
 
 	DefaultMTU         = 1500
+
+	DefaultNatGwTcpConnLimit    = 50000
+	DefaultNatGwSynSrcRate      = "500/s"
+	DefaultNatGwSynSrcBurst     = "1000"
+	DefaultNatGwSynDstRate      = "20000/s"
+	DefaultNatGwSynDstBurst     = "40000"
+	DefaultNatGwSynHtableMax    = "262144"
+	DefaultNatGwSynDstHtableMax = "2048"
+	DefaultNatGwSynHtableExpire = "10000"
 	GeneveHeaderLength = 100
 	VxlanHeaderLength  = 50
 	SttHeaderLength    = 72
