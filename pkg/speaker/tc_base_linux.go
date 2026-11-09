@@ -27,18 +27,19 @@ func ensureClsactQdisc(link netlink.Link) error {
 	return nil
 }
 
-// tcFilterConfig 封装通用的 TC BPF Ingress 过滤器挂载参数
+// tcFilterConfig 封装通用的 TC BPF Ingress 过滤器挂载参数。
 type tcFilterConfig struct {
-	Link         netlink.Link
-	Program      *ebpf.Program
-	FilterNames  []string
-	Priority     uint16
-	DirectAction bool
+	Link netlink.Link
+	// Program 指向待挂载的 eBPF 程序对象
+	Program *ebpf.Program
+	// FilterNames: [0] 为本次挂载与更新使用的主要 Filter 规则名，后续元素为待兼容匹配并剥离的历史遗留规则名
+	FilterNames []string
+	Priority    uint16
 }
 
 // attachBPFFilter 在指定网卡的 Ingress 队列上原子挂载或就地替换（Atomic Swap）eBPF TC 过滤器。
 // 1. 自动确保网卡具有 clsact qdisc。
-// 2. 检查现有过滤器，若已有相同 ID 与 DirectAction 的规则已就绪，直接幂等返回。
+// 2. 检查现有过滤器，若已有相同 ID 的 direct-action 规则已就绪，直接幂等返回。
 // 3. 自动探测并清理本程序历史遗留在其他 priority 上的旧规则。
 // 4. 使用 netlink.FilterReplace 执行零中断无锁 RCU 热更。
 func attachBPFFilter(cfg tcFilterConfig) error {
@@ -47,6 +48,9 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 	}
 	if cfg.Program == nil {
 		return errors.New("bpf program is nil")
+	}
+	if len(cfg.FilterNames) == 0 || cfg.FilterNames[0] == "" {
+		return errors.New("FilterNames must have at least one non-empty name as attach name")
 	}
 	progFD := cfg.Program.FD()
 	var progID uint32
@@ -83,20 +87,16 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 		if !ok || !isMatchingTCFilter(bpf, progID, progTag, cfg.FilterNames...) {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", cfg.Priority, linkName)
 		}
-		if bpf.Id == int(progID) && bpf.DirectAction == cfg.DirectAction {
+		if bpf.Id == int(progID) && bpf.DirectAction {
 			return nil
 		}
-	}
-	var filterName string
-	if len(cfg.FilterNames) > 0 {
-		filterName = cfg.FilterNames[0]
 	}
 	return netlink.FilterReplace(&netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: cfg.Link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
 			Handle: 1, Priority: cfg.Priority, Protocol: unix.ETH_P_ALL,
 		},
-		Fd: progFD, Name: filterName, DirectAction: cfg.DirectAction,
+		Fd: progFD, Name: cfg.FilterNames[0], DirectAction: true,
 	})
 }
 
@@ -138,7 +138,8 @@ func detachBPFFiltersOnLinks(linkName string, matchFunc func(*netlink.BpfFilter)
 	if linkName != "" {
 		link, err := netlink.LinkByName(linkName)
 		if err != nil {
-			if errors.As(err, &netlink.LinkNotFoundError{}) || errors.Is(err, unix.ENODEV) {
+			var linkNotFound netlink.LinkNotFoundError
+			if errors.As(err, &linkNotFound) || errors.Is(err, unix.ENODEV) {
 				return nil
 			}
 			return err
@@ -227,7 +228,6 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 	}
 
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{MapReplacements: replacements})
-	isFallback := false
 	if err != nil && len(replacements) > 0 {
 		klog.Warningf("failed to load BPF collection with existing pinned maps, falling back to new maps: %v", err)
 		for _, r := range replacements {
@@ -236,7 +236,6 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		replacements = make(map[string]*ebpf.Map)
 		// 关键点：绝不在这里提前 removeBPFPin(p)，避免新 Collection 加载失败退出时旧 Pin 被破坏导致无法回滚
 		coll, err = ebpf.NewCollection(spec)
-		isFallback = true
 	}
 	if err != nil {
 		for _, r := range replacements {
@@ -245,34 +244,50 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		return nil, fmt.Errorf("load BPF collection: %w", err)
 	}
 
-	// 对新创建（未复用）的 Map 挂载至 bpffs：
-	// 若处于复用失败的回退场景，先 Pin 到临时路径再原子重命名覆盖，确保全程零破坏性
+	// 两阶段安全提交（Two-Phase Commit）：
+	// 针对新创建（未被成功复用）的 Map，先全部 Pin 到同目录下的 .tmp 路径；
+	// 待所有未复用 Map 均成功创建临时 Pin 后，再统一通过 bpffs 原生支持的 rename(2) 原子替换到目标路径。
+	// 若任何环节出错，立即统一清理全部生成的 .tmp 文件并关闭 Collection，彻底杜绝数据面“半边新、半边旧”的分裂态。
+	type pendingPin struct {
+		name    string
+		tmpPath string
+		dstPath string
+	}
+	var pending []pendingPin
+	cleanupTmp := func() {
+		for _, p := range pending {
+			_ = removeBPFPin(p.tmpPath)
+		}
+	}
+
+	// Phase 1: 将所有未复用的 Map Pin 到 .tmp 临时文件
 	for name, path := range pinMapPaths {
 		if _, ok := replacements[name]; ok {
 			continue
 		}
 		if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			cleanupTmp()
 			coll.Close()
 			return nil, fmt.Errorf("create map dir %s: %w", filepath.Dir(path), err)
 		}
-		if isFallback {
-			tmpPath := path + ".tmp"
-			_ = removeBPFPin(tmpPath)
-			if err = coll.Maps[name].Pin(tmpPath); err != nil {
-				coll.Close()
-				return nil, fmt.Errorf("pin fallback BPF map to tmp %s: %w", tmpPath, err)
-			}
-			if err = os.Rename(tmpPath, path); err != nil {
-				_ = removeBPFPin(tmpPath)
-				coll.Close()
-				return nil, fmt.Errorf("atomic swap pinned map %s: %w", path, err)
-			}
-		} else {
-			if err = coll.Maps[name].Pin(path); err != nil {
-				coll.Close()
-				return nil, fmt.Errorf("pin BPF map %s: %w", path, err)
-			}
+		tmpPath := path + ".tmp"
+		_ = removeBPFPin(tmpPath)
+		if err = coll.Maps[name].Pin(tmpPath); err != nil {
+			cleanupTmp()
+			coll.Close()
+			return nil, fmt.Errorf("pin BPF map %s to tmp %s: %w", name, tmpPath, err)
+		}
+		pending = append(pending, pendingPin{name: name, tmpPath: tmpPath, dstPath: path})
+	}
+
+	// Phase 2: 全部 Pin 成功，统一原子重命名覆盖目标路径
+	for _, p := range pending {
+		if err = os.Rename(p.tmpPath, p.dstPath); err != nil {
+			cleanupTmp()
+			coll.Close()
+			return nil, fmt.Errorf("atomic swap pinned map %s: %w", p.dstPath, err)
 		}
 	}
+
 	return coll, nil
 }

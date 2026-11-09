@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -90,6 +91,14 @@ func TestAttachBPFFilterNilLink(t *testing.T) {
 func TestAttachBPFFilterNilProgram(t *testing.T) {
 	err := attachBPFFilter(tcFilterConfig{Link: &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}}})
 	require.ErrorContains(t, err, "bpf program is nil")
+}
+
+func TestAttachBPFFilterEmptyFilterNames(t *testing.T) {
+	err := attachBPFFilter(tcFilterConfig{
+		Link:    &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}},
+		Program: &ebpf.Program{},
+	})
+	require.ErrorContains(t, err, "FilterNames must have at least one non-empty name as attach name")
 }
 
 func TestIsMatchingTCFilterB1Regression(t *testing.T) {

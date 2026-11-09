@@ -99,11 +99,10 @@ func (m *linuxTCManager) attach(linkName string) error {
 		}
 	}
 	return attachBPFFilter(tcFilterConfig{
-		Link:         link,
-		Program:      m.collection.Programs["tc_eip_ingress"],
-		FilterNames:  []string{tcEIPFilterName, "tc_eip.o:[classifier]"},
-		Priority:     m.priority(),
-		DirectAction: true,
+		Link:        link,
+		Program:     m.collection.Programs["tc_eip_ingress"],
+		FilterNames: []string{tcEIPFilterName, "tc_eip.o:[classifier]"},
+		Priority:    m.priority(),
 	})
 }
 
