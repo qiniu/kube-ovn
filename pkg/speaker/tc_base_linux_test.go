@@ -86,3 +86,8 @@ func TestAttachBPFFilterNilLink(t *testing.T) {
 	err := attachBPFFilter(tcFilterConfig{Link: nil})
 	require.ErrorContains(t, err, "link is nil")
 }
+
+func TestAttachBPFFilterNilProgram(t *testing.T) {
+	err := attachBPFFilter(tcFilterConfig{Link: &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}}})
+	require.ErrorContains(t, err, "bpf program is nil")
+}

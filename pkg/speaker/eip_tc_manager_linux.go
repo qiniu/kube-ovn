@@ -98,22 +98,9 @@ func (m *linuxTCManager) attach(linkName string) error {
 			return err
 		}
 	}
-	prog := m.collection.Programs["tc_eip_ingress"]
-	info, err := prog.Info()
-	if err != nil {
-		return err
-	}
-	id, ok := info.ID()
-	if !ok {
-		klog.V(4).Infof("BPF program ID is not available for %s", prog.String())
-	}
 	return attachBPFFilter(tcFilterConfig{
 		Link:         link,
-		Program:      prog,
-		ProgFD:       prog.FD(),
-		ProgID:       uint32(id),
-		ProgTag:      info.Tag,
-		FilterName:   tcEIPFilterName,
+		Program:      m.collection.Programs["tc_eip_ingress"],
 		FilterNames:  []string{tcEIPFilterName, "tc_eip.o:[classifier]"},
 		Priority:     m.priority(),
 		DirectAction: true,

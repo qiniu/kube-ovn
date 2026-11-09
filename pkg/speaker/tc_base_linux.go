@@ -31,10 +31,6 @@ func ensureClsactQdisc(link netlink.Link) error {
 type tcFilterConfig struct {
 	Link         netlink.Link
 	Program      *ebpf.Program
-	ProgFD       int
-	ProgID       uint32
-	ProgTag      string
-	FilterName   string
 	FilterNames  []string
 	Priority     uint16
 	DirectAction bool
@@ -49,17 +45,17 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 	if cfg.Link == nil {
 		return errors.New("link is nil")
 	}
-	progFD := cfg.ProgFD
-	progID := cfg.ProgID
-	progTag := cfg.ProgTag
-	if cfg.Program != nil {
-		progFD = cfg.Program.FD()
-		if info, err := cfg.Program.Info(); err == nil {
-			if id, ok := info.ID(); ok {
-				progID = uint32(id)
-			}
-			progTag = info.Tag
+	if cfg.Program == nil {
+		return errors.New("bpf program is nil")
+	}
+	progFD := cfg.Program.FD()
+	var progID uint32
+	var progTag string
+	if info, err := cfg.Program.Info(); err == nil {
+		if id, ok := info.ID(); ok {
+			progID = uint32(id)
 		}
+		progTag = info.Tag
 	}
 	if err := ensureClsactQdisc(cfg.Link); err != nil {
 		return err
@@ -67,10 +63,6 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 	filters, err := netlink.FilterList(cfg.Link, netlink.HANDLE_MIN_INGRESS)
 	if err != nil {
 		return err
-	}
-	names := cfg.FilterNames
-	if len(names) == 0 && cfg.FilterName != "" {
-		names = []string{cfg.FilterName}
 	}
 	linkName := cfg.Link.Attrs().Name
 	for _, filter := range filters {
@@ -81,26 +73,30 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 		bpf, ok := filter.(*netlink.BpfFilter)
 		if attrs.Priority != cfg.Priority {
 			// 若发现本程序历史遗留在其他 priority 上的旧规则（如升级修改了 priority 配置），主动剥离避免旧规则拦截或双规则共存
-			if ok && isMatchingTCFilter(bpf, progID, progTag, names...) {
+			if ok && isMatchingTCFilter(bpf, progID, progTag, cfg.FilterNames...) {
 				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
 					klog.Warningf("failed to remove obsolete TC filter at priority %d on %s: %v", attrs.Priority, linkName, err)
 				}
 			}
 			continue
 		}
-		if !ok || !isMatchingTCFilter(bpf, progID, progTag, names...) {
+		if !ok || !isMatchingTCFilter(bpf, progID, progTag, cfg.FilterNames...) {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", cfg.Priority, linkName)
 		}
 		if bpf.Id == int(progID) && bpf.DirectAction == cfg.DirectAction {
 			return nil
 		}
 	}
+	var filterName string
+	if len(cfg.FilterNames) > 0 {
+		filterName = cfg.FilterNames[0]
+	}
 	return netlink.FilterReplace(&netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: cfg.Link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
 			Handle: 1, Priority: cfg.Priority, Protocol: unix.ETH_P_ALL,
 		},
-		Fd: progFD, Name: cfg.FilterName, DirectAction: cfg.DirectAction,
+		Fd: progFD, Name: filterName, DirectAction: cfg.DirectAction,
 	})
 }
 
