@@ -213,8 +213,8 @@ func removeBPFPin(path string) error {
 }
 
 // loadCollectionWithPinnedMaps 加载 BPF CollectionSpec，并优先复用 bpffs 中既有的 Pinned Map，
-// 实现进程重启/热更新期间数据面 0 丢包；若复用失败则自动回退并清理旧 Map。
-// 注意：若回退会删除既有 pin，牺牲旧版本回滚能力。
+// 实现进程重启/热更新期间数据面 0 丢包；若复用失败则安全回退，绝不破坏性提前删除旧 Pin 文件，
+// 仅在新 Collection 创建成功后原子替换 Pin 路径，确保旧实例回滚能力不受损。
 func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[string]string) (*ebpf.Collection, error) {
 	for _, ms := range spec.Maps {
 		ms.Pinning = ebpf.PinNone
@@ -231,16 +231,16 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 	}
 
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{MapReplacements: replacements})
+	isFallback := false
 	if err != nil && len(replacements) > 0 {
 		klog.Warningf("failed to load BPF collection with existing pinned maps, falling back to new maps: %v", err)
 		for _, r := range replacements {
 			_ = r.Close()
 		}
 		replacements = make(map[string]*ebpf.Map)
-		for _, p := range pinMapPaths {
-			_ = removeBPFPin(p)
-		}
+		// 关键点：绝不在这里提前 removeBPFPin(p)，避免新 Collection 加载失败退出时旧 Pin 被破坏导致无法回滚
 		coll, err = ebpf.NewCollection(spec)
+		isFallback = true
 	}
 	if err != nil {
 		for _, r := range replacements {
@@ -249,7 +249,8 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		return nil, fmt.Errorf("load BPF collection: %w", err)
 	}
 
-	// 仅对新创建（未复用）的 Map 挂载至 bpffs
+	// 对新创建（未复用）的 Map 挂载至 bpffs：
+	// 若处于复用失败的回退场景，先 Pin 到临时路径再原子重命名覆盖，确保全程零破坏性
 	for name, path := range pinMapPaths {
 		if _, ok := replacements[name]; ok {
 			continue
@@ -258,9 +259,23 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 			coll.Close()
 			return nil, fmt.Errorf("create map dir %s: %w", filepath.Dir(path), err)
 		}
-		if err = coll.Maps[name].Pin(path); err != nil {
-			coll.Close()
-			return nil, fmt.Errorf("pin BPF map %s: %w", path, err)
+		if isFallback {
+			tmpPath := path + ".tmp"
+			_ = removeBPFPin(tmpPath)
+			if err = coll.Maps[name].Pin(tmpPath); err != nil {
+				coll.Close()
+				return nil, fmt.Errorf("pin fallback BPF map to tmp %s: %w", tmpPath, err)
+			}
+			if err = os.Rename(tmpPath, path); err != nil {
+				_ = removeBPFPin(tmpPath)
+				coll.Close()
+				return nil, fmt.Errorf("atomic swap pinned map %s: %w", path, err)
+			}
+		} else {
+			if err = coll.Maps[name].Pin(path); err != nil {
+				coll.Close()
+				return nil, fmt.Errorf("pin BPF map %s: %w", path, err)
+			}
 		}
 	}
 	return coll, nil
