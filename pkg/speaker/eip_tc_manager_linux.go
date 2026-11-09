@@ -66,10 +66,13 @@ func (m *linuxTCManager) ensureAttached(linkName string) error {
 		return nil
 	}
 	if linkName == "" {
-		linkName = m.attachedDev
-	}
-	if linkName == "" {
-		linkName = m.cfg.TcBpfInterface
+		if m.attachedDev != "" {
+			linkName = m.attachedDev
+			klog.V(3).Infof("TC BPF reusing previously attached device %s", linkName)
+		} else if m.cfg.TcBpfInterface != "" {
+			linkName = m.cfg.TcBpfInterface
+			klog.V(3).Infof("TC BPF fallback to configured interface %s", linkName)
+		}
 	}
 	if linkName == "" {
 		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting")
@@ -100,13 +103,17 @@ func (m *linuxTCManager) attach(linkName string) error {
 	if err != nil {
 		return err
 	}
-	id, _ := info.ID()
+	id, ok := info.ID()
+	if !ok {
+		klog.V(4).Infof("BPF program ID is not available for %s", prog.String())
+	}
 	return attachBPFFilter(tcFilterConfig{
 		Link:         link,
 		ProgFD:       prog.FD(),
 		ProgID:       uint32(id),
 		ProgTag:      info.Tag,
 		FilterName:   tcEIPFilterName,
+		FilterNames:  []string{tcEIPFilterName, "tc_eip.o:[classifier]"},
 		Priority:     m.priority(),
 		DirectAction: true,
 	})

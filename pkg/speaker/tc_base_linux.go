@@ -34,6 +34,7 @@ type tcFilterConfig struct {
 	ProgID       uint32
 	ProgTag      string
 	FilterName   string
+	FilterNames  []string
 	Priority     uint16
 	DirectAction bool
 }
@@ -54,20 +55,27 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 	if err != nil {
 		return err
 	}
+	names := cfg.FilterNames
+	if len(names) == 0 && cfg.FilterName != "" {
+		names = []string{cfg.FilterName}
+	}
 	linkName := cfg.Link.Attrs().Name
 	for _, filter := range filters {
 		attrs := filter.Attrs()
+		if attrs == nil {
+			continue
+		}
 		bpf, ok := filter.(*netlink.BpfFilter)
 		if attrs.Priority != cfg.Priority {
 			// 若发现本程序历史遗留在其他 priority 上的旧规则（如升级修改了 priority 配置），主动剥离避免旧规则拦截或双规则共存
-			if ok && isMatchingTCFilter(bpf, cfg.ProgID, cfg.ProgTag, cfg.FilterName) {
+			if ok && isMatchingTCFilter(bpf, cfg.ProgID, cfg.ProgTag, names...) {
 				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
 					klog.Warningf("failed to remove obsolete TC filter at priority %d on %s: %v", attrs.Priority, linkName, err)
 				}
 			}
 			continue
 		}
-		if !ok || !isMatchingTCFilter(bpf, cfg.ProgID, cfg.ProgTag, cfg.FilterName) {
+		if !ok || !isMatchingTCFilter(bpf, cfg.ProgID, cfg.ProgTag, names...) {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", cfg.Priority, linkName)
 		}
 		if bpf.Id == int(cfg.ProgID) && bpf.DirectAction == cfg.DirectAction {
@@ -115,24 +123,39 @@ func isMatchingTCFilter(filter *netlink.BpfFilter, progID uint32, progTag string
 }
 
 // detachBPFFiltersOnLinks 安全遍历指定网卡（为空则遍历所有网卡）并按 matchFunc 卸载符合条件的 TC Filter。
+// 对无 clsact qdisc（ENOENT）或已被并发删除的虚拟网卡（ENODEV），静默视为已清理。
 func detachBPFFiltersOnLinks(linkName string, matchFunc func(*netlink.BpfFilter) bool) error {
-	links, err := netlink.LinkList()
-	if err != nil {
-		return err
+	var links []netlink.Link
+	if linkName != "" {
+		link, err := netlink.LinkByName(linkName)
+		if err != nil {
+			if errors.As(err, &netlink.LinkNotFoundError{}) || errors.Is(err, unix.ENODEV) {
+				return nil
+			}
+			return err
+		}
+		links = []netlink.Link{link}
+	} else {
+		var err error
+		links, err = netlink.LinkList()
+		if err != nil {
+			return err
+		}
 	}
 	var errs []error
 	for _, link := range links {
-		if linkName != "" && link.Attrs().Name != linkName {
-			continue
-		}
 		filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 		if err != nil {
+			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) {
+				klog.V(4).Infof("interface %s has no clsact qdisc or is gone, skipping filter detach: %v", link.Attrs().Name, err)
+				continue
+			}
 			errs = append(errs, err)
 			continue
 		}
 		for _, filter := range filters {
 			if bpf, ok := filter.(*netlink.BpfFilter); ok && matchFunc(bpf) {
-				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
+				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENODEV) {
 					errs = append(errs, err)
 				}
 			}
