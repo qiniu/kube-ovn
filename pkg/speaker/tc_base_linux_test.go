@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
@@ -144,14 +145,20 @@ func (m *mockBPFProgram) Info() (*ebpf.ProgramInfo, error) {
 	return m.info, m.infoErr
 }
 
+func mockProgramInfo(id uint32, tag string) *ebpf.ProgramInfo {
+	info := &ebpf.ProgramInfo{Tag: tag}
+	*(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(info)) + unsafe.Sizeof(ebpf.ProgramType(0)))) = id
+	return info
+}
+
 func TestAttachBPFFilterOpsBranches(t *testing.T) {
 	origOps := netlinkOps
 	defer func() { netlinkOps = origOps }()
 
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: "dummy0"}}
-	prog := &mockBPFProgram{fd: 42}
+	prog := &mockBPFProgram{fd: 42, info: mockProgramInfo(1001, "08218004caf6a189")}
 
-	// 1. 幂等短路分支：同 priority 上已存在匹配本程序的规则
+	// 1. 幂等短路分支：同 priority 上已存在匹配本程序有效 ProgID 的规则
 	mock := &mockTCNetlinkOps{
 		filterListFilters: []netlink.Filter{
 			&netlink.BpfFilter{
@@ -159,6 +166,7 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
 				},
 				DirectAction: true,
+				Id:           1001,
 				Name:         "kube-ovn-eip",
 			},
 		},
@@ -234,6 +242,7 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
 				},
 				DirectAction: true,
+				Id:           1001,
 				Name:         "kube-ovn-eip",
 			},
 			&netlink.BpfFilter{
@@ -257,6 +266,58 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 	require.Empty(t, mock.replacedFilters)
 	require.Len(t, mock.deletedFilters, 1)
 	require.Equal(t, uint16(7), mock.deletedFilters[0].Attrs().Priority)
+
+	// 5. ProgID 不匹配触发就地替换分支：同 priority 上存在属于本组件的旧规则（Name 匹配），但 ProgID 不一致（如升级或重启后重新加载），必须执行 FilterReplace
+	mock = &mockTCNetlinkOps{
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Id:           999, // 旧程序 ID
+				Name:         "kube-ovn-eip",
+			},
+		},
+	}
+	netlinkOps = mock
+	err = attachBPFFilter(tcFilterConfig{
+		Link:        link,
+		Program:     prog,
+		AttachName:  "kube-ovn-eip",
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		Priority:    5,
+	})
+	require.NoError(t, err)
+	require.Len(t, mock.replacedFilters, 1)
+	require.Equal(t, uint16(5), mock.replacedFilters[0].Attrs().Priority)
+	require.Empty(t, mock.deletedFilters)
+
+	// 6. progID == 0 防御分支：若 program 无有效内核 ID（progID == 0），即使现有规则 bpf.Id == 0 且 Name 匹配，绝不可误判定为 matchedCurrent 发生零值误判短路，必须执行 FilterReplace
+	progZero := &mockBPFProgram{fd: 42}
+	mock = &mockTCNetlinkOps{
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Id:           0,
+				Name:         "kube-ovn-eip",
+			},
+		},
+	}
+	netlinkOps = mock
+	err = attachBPFFilter(tcFilterConfig{
+		Link:        link,
+		Program:     progZero,
+		AttachName:  "kube-ovn-eip",
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		Priority:    5,
+	})
+	require.NoError(t, err)
+	require.Len(t, mock.replacedFilters, 1)
+	require.Empty(t, mock.deletedFilters)
 }
 
 func TestIsMatchingTCFilterB1Regression(t *testing.T) {

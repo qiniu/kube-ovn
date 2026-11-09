@@ -72,7 +72,8 @@ func (m *linuxTCManager) resolveLinkName(linkName string) (string, error) {
 }
 
 // ensureAttached 自动确保目标网卡已挂载 TC BPF 程序，先解析设备名后就地做短路判定，避免高频 Netlink 系统调用与日志开销。
-// 注意：本函数先确保 Collection 与 Pinned Map 加载成功，再执行网卡挂载。
+// 注意：本函数专供 AddEIP / SyncEIPs 等高频数据面调用路径快速短路；若需主动检查或自愈重建过滤器，应显式调用 Attach()。
+// 本函数先确保 Collection 与 Pinned Map 加载成功，再执行网卡挂载。
 // 若后续网卡挂载失败，此前已加载的 Collection 实例将保留在内存中以备后续快速重试；当 TCManager.Close() 或 Clean() 被调用时统一释放。
 func (m *linuxTCManager) ensureAttached(linkName string) error {
 	if m.closed {
@@ -120,11 +121,31 @@ func (m *linuxTCManager) attach(linkName string) error {
 }
 
 // Attach 具备幂等性，支持网卡设备或过滤器重建后的自动恢复。
-// 失败的尝试不会留下成功挂载标记，可安全重试。
+// 区别于内部数据面操作的高频内存缓存短路，主动调用 Attach() 会绕过 attachedDev 内存缓存，
+// 委托底层 attachBPFFilter 执行 Netlink 级别状态核验与原子恢复。失败的尝试不会留下成功挂载标记，可安全重试。
 func (m *linuxTCManager) Attach(linkName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.ensureAttached(linkName)
+	if m.closed {
+		return errors.New("TC manager is closed")
+	}
+	if !m.cfg.EnableTcBpfRedirect {
+		return nil
+	}
+	// 若处于测试注入独立 Map 模式（未加载完整 BPF Collection），跳过底层网卡挂载
+	if m.collection == nil && (m.v4Map != nil || m.v6Map != nil) {
+		return nil
+	}
+	dev, err := m.resolveLinkName(linkName)
+	if err != nil {
+		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting: %v", err)
+		return err
+	}
+	if err := m.attach(dev); err != nil {
+		return err
+	}
+	m.attachedDev = dev
+	return nil
 }
 
 func (m *linuxTCManager) load() error {

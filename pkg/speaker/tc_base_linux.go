@@ -129,7 +129,7 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", cfg.Priority, linkName)
 		}
 		// 严禁在此直接 return nil：否则当同 priority 规则排在前面时，排在后面的异 priority 废弃规则会被跳过清理。
-		if bpf.Id == int(progID) && bpf.DirectAction {
+		if progID > 0 && bpf.Id == int(progID) && bpf.DirectAction {
 			matchedCurrent = true
 		}
 	}

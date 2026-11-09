@@ -327,7 +327,22 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	require.True(t, foundPrio7, "必须成功挂载新 Priority 7 规则")
 	require.True(t, foundPrio10, "必须保留第三方 Priority 10 规则")
 
-	// 4. 模拟停用功能执行 Clean()，验证本程序所有 priority 规则彻底清理，且不伤及第三方规则
+	// 4. 模拟外部异常或误删导致内核 Filter 丢失，验证显式 Attach() 能够绕过 attachedDev 内存缓存自愈恢复
+	for _, f := range filters {
+		if f.Attrs().Priority == 7 {
+			require.NoError(t, netlink.FilterDel(f))
+		}
+	}
+	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 1, "删除后应仅剩第三方规则")
+
+	require.NoError(t, m2.Attach(link.Name))
+	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters, 2, "显式 Attach 必须能够成功自愈恢复被删除的 Filter")
+
+	// 5. 模拟停用功能执行 Clean()，验证本程序所有 priority 规则彻底清理，且不伤及第三方规则
 	require.NoError(t, m2.Clean())
 	filters, err = netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
