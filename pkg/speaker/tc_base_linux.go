@@ -299,9 +299,9 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 	}
 
 	// 两阶段安全提交（Two-Phase Commit）：
-	// 针对新创建（未被成功复用）的 Map，先全部 Pin 到同目录下的 .tmp 路径；
+	// 针对新创建（未被成功复用）的 Map，先全部 Pin 到同目录下的 _tmp 路径；
 	// 待所有未复用 Map 均成功创建临时 Pin 后，再统一通过 bpffs 原生支持的 rename(2) 原子替换到目标路径。
-	// 若任何环节出错，立即统一清理全部生成的 .tmp 文件并关闭 Collection，彻底杜绝数据面“半边新、半边旧”的分裂态。
+	// 若任何环节出错，立即统一清理全部生成的临时文件并关闭 Collection，彻底杜绝数据面“半边新、半边旧”的分裂态。
 	type pendingPin struct {
 		name    string
 		tmpPath string
@@ -314,7 +314,7 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		}
 	}
 
-	// Phase 1: 将所有未复用的 Map Pin 到 .tmp 临时文件
+	// Phase 1: 将所有未复用的 Map Pin 到临时文件
 	for name, path := range pinMapPaths {
 		if reused[name] {
 			continue
@@ -330,7 +330,8 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 			coll.Close()
 			return nil, fmt.Errorf("BPF map %s not found in collection", name)
 		}
-		tmpPath := path + ".tmp"
+		// bpffs 保留含点的文件名，使用不含点的后缀避免 Pin 返回 EPERM。
+		tmpPath := path + "_tmp"
 		_ = removeBPFPin(tmpPath)
 		if err = targetMap.Pin(tmpPath); err != nil {
 			cleanupTmp()
