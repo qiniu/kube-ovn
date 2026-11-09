@@ -93,12 +93,137 @@ func TestAttachBPFFilterNilProgram(t *testing.T) {
 	require.ErrorContains(t, err, "bpf program is nil")
 }
 
-func TestAttachBPFFilterEmptyFilterNames(t *testing.T) {
+func TestAttachBPFFilterEmptyAttachName(t *testing.T) {
 	err := attachBPFFilter(tcFilterConfig{
 		Link:    &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}},
-		Program: &ebpf.Program{},
+		Program: &mockBPFProgram{fd: 1},
 	})
-	require.ErrorContains(t, err, "FilterNames must have at least one non-empty name as attach name")
+	require.ErrorContains(t, err, "AttachName must not be empty")
+}
+
+type mockTCNetlinkOps struct {
+	qdiscAddErr       error
+	filterListFilters []netlink.Filter
+	filterListErr     error
+	filterReplaceErr  error
+	filterDelErr      error
+
+	replacedFilters []netlink.Filter
+	deletedFilters  []netlink.Filter
+}
+
+func (m *mockTCNetlinkOps) QdiscAdd(netlink.Qdisc) error {
+	return m.qdiscAddErr
+}
+
+func (m *mockTCNetlinkOps) FilterList(netlink.Link, uint32) ([]netlink.Filter, error) {
+	return m.filterListFilters, m.filterListErr
+}
+
+func (m *mockTCNetlinkOps) FilterReplace(f netlink.Filter) error {
+	m.replacedFilters = append(m.replacedFilters, f)
+	return m.filterReplaceErr
+}
+
+func (m *mockTCNetlinkOps) FilterDel(f netlink.Filter) error {
+	m.deletedFilters = append(m.deletedFilters, f)
+	return m.filterDelErr
+}
+
+type mockBPFProgram struct {
+	fd      int
+	info    *ebpf.ProgramInfo
+	infoErr error
+}
+
+func (m *mockBPFProgram) FD() int {
+	return m.fd
+}
+
+func (m *mockBPFProgram) Info() (*ebpf.ProgramInfo, error) {
+	return m.info, m.infoErr
+}
+
+func TestAttachBPFFilterOpsBranches(t *testing.T) {
+	origOps := netlinkOps
+	defer func() { netlinkOps = origOps }()
+
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: "dummy0"}}
+	prog := &mockBPFProgram{fd: 42}
+
+	// 1. 幂等短路分支：同 priority 上已存在匹配本程序的规则
+	mock := &mockTCNetlinkOps{
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "kube-ovn-eip",
+			},
+		},
+	}
+	netlinkOps = mock
+	err := attachBPFFilter(tcFilterConfig{
+		Link:        link,
+		Program:     prog,
+		AttachName:  "kube-ovn-eip",
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		Priority:    5,
+	})
+	require.NoError(t, err)
+	require.Empty(t, mock.replacedFilters)
+	require.Empty(t, mock.deletedFilters)
+
+	// 2. 异 priority 剥离分支：旧 priority 7 存在旧名称规则，新挂载在 priority 5
+	mock = &mockTCNetlinkOps{
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 7, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "tc_eip.o:[classifier]",
+			},
+		},
+	}
+	netlinkOps = mock
+	err = attachBPFFilter(tcFilterConfig{
+		Link:        link,
+		Program:     prog,
+		AttachName:  "kube-ovn-eip",
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		Priority:    5,
+	})
+	require.NoError(t, err)
+	require.Len(t, mock.deletedFilters, 1)
+	require.Equal(t, uint16(7), mock.deletedFilters[0].Attrs().Priority)
+	require.Len(t, mock.replacedFilters, 1)
+	require.Equal(t, uint16(5), mock.replacedFilters[0].Attrs().Priority)
+
+	// 3. 同 priority 冲突分支：目标 priority 5 已被第三方规则占用（名字不匹配）
+	mock = &mockTCNetlinkOps{
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "cilium-netdev",
+			},
+		},
+	}
+	netlinkOps = mock
+	err = attachBPFFilter(tcFilterConfig{
+		Link:        link,
+		Program:     prog,
+		AttachName:  "kube-ovn-eip",
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		Priority:    5,
+	})
+	require.ErrorContains(t, err, "TC priority 5 on dummy0 is already owned by another filter")
+	require.Empty(t, mock.replacedFilters)
+	require.Empty(t, mock.deletedFilters)
 }
 
 func TestIsMatchingTCFilterB1Regression(t *testing.T) {

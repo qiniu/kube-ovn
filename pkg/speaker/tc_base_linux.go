@@ -16,24 +16,59 @@ import (
 	"k8s.io/klog/v2"
 )
 
+type tcNetlinkOps interface {
+	QdiscAdd(netlink.Qdisc) error
+	FilterList(netlink.Link, uint32) ([]netlink.Filter, error)
+	FilterReplace(netlink.Filter) error
+	FilterDel(netlink.Filter) error
+}
+
+type defaultTCNetlinkOps struct{}
+
+func (defaultTCNetlinkOps) QdiscAdd(q netlink.Qdisc) error {
+	return netlink.QdiscAdd(q)
+}
+
+func (defaultTCNetlinkOps) FilterList(link netlink.Link, parent uint32) ([]netlink.Filter, error) {
+	return netlink.FilterList(link, parent)
+}
+
+func (defaultTCNetlinkOps) FilterReplace(f netlink.Filter) error {
+	return netlink.FilterReplace(f)
+}
+
+func (defaultTCNetlinkOps) FilterDel(f netlink.Filter) error {
+	return netlink.FilterDel(f)
+}
+
+var netlinkOps tcNetlinkOps = defaultTCNetlinkOps{}
+
 // ensureClsactQdisc 确保指定网卡已附加 clsact qdisc（若已存在则忽略 EEXIST）。
 func ensureClsactQdisc(link netlink.Link) error {
 	qdisc := &netlink.GenericQdisc{QdiscAttrs: netlink.QdiscAttrs{
 		LinkIndex: link.Attrs().Index, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT,
 	}, QdiscType: "clsact"}
-	if err := netlink.QdiscAdd(qdisc); err != nil && !errors.Is(err, unix.EEXIST) {
+	if err := netlinkOps.QdiscAdd(qdisc); err != nil && !errors.Is(err, unix.EEXIST) {
 		return err
 	}
 	return nil
+}
+
+// tcBPFProgram 抽象 BPF Program 的基本接口，便于纯单元测试 mock。
+type tcBPFProgram interface {
+	FD() int
+	Info() (*ebpf.ProgramInfo, error)
 }
 
 // tcFilterConfig 封装通用的 TC BPF Ingress 过滤器挂载参数。
 type tcFilterConfig struct {
 	Link netlink.Link
 	// Program 指向待挂载的 eBPF 程序对象
-	Program *ebpf.Program
-	// FilterNames: [0] 为本次挂载与更新使用的主要 Filter 规则名，后续元素为待兼容匹配并剥离的历史遗留规则名
-	FilterNames []string
+	Program tcBPFProgram
+	// AttachName 为本次挂载与更新使用的正式 Filter 规则名
+	AttachName string
+	// LegacyNames 为待兼容匹配并剥离的历史遗留规则名列表
+	LegacyNames []string
 	Priority    uint16
 }
 
@@ -49,25 +84,30 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 	if cfg.Program == nil {
 		return errors.New("bpf program is nil")
 	}
-	if len(cfg.FilterNames) == 0 || cfg.FilterNames[0] == "" {
-		return errors.New("FilterNames must have at least one non-empty name as attach name")
+	if cfg.AttachName == "" {
+		return errors.New("AttachName must not be empty")
 	}
 	progFD := cfg.Program.FD()
 	var progID uint32
 	var progTag string
-	if info, err := cfg.Program.Info(); err == nil {
+	if info, err := cfg.Program.Info(); err != nil {
+		klog.Warningf("failed to get BPF program info: %v", err)
+	} else if info != nil {
 		if id, ok := info.ID(); ok {
 			progID = uint32(id)
+		} else {
+			klog.V(4).Infof("BPF program info has no kernel ID yet")
 		}
 		progTag = info.Tag
 	}
 	if err := ensureClsactQdisc(cfg.Link); err != nil {
 		return err
 	}
-	filters, err := netlink.FilterList(cfg.Link, netlink.HANDLE_MIN_INGRESS)
+	filters, err := netlinkOps.FilterList(cfg.Link, netlink.HANDLE_MIN_INGRESS)
 	if err != nil {
 		return err
 	}
+	allNames := append([]string{cfg.AttachName}, cfg.LegacyNames...)
 	linkName := cfg.Link.Attrs().Name
 	for _, filter := range filters {
 		attrs := filter.Attrs()
@@ -77,26 +117,26 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 		bpf, ok := filter.(*netlink.BpfFilter)
 		if attrs.Priority != cfg.Priority {
 			// 若发现本程序历史遗留在其他 priority 上的旧规则（如升级修改了 priority 配置），主动剥离避免旧规则拦截或双规则共存
-			if ok && isMatchingTCFilter(bpf, progID, progTag, cfg.FilterNames...) {
-				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
+			if ok && isMatchingTCFilter(bpf, progID, progTag, allNames...) {
+				if err := netlinkOps.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
 					klog.Warningf("failed to remove obsolete TC filter at priority %d on %s: %v", attrs.Priority, linkName, err)
 				}
 			}
 			continue
 		}
-		if !ok || !isMatchingTCFilter(bpf, progID, progTag, cfg.FilterNames...) {
+		if !ok || !isMatchingTCFilter(bpf, progID, progTag, allNames...) {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", cfg.Priority, linkName)
 		}
 		if bpf.Id == int(progID) && bpf.DirectAction {
 			return nil
 		}
 	}
-	return netlink.FilterReplace(&netlink.BpfFilter{
+	return netlinkOps.FilterReplace(&netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: cfg.Link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
 			Handle: 1, Priority: cfg.Priority, Protocol: unix.ETH_P_ALL,
 		},
-		Fd: progFD, Name: cfg.FilterNames[0], DirectAction: true,
+		Fd: progFD, Name: cfg.AttachName, DirectAction: true,
 	})
 }
 
@@ -154,7 +194,7 @@ func detachBPFFiltersOnLinks(linkName string, matchFunc func(*netlink.BpfFilter)
 	}
 	var errs []error
 	for _, link := range links {
-		filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+		filters, err := netlinkOps.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 		if err != nil {
 			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) {
 				klog.V(4).Infof("interface %s has no clsact qdisc or is gone, skipping filter detach: %v", link.Attrs().Name, err)
@@ -165,7 +205,7 @@ func detachBPFFiltersOnLinks(linkName string, matchFunc func(*netlink.BpfFilter)
 		}
 		for _, filter := range filters {
 			if bpf, ok := filter.(*netlink.BpfFilter); ok && matchFunc(bpf) {
-				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENODEV) {
+				if err := netlinkOps.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.ENODEV) {
 					errs = append(errs, err)
 				}
 			}
@@ -182,6 +222,10 @@ func pruneBPFHashMap(targetMap *ebpf.Map, wanted map[string]bool) error {
 	for {
 		next, err := targetMap.NextKeyBytes(key)
 		if err != nil {
+			// 兼容不同 ebpf/内核版本在迭代到达结尾时返回 ErrKeyNotExist 而非 (nil, nil) 的边界情况
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				break
+			}
 			return err
 		}
 		if next == nil {
@@ -227,6 +271,8 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		}
 	}
 
+	// 注：传入 CollectionOptions 的 MapReplacements 所有权移交给返回的 Collection，
+	// 当 Collection.Close() 被调用时，其内部会统一 Close 释放所有引用的 Map（包括被替换的 Pinned Map 句柄）。
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{MapReplacements: replacements})
 	if err != nil && len(replacements) > 0 {
 		klog.Warningf("failed to load BPF collection with existing pinned maps, falling back to new maps: %v", err)

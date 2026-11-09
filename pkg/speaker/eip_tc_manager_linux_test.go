@@ -293,6 +293,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	oldFilter := filters[0].(*netlink.BpfFilter)
 	require.Equal(t, uint16(5), oldFilter.Attrs().Priority)
 	oldFilter.Name = "tc_eip.o:[classifier]"
+	oldFilter.Fd = m1.(*linuxTCManager).collection.Programs["tc_eip_ingress"].FD()
 	require.NoError(t, netlink.FilterReplace(oldFilter))
 
 	// 2. 模拟运维调整 priority 为 7 并重启新实例
@@ -377,4 +378,31 @@ func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 	require.Empty(t, filters, "TC filter must be removed after Clean")
 	_, err = os.Stat(pin)
 	require.True(t, os.IsNotExist(err), "pinned map must be removed after Clean")
+}
+
+func TestResolveLinkName(t *testing.T) {
+	// 1. 显式指定网卡参数，优先级最高
+	m := &linuxTCManager{
+		cfg:         &Configuration{TcBpfInterface: "cfg0"},
+		attachedDev: "att0",
+	}
+	dev, err := m.resolveLinkName("explicit0")
+	require.NoError(t, err)
+	require.Equal(t, "explicit0", dev)
+
+	// 2. 参数为空，复用已挂载的网卡 attachedDev
+	dev, err = m.resolveLinkName("")
+	require.NoError(t, err)
+	require.Equal(t, "att0", dev)
+
+	// 3. 参数为空且无 attachedDev，回退至配置中的 TcBpfInterface
+	m.attachedDev = ""
+	dev, err = m.resolveLinkName("")
+	require.NoError(t, err)
+	require.Equal(t, "cfg0", dev)
+
+	// 4. 全部为空，返回错误拒绝挂载
+	m.cfg.TcBpfInterface = ""
+	_, err = m.resolveLinkName("")
+	require.ErrorContains(t, err, "tc-bpf-interface must be explicitly specified")
 }

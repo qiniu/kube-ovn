@@ -53,7 +53,25 @@ func (m *linuxTCManager) mapPaths() (string, string) {
 	return v4, v6
 }
 
-// ensureAttached 自动确保指定的物理网卡已挂载 TC BPF 程序，并通过内存缓存短路避免高频 Netlink 系统调用。
+// resolveLinkName 解析最终待挂载的网卡设备名。
+// 优先级策略：显式指定入参 > 当前已挂载设备(attachedDev) > 静态配置网卡(TcBpfInterface)。
+// 显式入参优先保证调用方精确控制；缺省入参时继承当前会话已挂载网卡以保持生命周期连续；无挂载记录时回退到静态配置。
+func (m *linuxTCManager) resolveLinkName(linkName string) (string, error) {
+	if linkName != "" {
+		return linkName, nil
+	}
+	if m.attachedDev != "" {
+		return m.attachedDev, nil
+	}
+	if m.cfg.TcBpfInterface != "" {
+		return m.cfg.TcBpfInterface, nil
+	}
+	return "", errors.New("tc-bpf-interface must be explicitly specified")
+}
+
+// ensureAttached 自动确保目标网卡已挂载 TC BPF 程序，先解析设备名后就地做短路判定，避免高频 Netlink 系统调用与日志开销。
+// 注意：本函数先确保 Collection 与 Pinned Map 加载成功，再执行网卡挂载。
+// 若后续网卡挂载失败，此前已加载的 Collection 实例将保留在内存中以备后续快速重试；当 TCManager.Close() 或 Clean() 被调用时统一释放。
 func (m *linuxTCManager) ensureAttached(linkName string) error {
 	if m.closed {
 		return errors.New("TC manager is closed")
@@ -65,26 +83,18 @@ func (m *linuxTCManager) ensureAttached(linkName string) error {
 	if m.collection == nil && (m.v4Map != nil || m.v6Map != nil) {
 		return nil
 	}
-	if linkName == "" {
-		if m.attachedDev != "" {
-			linkName = m.attachedDev
-			klog.V(3).Infof("TC BPF reusing previously attached device %s", linkName)
-		} else if m.cfg.TcBpfInterface != "" {
-			linkName = m.cfg.TcBpfInterface
-			klog.V(3).Infof("TC BPF fallback to configured interface %s", linkName)
-		}
-	}
-	if linkName == "" {
-		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting")
-		return errors.New("tc-bpf-interface must be explicitly specified")
-	}
-	if m.attachedDev == linkName {
-		return nil
-	}
-	if err := m.attach(linkName); err != nil {
+	dev, err := m.resolveLinkName(linkName)
+	if err != nil {
+		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting: %v", err)
 		return err
 	}
-	m.attachedDev = linkName
+	if m.attachedDev == dev {
+		return nil
+	}
+	if err := m.attach(dev); err != nil {
+		return err
+	}
+	m.attachedDev = dev
 	return nil
 }
 
@@ -101,7 +111,8 @@ func (m *linuxTCManager) attach(linkName string) error {
 	return attachBPFFilter(tcFilterConfig{
 		Link:        link,
 		Program:     m.collection.Programs["tc_eip_ingress"],
-		FilterNames: []string{tcEIPFilterName, "tc_eip.o:[classifier]"},
+		AttachName:  tcEIPFilterName,
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
 		Priority:    m.priority(),
 	})
 }
@@ -137,9 +148,13 @@ func (m *linuxTCManager) load() error {
 	m.collection = coll
 	m.v4Map, m.v6Map = coll.Maps[tcEIPv4MapName], coll.Maps[tcEIPv6MapName]
 	prog := coll.Programs["tc_eip_ingress"]
-	if info, err := prog.Info(); err == nil {
+	if info, err := prog.Info(); err != nil {
+		klog.Warningf("failed to inspect BPF program info: %v", err)
+	} else if info != nil {
 		if id, ok := info.ID(); ok {
 			m.progID = uint32(id)
+		} else {
+			klog.V(4).Infof("BPF program info has no kernel ID yet")
 		}
 		m.progTag = info.Tag
 	}
