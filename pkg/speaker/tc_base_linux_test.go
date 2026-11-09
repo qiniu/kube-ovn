@@ -395,3 +395,46 @@ func TestIsMatchingTCFilterB1Regression(t *testing.T) {
 	}
 	require.False(t, isMatchingTCFilter(alienFilter, newProgID, newProgTag, filterNames...))
 }
+
+func TestAttachBPFFilterMigrationFailurePreservesOldFilter(t *testing.T) {
+	for _, conflict := range []bool{true, false} {
+		name := "replace failure"
+		if conflict {
+			name = "priority conflict"
+		}
+		t.Run(name, func(t *testing.T) {
+			old := &netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				Name: "kube-ovn-eip", DirectAction: true,
+			}
+			mock := &mockTCNetlinkOps{
+				filterListFilters: []netlink.Filter{old},
+				filterReplaceErr:  unix.EPERM,
+			}
+			if conflict {
+				mock.filterListFilters = append(mock.filterListFilters, &netlink.MatchAll{
+					FilterAttrs: netlink.FilterAttrs{Priority: 7},
+				})
+			}
+			origOps := netlinkOps
+			netlinkOps = mock
+			t.Cleanup(func() { netlinkOps = origOps })
+
+			err := attachBPFFilter(tcFilterConfig{
+				Link:       &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: "dummy0"}},
+				Program:    &mockBPFProgram{fd: 42},
+				AttachName: "kube-ovn-eip", Priority: 7,
+			})
+			if conflict {
+				require.ErrorContains(t, err, "already owned by another filter")
+				require.Empty(t, mock.replacedFilters)
+			} else {
+				require.ErrorIs(t, err, unix.EPERM)
+				require.Len(t, mock.replacedFilters, 1)
+			}
+			require.Empty(t, mock.deletedFilters, "failed migration must preserve the working filter")
+		})
+	}
+}

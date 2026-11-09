@@ -436,9 +436,9 @@ func TestTCSyncEmptyUninitialized(t *testing.T) {
 
 func TestTCDeleteEIPUninitialized(t *testing.T) {
 	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "bond0"})
-	// 未初始化且无 Map，DeleteEIP 应安全返回 nil 而不报错 "EIP BPF maps are not loaded"
-	require.NoError(t, m.DeleteEIP(net.ParseIP("1.2.3.4")))
-	require.NoError(t, m.DeleteEIP(net.ParseIP("2001:db8::1")))
+	// 未加载 Map 无法确认旧 Pin 中是否仍有条目，不能误报删除成功。
+	require.ErrorContains(t, m.DeleteEIP(net.ParseIP("1.2.3.4")), "EIP BPF maps are not loaded")
+	require.ErrorContains(t, m.DeleteEIP(net.ParseIP("2001:db8::1")), "EIP BPF maps are not loaded")
 }
 
 func TestTCCleanMarksClosed(t *testing.T) {

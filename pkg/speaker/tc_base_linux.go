@@ -74,9 +74,9 @@ type tcFilterConfig struct {
 
 // attachBPFFilter 在指定网卡的 Ingress 队列上原子挂载或就地替换（Atomic Swap）eBPF TC 过滤器。
 // 1. 自动确保网卡具有 clsact qdisc。
-// 2. 检查现有过滤器，若已有相同 ID 的 direct-action 规则已就绪，直接幂等返回。
-// 3. 自动探测并清理本程序历史遗留在其他 priority 上的旧规则。
-// 4. 使用 netlink.FilterReplace 执行零中断无锁 RCU 热更。
+// 2. 检查目标 priority 是否可用，并收集其他 priority 上的旧规则。
+// 3. 若当前规则尚未就绪，使用 netlink.FilterReplace 执行原子挂载或替换。
+// 4. 新规则就绪后，再清理其他 priority 上的旧规则。
 func attachBPFFilter(cfg tcFilterConfig) error {
 	if cfg.Link == nil {
 		return errors.New("link is nil")
@@ -110,6 +110,7 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 	allNames := append([]string{cfg.AttachName}, cfg.LegacyNames...)
 	linkName := cfg.Link.Attrs().Name
 	var matchedCurrent bool
+	var obsolete []netlink.Filter
 	for _, filter := range filters {
 		attrs := filter.Attrs()
 		if attrs == nil {
@@ -117,11 +118,9 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 		}
 		bpf, ok := filter.(*netlink.BpfFilter)
 		if attrs.Priority != cfg.Priority {
-			// 若发现本程序历史遗留在其他 priority 上的旧规则（如升级修改了 priority 配置），主动剥离避免旧规则拦截或双规则共存
+			// 先收集旧规则，待目标 priority 校验并挂载成功后再清理，避免迁移失败破坏存量转发。
 			if ok && isMatchingTCFilter(bpf, progID, progTag, allNames...) {
-				if err := netlinkOps.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
-					klog.Warningf("failed to remove obsolete TC filter at priority %d on %s: %v", attrs.Priority, linkName, err)
-				}
+				obsolete = append(obsolete, filter)
 			}
 			continue
 		}
@@ -133,16 +132,23 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 			matchedCurrent = true
 		}
 	}
-	if matchedCurrent {
-		return nil
+	if !matchedCurrent {
+		if err := netlinkOps.FilterReplace(&netlink.BpfFilter{
+			FilterAttrs: netlink.FilterAttrs{
+				LinkIndex: cfg.Link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
+				Handle: 1, Priority: cfg.Priority, Protocol: unix.ETH_P_ALL,
+			},
+			Fd: progFD, Name: cfg.AttachName, DirectAction: true,
+		}); err != nil {
+			return err
+		}
 	}
-	return netlinkOps.FilterReplace(&netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: cfg.Link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
-			Handle: 1, Priority: cfg.Priority, Protocol: unix.ETH_P_ALL,
-		},
-		Fd: progFD, Name: cfg.AttachName, DirectAction: true,
-	})
+	for _, filter := range obsolete {
+		if err := netlinkOps.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
+			klog.Warningf("failed to remove obsolete TC filter at priority %d on %s: %v", filter.Attrs().Priority, linkName, err)
+		}
+	}
+	return nil
 }
 
 // isMatchingTCFilter 基于 Ingress parent、Handle=1、Protocol=ALL、DirectAction

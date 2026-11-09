@@ -285,9 +285,6 @@ func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-	if m.collection == nil && m.v4Map == nil && m.v6Map == nil {
-		return nil
-	}
 	key, err := eipMapKey(ip)
 	if err != nil {
 		return err
