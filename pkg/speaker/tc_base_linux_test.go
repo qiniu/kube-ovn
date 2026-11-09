@@ -91,3 +91,45 @@ func TestAttachBPFFilterNilProgram(t *testing.T) {
 	err := attachBPFFilter(tcFilterConfig{Link: &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}}})
 	require.ErrorContains(t, err, "bpf program is nil")
 }
+
+func TestIsMatchingTCFilterB1Regression(t *testing.T) {
+	// 验证 B1 回归场景：
+	// 旧版本可能保留了名字为 "tc_eip.o:[classifier]" 的 Filter 规则，
+	// 且由于升级重编译，ProgTag 与内核 ProgID 均不相同。
+	// 新版本必须仅通过 FilterNames 命中并识别该旧规则，以支持跨 Priority 安全剥离。
+	legacyFilter := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			Handle:   1,
+			Parent:   netlink.HANDLE_MIN_INGRESS,
+			Protocol: unix.ETH_P_ALL,
+			Priority: 5,
+		},
+		DirectAction: true,
+		Id:           1001,                    // 旧程序在内核中的 ProgID
+		Tag:          "aaaaaaaaaaaaaaaa",      // 旧程序字节码 Tag
+		Name:         "tc_eip.o:[classifier]", // 历史版本规则名
+	}
+
+	newProgID := uint32(2002)
+	newProgTag := "bbbbbbbbbbbbbbbb"
+	filterNames := []string{tcEIPFilterName, "tc_eip.o:[classifier]"}
+
+	// 1. 在 ProgID 与 ProgTag 完全不一致的情况下，必须通过历史 FilterName 成功识别旧规则（B1 核心诉求）
+	require.True(t, isMatchingTCFilter(legacyFilter, newProgID, newProgTag, filterNames...))
+
+	// 2. 若未配置历史 FilterName，则由于 ID/Tag 均不匹配而判定非本程序，无法识别
+	require.False(t, isMatchingTCFilter(legacyFilter, newProgID, newProgTag, tcEIPFilterName))
+
+	// 3. 第三方（如 Cilium/Calico）规则绝不误匹配
+	alienFilter := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			Handle:   1,
+			Parent:   netlink.HANDLE_MIN_INGRESS,
+			Protocol: unix.ETH_P_ALL,
+			Priority: 10,
+		},
+		DirectAction: true,
+		Name:         "cilium-netdev",
+	}
+	require.False(t, isMatchingTCFilter(alienFilter, newProgID, newProgTag, filterNames...))
+}

@@ -286,11 +286,14 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	m1 := NewTCManager(cfg1)
 	require.NoError(t, m1.Attach(link.Name))
 
-	// 验证 Priority 5 过滤器已就绪
+	// 验证 Priority 5 过滤器已就绪，并显式重命名为历史版本命名 "tc_eip.o:[classifier]"，模拟 B1 场景（跨 Priority 与旧规则名迁移）
 	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
 	require.NoError(t, err)
 	require.Len(t, filters, 1)
-	require.Equal(t, uint16(5), filters[0].Attrs().Priority)
+	oldFilter := filters[0].(*netlink.BpfFilter)
+	require.Equal(t, uint16(5), oldFilter.Attrs().Priority)
+	oldFilter.Name = "tc_eip.o:[classifier]"
+	require.NoError(t, netlink.FilterReplace(oldFilter))
 
 	// 2. 模拟运维调整 priority 为 7 并重启新实例
 	cfg2 := &Configuration{
