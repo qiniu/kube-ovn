@@ -109,6 +109,7 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 	}
 	allNames := append([]string{cfg.AttachName}, cfg.LegacyNames...)
 	linkName := cfg.Link.Attrs().Name
+	var matchedCurrent bool
 	for _, filter := range filters {
 		attrs := filter.Attrs()
 		if attrs == nil {
@@ -127,9 +128,13 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 		if !ok || !isMatchingTCFilter(bpf, progID, progTag, allNames...) {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", cfg.Priority, linkName)
 		}
+		// 严禁在此直接 return nil：否则当同 priority 规则排在前面时，排在后面的异 priority 废弃规则会被跳过清理。
 		if bpf.Id == int(progID) && bpf.DirectAction {
-			return nil
+			matchedCurrent = true
 		}
+	}
+	if matchedCurrent {
+		return nil
 	}
 	return netlinkOps.FilterReplace(&netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
@@ -265,28 +270,27 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 	}
 
 	replacements := make(map[string]*ebpf.Map)
+	// 根据 cilium/ebpf 契约：CollectionOptions.MapReplacements 内部仅克隆 (Clone) 传入的 Map 句柄，
+	// 调用方仍然拥有 LoadPinnedMap 打开的原始句柄的所有权，必须显式 Close()，否则每次加载均会导致 FD 泄漏。
+	defer func() {
+		for _, r := range replacements {
+			_ = r.Close()
+		}
+	}()
+
 	for name, p := range pinMapPaths {
 		if pinned, err := ebpf.LoadPinnedMap(p, nil); err == nil {
 			replacements[name] = pinned
 		}
 	}
 
-	// 注：传入 CollectionOptions 的 MapReplacements 所有权移交给返回的 Collection，
-	// 当 Collection.Close() 被调用时，其内部会统一 Close 释放所有引用的 Map（包括被替换的 Pinned Map 句柄）。
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{MapReplacements: replacements})
 	if err != nil && len(replacements) > 0 {
 		klog.Warningf("failed to load BPF collection with existing pinned maps, falling back to new maps: %v", err)
-		for _, r := range replacements {
-			_ = r.Close()
-		}
-		replacements = make(map[string]*ebpf.Map)
 		// 关键点：绝不在这里提前 removeBPFPin(p)，避免新 Collection 加载失败退出时旧 Pin 被破坏导致无法回滚
 		coll, err = ebpf.NewCollection(spec)
 	}
 	if err != nil {
-		for _, r := range replacements {
-			_ = r.Close()
-		}
 		return nil, fmt.Errorf("load BPF collection: %w", err)
 	}
 
@@ -326,7 +330,11 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 		pending = append(pending, pendingPin{name: name, tmpPath: tmpPath, dstPath: path})
 	}
 
-	// Phase 2: 全部 Pin 成功，统一原子重命名覆盖目标路径
+	// Phase 2: 全部 Pin 成功，统一原子重命名覆盖目标路径。
+	// 设计妥协说明：
+	// 若 Phase 2 执行过程中出现极端罕见故障（如前一个 Map 重命名成功但后续 Map 失败），
+	// 已成功覆盖的目标路径无法回滚至旧 Pin 文件。鉴于所有待重命名文件均位于同一 bpffs 挂载点内且权限目录均已验证就绪，
+	// 内核 VFS rename(2) 操作在同文件系统内失败概率极低，此两阶段设计可在极小复杂度下杜绝绝大多数中间态。
 	for _, p := range pending {
 		if err = os.Rename(p.tmpPath, p.dstPath); err != nil {
 			cleanupTmp()

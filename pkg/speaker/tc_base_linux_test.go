@@ -224,6 +224,39 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 	require.ErrorContains(t, err, "TC priority 5 on dummy0 is already owned by another filter")
 	require.Empty(t, mock.replacedFilters)
 	require.Empty(t, mock.deletedFilters)
+
+	// 4. 消除 Ordering Hazard 分支：同 priority 5 已存在匹配本程序的规则，且排在后面的 priority 7 存在旧名称规则
+	// 必须能够短路（不触发 FilterReplace），同时不能提前 return，必须成功剥离 priority 7 的旧规则
+	mock = &mockTCNetlinkOps{
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "kube-ovn-eip",
+			},
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 7, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "tc_eip.o:[classifier]",
+			},
+		},
+	}
+	netlinkOps = mock
+	err = attachBPFFilter(tcFilterConfig{
+		Link:        link,
+		Program:     prog,
+		AttachName:  "kube-ovn-eip",
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		Priority:    5,
+	})
+	require.NoError(t, err)
+	require.Empty(t, mock.replacedFilters)
+	require.Len(t, mock.deletedFilters, 1)
+	require.Equal(t, uint16(7), mock.deletedFilters[0].Attrs().Priority)
 }
 
 func TestIsMatchingTCFilterB1Regression(t *testing.T) {

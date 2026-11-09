@@ -61,9 +61,11 @@ func (m *linuxTCManager) resolveLinkName(linkName string) (string, error) {
 		return linkName, nil
 	}
 	if m.attachedDev != "" {
+		klog.V(3).Infof("reusing already attached TC BPF interface %s", m.attachedDev)
 		return m.attachedDev, nil
 	}
 	if m.cfg.TcBpfInterface != "" {
+		klog.V(3).Infof("falling back to configured TC BPF interface %s", m.cfg.TcBpfInterface)
 		return m.cfg.TcBpfInterface, nil
 	}
 	return "", errors.New("tc-bpf-interface must be explicitly specified")
@@ -247,7 +249,7 @@ func (m *linuxTCManager) AddEIP(ip net.IP, target TCRedirectTarget) error {
 	if !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
-	if err := m.ensureAttached(m.cfg.TcBpfInterface); err != nil {
+	if err := m.ensureAttached(""); err != nil {
 		return err
 	}
 	return m.addEIP(ip, target)
@@ -280,7 +282,7 @@ func (m *linuxTCManager) SyncEIPs(expected map[string]TCRedirectTarget, retained
 		return nil
 	}
 	if len(expected) > 0 || len(retainedIPs) > 0 {
-		if err := m.ensureAttached(m.cfg.TcBpfInterface); err != nil {
+		if err := m.ensureAttached(""); err != nil {
 			return err
 		}
 	}
