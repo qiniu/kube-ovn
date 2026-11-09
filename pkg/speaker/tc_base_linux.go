@@ -30,6 +30,7 @@ func ensureClsactQdisc(link netlink.Link) error {
 // tcFilterConfig 封装通用的 TC BPF Ingress 过滤器挂载参数
 type tcFilterConfig struct {
 	Link         netlink.Link
+	Program      *ebpf.Program
 	ProgFD       int
 	ProgID       uint32
 	ProgTag      string
@@ -47,6 +48,18 @@ type tcFilterConfig struct {
 func attachBPFFilter(cfg tcFilterConfig) error {
 	if cfg.Link == nil {
 		return errors.New("link is nil")
+	}
+	progFD := cfg.ProgFD
+	progID := cfg.ProgID
+	progTag := cfg.ProgTag
+	if cfg.Program != nil {
+		progFD = cfg.Program.FD()
+		if info, err := cfg.Program.Info(); err == nil {
+			if id, ok := info.ID(); ok {
+				progID = uint32(id)
+			}
+			progTag = info.Tag
+		}
 	}
 	if err := ensureClsactQdisc(cfg.Link); err != nil {
 		return err
@@ -68,17 +81,17 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 		bpf, ok := filter.(*netlink.BpfFilter)
 		if attrs.Priority != cfg.Priority {
 			// 若发现本程序历史遗留在其他 priority 上的旧规则（如升级修改了 priority 配置），主动剥离避免旧规则拦截或双规则共存
-			if ok && isMatchingTCFilter(bpf, cfg.ProgID, cfg.ProgTag, names...) {
+			if ok && isMatchingTCFilter(bpf, progID, progTag, names...) {
 				if err := netlink.FilterDel(filter); err != nil && !errors.Is(err, unix.ENOENT) {
 					klog.Warningf("failed to remove obsolete TC filter at priority %d on %s: %v", attrs.Priority, linkName, err)
 				}
 			}
 			continue
 		}
-		if !ok || !isMatchingTCFilter(bpf, cfg.ProgID, cfg.ProgTag, names...) {
+		if !ok || !isMatchingTCFilter(bpf, progID, progTag, names...) {
 			return fmt.Errorf("TC priority %d on %s is already owned by another filter", cfg.Priority, linkName)
 		}
-		if bpf.Id == int(cfg.ProgID) && bpf.DirectAction == cfg.DirectAction {
+		if bpf.Id == int(progID) && bpf.DirectAction == cfg.DirectAction {
 			return nil
 		}
 	}
@@ -87,7 +100,7 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 			LinkIndex: cfg.Link.Attrs().Index, Parent: netlink.HANDLE_MIN_INGRESS,
 			Handle: 1, Priority: cfg.Priority, Protocol: unix.ETH_P_ALL,
 		},
-		Fd: cfg.ProgFD, Name: cfg.FilterName, DirectAction: cfg.DirectAction,
+		Fd: progFD, Name: cfg.FilterName, DirectAction: cfg.DirectAction,
 	})
 }
 
@@ -201,6 +214,7 @@ func removeBPFPin(path string) error {
 
 // loadCollectionWithPinnedMaps 加载 BPF CollectionSpec，并优先复用 bpffs 中既有的 Pinned Map，
 // 实现进程重启/热更新期间数据面 0 丢包；若复用失败则自动回退并清理旧 Map。
+// 注意：若回退会删除既有 pin，牺牲旧版本回滚能力。
 func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[string]string) (*ebpf.Collection, error) {
 	for _, ms := range spec.Maps {
 		ms.Pinning = ebpf.PinNone

@@ -109,6 +109,7 @@ func (m *linuxTCManager) attach(linkName string) error {
 	}
 	return attachBPFFilter(tcFilterConfig{
 		Link:         link,
+		Program:      prog,
 		ProgFD:       prog.FD(),
 		ProgID:       uint32(id),
 		ProgTag:      info.Tag,
