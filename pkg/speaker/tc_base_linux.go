@@ -270,6 +270,7 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 	}
 
 	replacements := make(map[string]*ebpf.Map)
+	reused := make(map[string]bool)
 	// 根据 cilium/ebpf 契约：CollectionOptions.MapReplacements 内部仅克隆 (Clone) 传入的 Map 句柄，
 	// 调用方仍然拥有 LoadPinnedMap 打开的原始句柄的所有权，必须显式 Close()，否则每次加载均会导致 FD 泄漏。
 	defer func() {
@@ -281,13 +282,16 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 	for name, p := range pinMapPaths {
 		if pinned, err := ebpf.LoadPinnedMap(p, nil); err == nil {
 			replacements[name] = pinned
+			reused[name] = true
 		}
 	}
 
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{MapReplacements: replacements})
 	if err != nil && len(replacements) > 0 {
 		klog.Warningf("failed to load BPF collection with existing pinned maps, falling back to new maps: %v", err)
-		// 关键点：绝不在这里提前 removeBPFPin(p)，避免新 Collection 加载失败退出时旧 Pin 被破坏导致无法回滚
+		// 关键点：绝不在这里提前 removeBPFPin(p)，避免新 Collection 加载失败退出时旧 Pin 被破坏导致无法回滚；
+		// 同时清空 reused 标记，确保回退创建的全新 Map 实例在后续 Phase 1 中被完整 Pin 到 bpffs。
+		reused = make(map[string]bool)
 		coll, err = ebpf.NewCollection(spec)
 	}
 	if err != nil {
@@ -312,7 +316,7 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 
 	// Phase 1: 将所有未复用的 Map Pin 到 .tmp 临时文件
 	for name, path := range pinMapPaths {
-		if _, ok := replacements[name]; ok {
+		if reused[name] {
 			continue
 		}
 		if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

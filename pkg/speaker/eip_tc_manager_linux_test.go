@@ -405,4 +405,9 @@ func TestResolveLinkName(t *testing.T) {
 	m.cfg.TcBpfInterface = ""
 	_, err = m.resolveLinkName("")
 	require.ErrorContains(t, err, "tc-bpf-interface must be explicitly specified")
+
+	// 5. cfg 为 nil 防御，返回错误拒绝挂载而不发生 panic
+	m.cfg = nil
+	_, err = m.resolveLinkName("")
+	require.ErrorContains(t, err, "tc-bpf-interface must be explicitly specified")
 }

@@ -64,7 +64,7 @@ func (m *linuxTCManager) resolveLinkName(linkName string) (string, error) {
 		klog.V(3).Infof("reusing already attached TC BPF interface %s", m.attachedDev)
 		return m.attachedDev, nil
 	}
-	if m.cfg.TcBpfInterface != "" {
+	if m.cfg != nil && m.cfg.TcBpfInterface != "" {
 		klog.V(3).Infof("falling back to configured TC BPF interface %s", m.cfg.TcBpfInterface)
 		return m.cfg.TcBpfInterface, nil
 	}
