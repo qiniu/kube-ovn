@@ -279,7 +279,13 @@ func (m *linuxTCManager) AddEIP(ip net.IP, target TCRedirectTarget) error {
 func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return errors.New("TC manager is closed")
+	}
 	if !m.cfg.EnableTcBpfRedirect {
+		return nil
+	}
+	if m.collection == nil && m.v4Map == nil && m.v6Map == nil {
 		return nil
 	}
 	key, err := eipMapKey(ip)

@@ -434,7 +434,19 @@ func TestTCSyncEmptyUninitialized(t *testing.T) {
 	require.NoError(t, m.SyncEIPs(nil))
 }
 
+func TestTCDeleteEIPUninitialized(t *testing.T) {
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "bond0"})
+	// 未初始化且无 Map，DeleteEIP 应安全返回 nil 而不报错 "EIP BPF maps are not loaded"
+	require.NoError(t, m.DeleteEIP(net.ParseIP("1.2.3.4")))
+	require.NoError(t, m.DeleteEIP(net.ParseIP("2001:db8::1")))
+}
+
 func TestTCCleanMarksClosed(t *testing.T) {
+	// Only exercise the manager state machine; never enumerate or delete real TC filters.
+	origOps := netlinkOps
+	netlinkOps = &mockTCNetlinkOps{}
+	t.Cleanup(func() { netlinkOps = origOps })
+
 	tmpDir := t.TempDir()
 	m := NewTCManager(&Configuration{
 		EnableTcBpfRedirect: true,
@@ -447,9 +459,20 @@ func TestTCCleanMarksClosed(t *testing.T) {
 	// Clean 之后，数据面写入操作必须明确返回 closed 错误
 	ip := net.ParseIP("1.2.3.4")
 	require.ErrorContains(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: 1}), "TC manager is closed")
+	require.ErrorContains(t, m.DeleteEIP(ip), "TC manager is closed")
 	require.ErrorContains(t, m.SyncEIPs(map[string]TCRedirectTarget{}), "TC manager is closed")
 	require.ErrorContains(t, m.Attach("bond0"), "TC manager is closed")
 
 	// 但 Clean 自身仍可幂等调用支持重试
 	require.NoError(t, m.Clean())
+}
+
+func TestTCDeleteEIPAfterClose(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			m := NewTCManager(&Configuration{EnableTcBpfRedirect: enabled})
+			require.NoError(t, m.Close())
+			require.ErrorContains(t, m.DeleteEIP(net.ParseIP("1.2.3.4")), "TC manager is closed")
+		})
+	}
 }
