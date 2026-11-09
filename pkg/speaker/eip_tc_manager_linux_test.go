@@ -426,3 +426,30 @@ func TestResolveLinkName(t *testing.T) {
 	_, err = m.resolveLinkName("")
 	require.ErrorContains(t, err, "tc-bpf-interface must be explicitly specified")
 }
+
+func TestTCSyncEmptyUninitialized(t *testing.T) {
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "bond0"})
+	// 未初始化且无期望 EIP，SyncEIPs 应安全返回 nil 而不报错 "EIP BPF maps are not loaded"
+	require.NoError(t, m.SyncEIPs(map[string]TCRedirectTarget{}))
+	require.NoError(t, m.SyncEIPs(nil))
+}
+
+func TestTCCleanMarksClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	m := NewTCManager(&Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      "bond0",
+		TcBpfMapPath:        filepath.Join(tmpDir, "v4_map"),
+	}).(*linuxTCManager)
+	require.NoError(t, m.Clean())
+	require.True(t, m.closed)
+
+	// Clean 之后，数据面写入操作必须明确返回 closed 错误
+	ip := net.ParseIP("1.2.3.4")
+	require.ErrorContains(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: 1}), "TC manager is closed")
+	require.ErrorContains(t, m.SyncEIPs(map[string]TCRedirectTarget{}), "TC manager is closed")
+	require.ErrorContains(t, m.Attach("bond0"), "TC manager is closed")
+
+	// 但 Clean 自身仍可幂等调用支持重试
+	require.NoError(t, m.Clean())
+}

@@ -299,7 +299,13 @@ func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
 func (m *linuxTCManager) SyncEIPs(expected map[string]TCRedirectTarget, retainedIPs ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return errors.New("TC manager is closed")
+	}
 	if !m.cfg.EnableTcBpfRedirect {
+		return nil
+	}
+	if len(expected) == 0 && len(retainedIPs) == 0 && m.collection == nil && m.v4Map == nil && m.v6Map == nil {
 		return nil
 	}
 	if len(expected) > 0 || len(retainedIPs) > 0 {
@@ -384,6 +390,7 @@ func (m *linuxTCManager) Clean() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.attachedDev = ""
+	m.closed = true
 	var errs []error
 	if err := m.cleanupFilters(""); err != nil {
 		errs = append(errs, err)
@@ -402,9 +409,6 @@ func (m *linuxTCManager) Clean() error {
 	}
 	if err := removeBPFPin(v6); err != nil {
 		errs = append(errs, err)
-	}
-	if len(errs) == 0 {
-		m.closed = true
 	}
 	return errors.Join(errs...)
 }

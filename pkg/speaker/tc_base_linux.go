@@ -324,9 +324,15 @@ func loadCollectionWithPinnedMaps(spec *ebpf.CollectionSpec, pinMapPaths map[str
 			coll.Close()
 			return nil, fmt.Errorf("create map dir %s: %w", filepath.Dir(path), err)
 		}
+		targetMap, ok := coll.Maps[name]
+		if !ok || targetMap == nil {
+			cleanupTmp()
+			coll.Close()
+			return nil, fmt.Errorf("BPF map %s not found in collection", name)
+		}
 		tmpPath := path + ".tmp"
 		_ = removeBPFPin(tmpPath)
-		if err = coll.Maps[name].Pin(tmpPath); err != nil {
+		if err = targetMap.Pin(tmpPath); err != nil {
 			cleanupTmp()
 			coll.Close()
 			return nil, fmt.Errorf("pin BPF map %s to tmp %s: %w", name, tmpPath, err)
