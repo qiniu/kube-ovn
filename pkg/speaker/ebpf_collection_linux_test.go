@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestRemoveBPFPin(t *testing.T) {
+func TestTCRemoveBPFPin(t *testing.T) {
 	// 1. 删除不存在的文件应安全返回 nil
 	require.NoError(t, removeBPFPin("/tmp/nonexistent-pin-file-12345"))
 
@@ -25,7 +25,7 @@ func TestRemoveBPFPin(t *testing.T) {
 	require.NoFileExists(t, filePath)
 }
 
-func TestLoadCollectionWithPinnedMaps(t *testing.T) {
+func TestTCLoadCollectionWithPinnedMaps(t *testing.T) {
 	for _, fallback := range []bool{false, true} {
 		name := "fresh"
 		if fallback {
@@ -59,11 +59,11 @@ func TestLoadCollectionWithPinnedMaps(t *testing.T) {
 	}
 }
 
-func TestPruneBPFHashMapNil(t *testing.T) {
+func TestTCPruneBPFHashMapNil(t *testing.T) {
 	require.ErrorContains(t, pruneBPFHashMap(nil, map[string]bool{}), "target map is nil")
 }
 
-func TestLoadCollectionWithPinnedMapsMissingMap(t *testing.T) {
+func TestTCLoadCollectionWithPinnedMapsMissingMap(t *testing.T) {
 	if os.Getenv("KUBE_OVN_BPF_TEST") != "1" {
 		t.Skip("requires privileged BPF environment")
 	}

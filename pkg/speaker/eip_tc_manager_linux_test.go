@@ -478,14 +478,87 @@ func TestTCCleanMarksClosed(t *testing.T) {
 	require.NoError(t, m.Clean())
 }
 
-func TestTCDeleteEIPAfterClose(t *testing.T) {
+func TestTCDataOpsAfterClose(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
 			m := NewTCManager(&Configuration{EnableTcBpfRedirect: enabled})
 			require.NoError(t, m.Close())
-			require.ErrorContains(t, m.DeleteEIP(net.ParseIP("1.2.3.4")), "TC manager is closed")
+			ip := net.ParseIP("1.2.3.4")
+			require.ErrorContains(t, m.AddEIP(ip, TCRedirectTarget{TargetIfindex: 1}), "TC manager is closed")
+			require.ErrorContains(t, m.DeleteEIP(ip), "TC manager is closed")
+			require.ErrorContains(t, m.SyncEIPs(map[string]TCRedirectTarget{}), "TC manager is closed")
 		})
 	}
+}
+
+func TestTCCleanupFiltersSpecificLink(t *testing.T) {
+	origOps := netlinkOps
+	defer func() { netlinkOps = origOps }()
+
+	mock := &mockTCNetlinkOps{
+		linkByNameFunc: func(name string) (netlink.Link, error) {
+			if name == "eth0" {
+				return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: "eth0"}}, nil
+			}
+			return nil, errors.New("not found")
+		},
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "kube-ovn-eip",
+			},
+		},
+	}
+	netlinkOps = mock
+
+	m := &linuxTCManager{}
+	err := m.cleanupFilters("eth0")
+	require.NoError(t, err)
+	require.Len(t, mock.deletedFilters, 1)
+	require.Equal(t, 10, mock.deletedFilters[0].Attrs().LinkIndex)
+}
+
+func TestTCInterfaceSwitchIntegration(t *testing.T) {
+	bpfObj := requireBPFObject(t)
+	pin := testTCPinPath(t)
+	link1 := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-sw1-%d", time.Now().UnixNano()%100000)}}
+	require.NoError(t, netlink.LinkAdd(link1))
+	t.Cleanup(func() { _ = netlink.LinkDel(link1) })
+
+	link2 := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-sw2-%d", time.Now().UnixNano()%100000)}}
+	require.NoError(t, netlink.LinkAdd(link2))
+	t.Cleanup(func() { _ = netlink.LinkDel(link2) })
+
+	cfg := &Configuration{
+		EnableTcBpfRedirect: true,
+		TcBpfInterface:      link1.Name,
+		TcBpfProgPath:       bpfObj,
+		TcBpfMapPath:        pin,
+	}
+
+	m := NewTCManager(cfg)
+	t.Cleanup(func() { _ = m.Close() })
+
+	// 1. 先挂载在 link1
+	require.NoError(t, m.Attach(link1.Name))
+	filters1, err := netlink.FilterList(link1, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters1, 1)
+
+	// 2. 切换挂载至 link2
+	require.NoError(t, m.Attach(link2.Name))
+
+	// 验证 link2 已挂载，link1 上的旧规则已被自动清理
+	filters2, err := netlink.FilterList(link2, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Len(t, filters2, 1)
+
+	filters1After, err := netlink.FilterList(link1, netlink.HANDLE_MIN_INGRESS)
+	require.NoError(t, err)
+	require.Empty(t, filters1After, "old interface filters must be cleaned up after interface switch")
 }
 
 func TestTCManagerAttachUsesNetlinkOps(t *testing.T) {

@@ -103,13 +103,19 @@ func (m *linuxTCManager) doAttach(linkName string, useCache bool) error {
 	if useCache && m.attachedDev == dev {
 		return nil
 	}
-	if m.attachedDev != "" && m.attachedDev != dev {
-		klog.Warningf("TC BPF interface changed from %s to %s; previous interface filters may still be attached", m.attachedDev, dev)
+	oldDev := m.attachedDev
+	if oldDev != "" && oldDev != dev {
+		klog.Warningf("TC BPF interface changed from %s to %s; previous interface filters will be cleaned up", oldDev, dev)
 	}
 	if err := m.attach(dev); err != nil {
 		return err
 	}
 	m.attachedDev = dev
+	if oldDev != "" && oldDev != dev {
+		if err := m.cleanupFilters(oldDev); err != nil {
+			klog.Warningf("failed to remove obsolete TC filter on previous interface %s: %v", oldDev, err)
+		}
+	}
 	return nil
 }
 
@@ -265,6 +271,9 @@ func (m *linuxTCManager) addEIP(ip net.IP, target TCRedirectTarget) error {
 func (m *linuxTCManager) AddEIP(ip net.IP, target TCRedirectTarget) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return errors.New("TC manager is closed")
+	}
 	if m.cfg == nil || !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
@@ -288,6 +297,12 @@ func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
 		return err
 	}
 	targetMap, err := m.mapFor(key)
+	if err != nil && !m.closed {
+		// 优先尝试按需加载复用已有 Pinned Map，支持冷启动先收到删除事件时清理残留规则
+		if attachErr := m.ensureAttached(""); attachErr == nil {
+			targetMap, err = m.mapFor(key)
+		}
+	}
 	if err != nil {
 		return err
 	}

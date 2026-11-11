@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
@@ -75,7 +76,10 @@ type tcBPFProgram interface {
 
 // ebpfTCProgram 包装 *ebpf.Program 以适配 tcBPFProgram 接口，统一 ProgInfo 的提取与观测日志。
 type ebpfTCProgram struct {
-	p *ebpf.Program
+	p    *ebpf.Program
+	info *ebpf.ProgramInfo
+	err  error
+	once sync.Once
 }
 
 func newEbpfTCProgram(p *ebpf.Program) tcBPFProgram {
@@ -89,10 +93,19 @@ func (e *ebpfTCProgram) FD() int {
 	return e.p.FD()
 }
 
+func (e *ebpfTCProgram) getInfo() (*ebpf.ProgramInfo, error) {
+	e.once.Do(func() {
+		e.info, e.err = e.p.Info()
+		if e.err != nil {
+			klog.Warningf("failed to get BPF program info: %v", e.err)
+		}
+	})
+	return e.info, e.err
+}
+
 func (e *ebpfTCProgram) ID() (uint32, bool) {
-	info, err := e.p.Info()
-	if err != nil {
-		klog.Warningf("failed to get BPF program info: %v", err)
+	info, err := e.getInfo()
+	if err != nil || info == nil {
 		return 0, false
 	}
 	id, ok := info.ID()
@@ -103,8 +116,8 @@ func (e *ebpfTCProgram) ID() (uint32, bool) {
 }
 
 func (e *ebpfTCProgram) Tag() string {
-	info, err := e.p.Info()
-	if err != nil {
+	info, err := e.getInfo()
+	if err != nil || info == nil {
 		return ""
 	}
 	return info.Tag
