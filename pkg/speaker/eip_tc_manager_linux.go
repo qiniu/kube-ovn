@@ -45,7 +45,10 @@ func newTCManager(cfg *Configuration) TCManager { return &linuxTCManager{cfg: cf
 
 // mapPaths 根据配置的 IPv4 Pinned Map 路径推导，IPv6 Map 为其同级同名映射文件
 func (m *linuxTCManager) mapPaths() (string, string) {
-	v4 := m.cfg.TcBpfMapPath
+	var v4 string
+	if m.cfg != nil {
+		v4 = m.cfg.TcBpfMapPath
+	}
 	if v4 == "" {
 		v4 = "/sys/fs/bpf/kube_ovn_eip_v4_map"
 	}
@@ -71,15 +74,11 @@ func (m *linuxTCManager) resolveLinkName(linkName string) (string, error) {
 	return "", errors.New("tc-bpf-interface must be explicitly specified")
 }
 
-// ensureAttached 自动确保目标网卡已挂载 TC BPF 程序，先解析设备名后就地做短路判定，避免高频 Netlink 系统调用与日志开销。
-// 注意：本函数专供 AddEIP / SyncEIPs 等高频数据面调用路径快速短路；若需主动检查或自愈重建过滤器，应显式调用 Attach()。
-// 本函数先确保 Collection 与 Pinned Map 加载成功，再执行网卡挂载。
-// 若后续网卡挂载失败，此前已加载的 Collection 实例将保留在内存中以备后续快速重试；当 TCManager.Close() 或 Clean() 被调用时统一释放。
-func (m *linuxTCManager) ensureAttached(linkName string) error {
+func (m *linuxTCManager) doAttach(linkName string, useCache bool) error {
 	if m.closed {
 		return errors.New("TC manager is closed")
 	}
-	if !m.cfg.EnableTcBpfRedirect {
+	if m.cfg == nil || !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
 	// 若处于测试注入独立 Map 模式（未加载完整 BPF Collection），跳过底层网卡挂载
@@ -91,7 +90,7 @@ func (m *linuxTCManager) ensureAttached(linkName string) error {
 		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting: %v", err)
 		return err
 	}
-	if m.attachedDev == dev {
+	if useCache && m.attachedDev == dev {
 		return nil
 	}
 	if err := m.attach(dev); err != nil {
@@ -99,6 +98,14 @@ func (m *linuxTCManager) ensureAttached(linkName string) error {
 	}
 	m.attachedDev = dev
 	return nil
+}
+
+// ensureAttached 自动确保目标网卡已挂载 TC BPF 程序，先解析设备名后就地做短路判定，避免高频 Netlink 系统调用与日志开销。
+// 注意：本函数专供 AddEIP / SyncEIPs 等高频数据面调用路径快速短路；若需主动检查或自愈重建过滤器，应显式调用 Attach()。
+// 本函数先确保 Collection 与 Pinned Map 加载成功，再执行网卡挂载。
+// 若后续网卡挂载失败，此前已加载的 Collection 实例将保留在内存中以备后续快速重试；当 TCManager.Close() 或 Clean() 被调用时统一释放。
+func (m *linuxTCManager) ensureAttached(linkName string) error {
+	return m.doAttach(linkName, true)
 }
 
 func (m *linuxTCManager) attach(linkName string) error {
@@ -113,43 +120,27 @@ func (m *linuxTCManager) attach(linkName string) error {
 	}
 	return attachBPFFilter(tcFilterConfig{
 		Link:        link,
-		Program:     m.collection.Programs["tc_eip_ingress"],
+		Program:     newEbpfTCProgram(m.collection.Programs["tc_eip_ingress"]),
 		AttachName:  tcEIPFilterName,
 		LegacyNames: []string{"tc_eip.o:[classifier]"},
 		Priority:    m.priority(),
 	})
 }
 
-// Attach 具备幂等性，支持网卡设备或过滤器重建后的自动恢复。
+// Attach 具备幂等性，支持网卡设备或过滤器重建后的主动探测与自愈恢复。
 // 区别于内部数据面操作的高频内存缓存短路，主动调用 Attach() 会绕过 attachedDev 内存缓存，
 // 委托底层 attachBPFFilter 执行 Netlink 级别状态核验与原子恢复。失败的尝试不会留下成功挂载标记，可安全重试。
 func (m *linuxTCManager) Attach(linkName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed {
-		return errors.New("TC manager is closed")
-	}
-	if !m.cfg.EnableTcBpfRedirect {
-		return nil
-	}
-	// 若处于测试注入独立 Map 模式（未加载完整 BPF Collection），跳过底层网卡挂载
-	if m.collection == nil && (m.v4Map != nil || m.v6Map != nil) {
-		return nil
-	}
-	dev, err := m.resolveLinkName(linkName)
-	if err != nil {
-		klog.Errorf("TC BPF interface must be explicitly specified (e.g. macbond1); refusing to attach to protect production from misrouting: %v", err)
-		return err
-	}
-	if err := m.attach(dev); err != nil {
-		return err
-	}
-	m.attachedDev = dev
-	return nil
+	return m.doAttach(linkName, false)
 }
 
 func (m *linuxTCManager) load() error {
-	path := m.cfg.TcBpfProgPath
+	var path string
+	if m.cfg != nil {
+		path = m.cfg.TcBpfProgPath
+	}
 	if path == "" {
 		path = "/etc/kube-ovn/tc_eip.o"
 	}
@@ -170,17 +161,11 @@ func (m *linuxTCManager) load() error {
 
 	m.collection = coll
 	m.v4Map, m.v6Map = coll.Maps[tcEIPv4MapName], coll.Maps[tcEIPv6MapName]
-	prog := coll.Programs["tc_eip_ingress"]
-	if info, err := prog.Info(); err != nil {
-		klog.Warningf("failed to inspect BPF program info: %v", err)
-	} else if info != nil {
-		if id, ok := info.ID(); ok {
-			m.progID = uint32(id)
-		} else {
-			klog.V(4).Infof("BPF program info has no kernel ID yet")
-		}
-		m.progTag = info.Tag
+	prog := newEbpfTCProgram(coll.Programs["tc_eip_ingress"])
+	if id, ok := prog.ID(); ok {
+		m.progID = id
 	}
+	m.progTag = prog.Tag()
 	return nil
 }
 
@@ -267,7 +252,7 @@ func (m *linuxTCManager) addEIP(ip net.IP, target TCRedirectTarget) error {
 func (m *linuxTCManager) AddEIP(ip net.IP, target TCRedirectTarget) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.cfg.EnableTcBpfRedirect {
+	if m.cfg == nil || !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
 	if err := m.ensureAttached(""); err != nil {
@@ -282,7 +267,7 @@ func (m *linuxTCManager) DeleteEIP(ip net.IP) error {
 	if m.closed {
 		return errors.New("TC manager is closed")
 	}
-	if !m.cfg.EnableTcBpfRedirect {
+	if m.cfg == nil || !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
 	key, err := eipMapKey(ip)
@@ -305,7 +290,7 @@ func (m *linuxTCManager) SyncEIPs(expected map[string]TCRedirectTarget, retained
 	if m.closed {
 		return errors.New("TC manager is closed")
 	}
-	if !m.cfg.EnableTcBpfRedirect {
+	if m.cfg == nil || !m.cfg.EnableTcBpfRedirect {
 		return nil
 	}
 	if len(expected) == 0 && len(retainedIPs) == 0 && m.collection == nil && m.v4Map == nil && m.v6Map == nil {
@@ -320,12 +305,12 @@ func (m *linuxTCManager) SyncEIPs(expected map[string]TCRedirectTarget, retained
 	var errs []error
 	for address, info := range expected {
 		ip := net.ParseIP(address)
-		if err := m.addEIP(ip, info); err != nil {
+		key, err := eipMapKey(ip)
+		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		key, err := eipMapKey(ip)
-		if err != nil {
+		if err := m.addEIP(ip, info); err != nil {
 			errs = append(errs, err)
 			continue
 		}

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
@@ -145,6 +144,9 @@ type mockTCNetlinkOps struct {
 
 	replacedFilters []netlink.Filter
 	deletedFilters  []netlink.Filter
+
+	linkByNameFunc func(string) (netlink.Link, error)
+	linkListFunc   func() ([]netlink.Link, error)
 }
 
 func (m *mockTCNetlinkOps) QdiscAdd(netlink.Qdisc) error {
@@ -165,24 +167,37 @@ func (m *mockTCNetlinkOps) FilterDel(f netlink.Filter) error {
 	return m.filterDelErr
 }
 
+func (m *mockTCNetlinkOps) LinkByName(name string) (netlink.Link, error) {
+	if m.linkByNameFunc != nil {
+		return m.linkByNameFunc(name)
+	}
+	return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: name}}, nil
+}
+
+func (m *mockTCNetlinkOps) LinkList() ([]netlink.Link, error) {
+	if m.linkListFunc != nil {
+		return m.linkListFunc()
+	}
+	return nil, nil
+}
+
 type mockBPFProgram struct {
-	fd      int
-	info    *ebpf.ProgramInfo
-	infoErr error
+	fd    int
+	id    uint32
+	hasID bool
+	tag   string
 }
 
 func (m *mockBPFProgram) FD() int {
 	return m.fd
 }
 
-func (m *mockBPFProgram) Info() (*ebpf.ProgramInfo, error) {
-	return m.info, m.infoErr
+func (m *mockBPFProgram) ID() (uint32, bool) {
+	return m.id, m.hasID
 }
 
-func mockProgramInfo(id uint32, tag string) *ebpf.ProgramInfo {
-	info := &ebpf.ProgramInfo{Tag: tag}
-	*(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(info)) + unsafe.Sizeof(ebpf.ProgramType(0)))) = id
-	return info
+func (m *mockBPFProgram) Tag() string {
+	return m.tag
 }
 
 func TestAttachBPFFilterOpsBranches(t *testing.T) {
@@ -190,7 +205,12 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 	defer func() { netlinkOps = origOps }()
 
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: "dummy0"}}
-	prog := &mockBPFProgram{fd: 42, info: mockProgramInfo(1001, "08218004caf6a189")}
+	prog := &mockBPFProgram{
+		fd:    42,
+		id:    1001,
+		hasID: true,
+		tag:   "08218004caf6a189",
+	}
 
 	// 1. 幂等短路分支：同 priority 上已存在匹配本程序有效 ProgID 的规则
 	mock := &mockTCNetlinkOps{
@@ -201,6 +221,7 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 				},
 				DirectAction: true,
 				Id:           1001,
+				Tag:          "08218004caf6a189",
 				Name:         "kube-ovn-eip",
 			},
 		},
@@ -277,6 +298,7 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 				},
 				DirectAction: true,
 				Id:           1001,
+				Tag:          "08218004caf6a189",
 				Name:         "kube-ovn-eip",
 			},
 			&netlink.BpfFilter{
@@ -352,6 +374,45 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, mock.replacedFilters, 1)
 	require.Empty(t, mock.deletedFilters)
+}
+
+func TestDetachBPFFiltersOnLinksWithOps(t *testing.T) {
+	origOps := netlinkOps
+	defer func() { netlinkOps = origOps }()
+
+	// 1. linkName 为空时，通过 ops.LinkList 枚举网卡并卸载匹配规则
+	mock := &mockTCNetlinkOps{
+		linkListFunc: func() ([]netlink.Link, error) {
+			return []netlink.Link{&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 1, Name: "dummy1"}}}, nil
+		},
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 1, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "kube-ovn-eip",
+			},
+		},
+	}
+	netlinkOps = mock
+
+	err := detachBPFFiltersOnLinks("", func(b *netlink.BpfFilter) bool {
+		return b.Name == "kube-ovn-eip"
+	})
+	require.NoError(t, err)
+	require.Len(t, mock.deletedFilters, 1)
+
+	// 2. linkName 非空时，仅通过 ops.LinkByName 查询指定网卡
+	mock = &mockTCNetlinkOps{
+		linkByNameFunc: func(name string) (netlink.Link, error) {
+			require.Equal(t, "eth0", name)
+			return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 2, Name: "eth0"}}, nil
+		},
+	}
+	netlinkOps = mock
+	err = detachBPFFiltersOnLinks("eth0", func(_ *netlink.BpfFilter) bool { return false })
+	require.NoError(t, err)
 }
 
 func TestIsMatchingTCFilterB1Regression(t *testing.T) {
@@ -437,4 +498,37 @@ func TestAttachBPFFilterMigrationFailurePreservesOldFilter(t *testing.T) {
 			require.Empty(t, mock.deletedFilters, "failed migration must preserve the working filter")
 		})
 	}
+}
+
+func TestPruneBPFHashMapNil(t *testing.T) {
+	require.ErrorContains(t, pruneBPFHashMap(nil, map[string]bool{}), "target map is nil")
+}
+
+func TestLoadCollectionWithPinnedMapsMissingMap(t *testing.T) {
+	if os.Getenv("KUBE_OVN_BPF_TEST") != "1" {
+		t.Skip("requires privileged BPF environment")
+	}
+	if err := unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, ""); err != nil {
+		require.ErrorIs(t, err, unix.EBUSY)
+	}
+	dir, err := os.MkdirTemp("/sys/fs/bpf", "bpf-missing-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	spec := &ebpf.CollectionSpec{
+		Maps: map[string]*ebpf.MapSpec{
+			"valid_map": {
+				Type:       ebpf.Hash,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: 10,
+			},
+		},
+	}
+	pinPaths := map[string]string{
+		"missing_map": filepath.Join(dir, "missing_map"),
+	}
+	coll, err := loadCollectionWithPinnedMaps(spec, pinPaths)
+	require.ErrorContains(t, err, "missing_map not found in collection")
+	require.Nil(t, coll)
 }

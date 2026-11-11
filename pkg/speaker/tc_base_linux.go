@@ -21,6 +21,8 @@ type tcNetlinkOps interface {
 	FilterList(netlink.Link, uint32) ([]netlink.Filter, error)
 	FilterReplace(netlink.Filter) error
 	FilterDel(netlink.Filter) error
+	LinkByName(string) (netlink.Link, error)
+	LinkList() ([]netlink.Link, error)
 }
 
 type defaultTCNetlinkOps struct{}
@@ -41,6 +43,14 @@ func (defaultTCNetlinkOps) FilterDel(f netlink.Filter) error {
 	return netlink.FilterDel(f)
 }
 
+func (defaultTCNetlinkOps) LinkByName(name string) (netlink.Link, error) {
+	return netlink.LinkByName(name)
+}
+
+func (defaultTCNetlinkOps) LinkList() ([]netlink.Link, error) {
+	return netlink.LinkList()
+}
+
 var netlinkOps tcNetlinkOps = defaultTCNetlinkOps{}
 
 // ensureClsactQdisc 确保指定网卡已附加 clsact qdisc（若已存在则忽略 EEXIST）。
@@ -54,10 +64,48 @@ func ensureClsactQdisc(link netlink.Link) error {
 	return nil
 }
 
-// tcBPFProgram 抽象 BPF Program 的基本接口，便于纯单元测试 mock。
+// tcBPFProgram 抽象 BPF Program 的基本接口，便于纯单元测试 mock 并统一获取 Program 关键元数据。
 type tcBPFProgram interface {
 	FD() int
-	Info() (*ebpf.ProgramInfo, error)
+	ID() (uint32, bool)
+	Tag() string
+}
+
+// ebpfTCProgram 包装 *ebpf.Program 以适配 tcBPFProgram 接口，统一 ProgInfo 的提取与观测日志。
+type ebpfTCProgram struct {
+	p *ebpf.Program
+}
+
+func newEbpfTCProgram(p *ebpf.Program) tcBPFProgram {
+	if p == nil {
+		return nil
+	}
+	return &ebpfTCProgram{p: p}
+}
+
+func (e *ebpfTCProgram) FD() int {
+	return e.p.FD()
+}
+
+func (e *ebpfTCProgram) ID() (uint32, bool) {
+	info, err := e.p.Info()
+	if err != nil {
+		klog.Warningf("failed to get BPF program info: %v", err)
+		return 0, false
+	}
+	id, ok := info.ID()
+	if !ok {
+		klog.V(4).Infof("BPF program info has no kernel ID yet")
+	}
+	return uint32(id), ok
+}
+
+func (e *ebpfTCProgram) Tag() string {
+	info, err := e.p.Info()
+	if err != nil {
+		return ""
+	}
+	return info.Tag
 }
 
 // tcFilterConfig 封装通用的 TC BPF Ingress 过滤器挂载参数。
@@ -88,18 +136,8 @@ func attachBPFFilter(cfg tcFilterConfig) error {
 		return errors.New("AttachName must not be empty")
 	}
 	progFD := cfg.Program.FD()
-	var progID uint32
-	var progTag string
-	if info, err := cfg.Program.Info(); err != nil {
-		klog.Warningf("failed to get BPF program info: %v", err)
-	} else if info != nil {
-		if id, ok := info.ID(); ok {
-			progID = uint32(id)
-		} else {
-			klog.V(4).Infof("BPF program info has no kernel ID yet")
-		}
-		progTag = info.Tag
-	}
+	progID, _ := cfg.Program.ID()
+	progTag := cfg.Program.Tag()
 	if err := ensureClsactQdisc(cfg.Link); err != nil {
 		return err
 	}
@@ -187,7 +225,7 @@ func isMatchingTCFilter(filter *netlink.BpfFilter, progID uint32, progTag string
 func detachBPFFiltersOnLinks(linkName string, matchFunc func(*netlink.BpfFilter) bool) error {
 	var links []netlink.Link
 	if linkName != "" {
-		link, err := netlink.LinkByName(linkName)
+		link, err := netlinkOps.LinkByName(linkName)
 		if err != nil {
 			var linkNotFound netlink.LinkNotFoundError
 			if errors.As(err, &linkNotFound) || errors.Is(err, unix.ENODEV) {
@@ -198,7 +236,7 @@ func detachBPFFiltersOnLinks(linkName string, matchFunc func(*netlink.BpfFilter)
 		links = []netlink.Link{link}
 	} else {
 		var err error
-		links, err = netlink.LinkList()
+		links, err = netlinkOps.LinkList()
 		if err != nil {
 			return err
 		}
@@ -228,6 +266,9 @@ func detachBPFFiltersOnLinks(linkName string, matchFunc func(*netlink.BpfFilter)
 // pruneBPFHashMap 安全清理 BPF Hash Map 中的过期条目。
 // 必须在删除前先完整收集过期 Key：直接在遍历游标处删除可能导致 BPF Hash Map 遍历重置，当保留部分条目时可能发生死循环。
 func pruneBPFHashMap(targetMap *ebpf.Map, wanted map[string]bool) error {
+	if targetMap == nil {
+		return errors.New("target map is nil")
+	}
 	var stale [][]byte
 	var key any
 	for {

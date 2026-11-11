@@ -52,6 +52,21 @@ func TestNewTCManager(t *testing.T) {
 	if err := mgr.DeleteEIP(eip); err != nil {
 		t.Errorf("DeleteEIP: %v", err)
 	}
+
+	// 验证 cfg 为 nil 时的防御与接口调用安全
+	mgrNil := NewTCManager(nil)
+	if mgrNil == nil {
+		t.Fatal("expected non-nil TCManager instance even if cfg is nil")
+	}
+	if err := mgrNil.AddEIP(eip, target); err != nil {
+		t.Errorf("AddEIP with nil cfg: %v", err)
+	}
+	if err := mgrNil.DeleteEIP(eip); err != nil {
+		t.Errorf("DeleteEIP with nil cfg: %v", err)
+	}
+	if err := mgrNil.SyncEIPs(map[string]TCRedirectTarget{}); err != nil {
+		t.Errorf("SyncEIPs with nil cfg: %v", err)
+	}
 }
 
 // TestTCManagerPriority 验证 TC 过滤器优先级默认值及自定义配置
