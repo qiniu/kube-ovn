@@ -51,6 +51,12 @@ func (c *Controller) enqueueUpdateVpc(oldObj, newObj any) {
 	oldVpc := oldObj.(*kubeovnv1.Vpc)
 	newVpc := newObj.(*kubeovnv1.Vpc)
 
+	// Dependency recovery is event-driven (CODE_STYLE.md): once a VPC key is in the cache, wake
+	// the pods waiting for it instead of leaving them to queue backoff. Imported VPCs included.
+	if !util.IsValidTunnelKey(oldVpc.Status.TunnelKey) && util.IsValidTunnelKey(newVpc.Status.TunnelKey) {
+		c.notifyVpcTunnelKeySynced()
+	}
+
 	if newVpc.Labels != nil && newVpc.Labels[util.VpcExternalLabel] == "true" {
 		return
 	}
@@ -556,6 +562,13 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		if err = c.addPolicyRouteToVpc(vpc.Name, item, externalIDs); err != nil {
 			return err
 		}
+	}
+
+	// Subnets wait for Standby and pods take this key as their tunnel_key, so sync it before the
+	// status patch below marks the VPC Standby. A brand-new router may not have a SB
+	// Datapath_Binding yet; the error requeues and every step above is idempotent.
+	if err = c.reconcileVpcTunnelKey(vpc); err != nil {
+		return err
 	}
 
 	vpcSubnets, defaultSubnet := getVpcSubnetsFromList(vpc, allSubnets)
@@ -1507,4 +1520,87 @@ func (c *Controller) updateVpcExternalStatus(key string) error {
 	}
 
 	return nil
+}
+
+// reconcileVpcTunnelKey records the logical router tunnel key from OVN SB in vpc.Status. It is
+// the identity scope of every pod on the VPC's non-vlan OVN subnets (see
+// docs/tunnel-key-annotation-guarantee.md). A valid persisted key is kept, mirroring
+// reconcileSubnetTunnelKey; the caller persists the status and must pass a copy, never a
+// lister object. The SB lookup uses vpc.Name because handleAddOrUpdateVpc creates the
+// logical router under the VPC name (createVpcRouter(key), Status.Router = key).
+func (c *Controller) reconcileVpcTunnelKey(vpc *kubeovnv1.Vpc) error {
+	if util.IsValidTunnelKey(vpc.Status.TunnelKey) {
+		return nil
+	}
+	tunnelKey, err := c.OVNSbClient.GetLogicalRouterTunnelKey(vpc.Name)
+	if err != nil {
+		err = fmt.Errorf("failed to get tunnel key for logical router %s: %w", vpc.Name, err)
+		klog.Error(err)
+		return err
+	}
+	if !util.IsValidTunnelKey(tunnelKey) {
+		err = fmt.Errorf("invalid tunnel key %d for logical router %s", tunnelKey, vpc.Name)
+		klog.Error(err)
+		return err
+	}
+	vpc.Status.TunnelKey = tunnelKey
+	klog.Infof("synced tunnel key %d for vpc %s", tunnelKey, vpc.Name)
+	return nil
+}
+
+// vpcTunnelKey returns the synced tunnel key of the subnet's VPC, or 0 when the VPC is
+// unknown or its key is not synced yet; callers treat 0 as not ready (fail-closed).
+func (c *Controller) vpcTunnelKey(subnet *kubeovnv1.Subnet) int {
+	vpc, err := c.vpcsLister.Get(subnet.Spec.Vpc)
+	if err != nil {
+		return 0
+	}
+	return vpc.Status.TunnelKey
+}
+
+// notifyVpcTunnelKeySynced requests a pod sweep without blocking the informer callback. A pending
+// signal already covers this transition: the sweep it starts reads the cache after this key is in.
+func (c *Controller) notifyVpcTunnelKeySynced() {
+	select {
+	case c.vpcTunnelKeySyncedCh <- struct{}{}:
+	default:
+	}
+}
+
+// runVpcTunnelKeyWaker runs one sweep per coalesced signal until ctx is done.
+func (c *Controller) runVpcTunnelKeyWaker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.vpcTunnelKeySyncedCh:
+			c.wakePodsWaitingForVpcTunnelKey()
+		}
+	}
+}
+
+// wakePodsWaitingForVpcTunnelKey re-enqueues pods that a missing VPC key may hold back: pods with
+// any requested provider not allocated yet (allocation gate, including a hot-plugged attachment
+// of an allocated pod) and allocated pods whose annotation needs repair. A pending provider does
+// not record its subnet yet, so pods are not filtered by VPC; both handlers are idempotent and the
+// transition happens once per VPC. Retries with backoff remain the fallback.
+func (c *Controller) wakePodsWaitingForVpcTunnelKey() {
+	pods, err := c.podsLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list pods to wake after vpc tunnel key sync: %v", err)
+		return
+	}
+	for _, pod := range pods {
+		if pod.Spec.HostNetwork || !isPodAlive(pod) {
+			continue
+		}
+		key := cache.MetaObjectToName(pod).String()
+		// Same predicate as handleAddOrUpdatePod; a resolution error is left to that handler.
+		if podNets, err := c.getPodKubeovnNets(pod); err != nil || len(needAllocateSubnets(pod, podNets)) != 0 {
+			c.addOrUpdatePodQueue.Add(key)
+		}
+		if len(c.podProvidersNeedingTunnelKeyRepair(pod)) != 0 {
+			c.repairTunnelKeyQueue.Add(key)
+		}
+	}
 }
