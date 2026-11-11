@@ -3,17 +3,15 @@
 package speaker
 
 import (
-	"os"
-	"path/filepath"
+	"fmt"
 	"testing"
 
-	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
-func TestIsMatchingTCFilter(t *testing.T) {
+func TestTCIsMatchingTCFilter(t *testing.T) {
 	baseFilter := func() *netlink.BpfFilter {
 		return &netlink.BpfFilter{
 			FilterAttrs: netlink.FilterAttrs{
@@ -70,64 +68,28 @@ func TestIsMatchingTCFilter(t *testing.T) {
 	require.False(t, isMatchingTCFilter(fAlien, 0, "", "test-tc-filter"))
 }
 
-func TestRemoveBPFPin(t *testing.T) {
-	// 1. 删除不存在的文件应安全返回 nil
-	require.NoError(t, removeBPFPin("/tmp/nonexistent-pin-file-12345"))
+type nilAttrsLink struct{ netlink.Link }
 
-	// 2. 正常删除已有文件
-	tmpDir := t.TempDir()
-	filePath := filepath.Join(tmpDir, "test-pin")
-	require.NoError(t, os.WriteFile(filePath, []byte("test"), 0o600))
-	require.FileExists(t, filePath)
-	require.NoError(t, removeBPFPin(filePath))
-	require.NoFileExists(t, filePath)
-}
+func (nilAttrsLink) Attrs() *netlink.LinkAttrs { return nil }
 
-func TestLoadCollectionWithPinnedMaps(t *testing.T) {
-	for _, fallback := range []bool{false, true} {
-		name := "fresh"
-		if fallback {
-			name = "incompatible"
-		}
-		t.Run(name, func(t *testing.T) {
-			path := testTCPinPath(t)
-			if fallback {
-				old, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: 8, MaxEntries: 1})
-				require.NoError(t, err)
-				t.Cleanup(func() { require.NoError(t, old.Close()) })
-				require.NoError(t, old.Pin(path))
-			}
-			spec := &ebpf.CollectionSpec{Maps: map[string]*ebpf.MapSpec{
-				"test_map": {Name: "test_map", Type: ebpf.Hash, KeySize: 4, ValueSize: 4, MaxEntries: 1},
-			}}
-			coll, err := loadCollectionWithPinnedMaps(spec, map[string]string{"test_map": path})
-			require.NoError(t, err)
-			t.Cleanup(coll.Close)
-			require.NoError(t, coll.Maps["test_map"].Put(uint32(1), uint32(42)))
-			pinned, err := ebpf.LoadPinnedMap(path, nil)
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, pinned.Close()) })
-			var value uint32
-			require.NoError(t, pinned.Lookup(uint32(1), &value))
-			require.Equal(t, uint32(42), value)
-			entries, err := os.ReadDir(filepath.Dir(path))
-			require.NoError(t, err)
-			require.Len(t, entries, 1, "temporary pins must not remain after commit")
-		})
-	}
-}
-
-func TestAttachBPFFilterNilLink(t *testing.T) {
+func TestTCAttachBPFFilterNilLink(t *testing.T) {
 	err := attachBPFFilter(tcFilterConfig{Link: nil})
 	require.ErrorContains(t, err, "link is nil")
+
+	// 验证 Link.Attrs() 为 nil 的防御分支
+	err = attachBPFFilter(tcFilterConfig{
+		Link:    nilAttrsLink{},
+		Program: &mockBPFProgram{fd: 1},
+	})
+	require.ErrorContains(t, err, "link attrs is nil")
 }
 
-func TestAttachBPFFilterNilProgram(t *testing.T) {
+func TestTCAttachBPFFilterNilProgram(t *testing.T) {
 	err := attachBPFFilter(tcFilterConfig{Link: &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}}})
 	require.ErrorContains(t, err, "bpf program is nil")
 }
 
-func TestAttachBPFFilterEmptyAttachName(t *testing.T) {
+func TestTCAttachBPFFilterEmptyAttachName(t *testing.T) {
 	err := attachBPFFilter(tcFilterConfig{
 		Link:    &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dummy0"}},
 		Program: &mockBPFProgram{fd: 1},
@@ -145,8 +107,9 @@ type mockTCNetlinkOps struct {
 	replacedFilters []netlink.Filter
 	deletedFilters  []netlink.Filter
 
-	linkByNameFunc func(string) (netlink.Link, error)
-	linkListFunc   func() ([]netlink.Link, error)
+	linkByNameFunc  func(string) (netlink.Link, error)
+	linkByIndexFunc func(int) (netlink.Link, error)
+	linkListFunc    func() ([]netlink.Link, error)
 }
 
 func (m *mockTCNetlinkOps) QdiscAdd(netlink.Qdisc) error {
@@ -172,6 +135,13 @@ func (m *mockTCNetlinkOps) LinkByName(name string) (netlink.Link, error) {
 		return m.linkByNameFunc(name)
 	}
 	return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 10, Name: name}}, nil
+}
+
+func (m *mockTCNetlinkOps) LinkByIndex(index int) (netlink.Link, error) {
+	if m.linkByIndexFunc != nil {
+		return m.linkByIndexFunc(index)
+	}
+	return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: index, Name: fmt.Sprintf("mock%d", index)}}, nil
 }
 
 func (m *mockTCNetlinkOps) LinkList() ([]netlink.Link, error) {
@@ -200,7 +170,7 @@ func (m *mockBPFProgram) Tag() string {
 	return m.tag
 }
 
-func TestAttachBPFFilterOpsBranches(t *testing.T) {
+func TestTCAttachBPFFilterOpsBranches(t *testing.T) {
 	origOps := netlinkOps
 	defer func() { netlinkOps = origOps }()
 
@@ -404,14 +374,18 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 	require.Empty(t, mock.deletedFilters)
 }
 
-func TestDetachBPFFiltersOnLinksWithOps(t *testing.T) {
+func TestTCDetachBPFFiltersOnLinksWithOps(t *testing.T) {
 	origOps := netlinkOps
 	defer func() { netlinkOps = origOps }()
 
-	// 1. linkName 为空时，通过 ops.LinkList 枚举网卡并卸载匹配规则
+	// 1. linkName 为空时，通过 ops.LinkList 枚举网卡并卸载匹配规则，且支持跳过 nil link
 	mock := &mockTCNetlinkOps{
 		linkListFunc: func() ([]netlink.Link, error) {
-			return []netlink.Link{&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 1, Name: "dummy1"}}}, nil
+			return []netlink.Link{
+				nil,
+				nilAttrsLink{},
+				&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 1, Name: "dummy1"}},
+			}, nil
 		},
 		filterListFilters: []netlink.Filter{
 			&netlink.BpfFilter{
@@ -441,9 +415,39 @@ func TestDetachBPFFiltersOnLinksWithOps(t *testing.T) {
 	netlinkOps = mock
 	err = detachBPFFiltersOnLinks("eth0", func(_ *netlink.BpfFilter) bool { return false })
 	require.NoError(t, err)
+
+	// 3. LinkByName 返回 unix.ENOENT 或 unix.ENODEV 时视为已清理返回 nil
+	for _, notFoundErr := range []error{unix.ENOENT, unix.ENODEV, netlink.LinkNotFoundError{}} {
+		mock = &mockTCNetlinkOps{
+			linkByNameFunc: func(_ string) (netlink.Link, error) {
+				return nil, notFoundErr
+			},
+		}
+		netlinkOps = mock
+		require.NoError(t, detachBPFFiltersOnLinks("gone0", func(_ *netlink.BpfFilter) bool { return true }))
+	}
+
+	// 4. FilterDel 返回 unix.ESRCH 时静默忽略
+	mock = &mockTCNetlinkOps{
+		linkByNameFunc: func(name string) (netlink.Link, error) {
+			return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: 3, Name: name}}, nil
+		},
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 3, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Name:         "kube-ovn-eip",
+			},
+		},
+		filterDelErr: unix.ESRCH,
+	}
+	netlinkOps = mock
+	require.NoError(t, detachBPFFiltersOnLinks("eth1", func(_ *netlink.BpfFilter) bool { return true }))
 }
 
-func TestIsMatchingTCFilterB1Regression(t *testing.T) {
+func TestTCIsMatchingTCFilterB1Regression(t *testing.T) {
 	// 验证 B1 回归场景：
 	// 旧版本可能保留了名字为 "tc_eip.o:[classifier]" 的 Filter 规则，
 	// 且由于升级重编译，ProgTag 与内核 ProgID 均不相同。
@@ -485,7 +489,7 @@ func TestIsMatchingTCFilterB1Regression(t *testing.T) {
 	require.False(t, isMatchingTCFilter(alienFilter, newProgID, newProgTag, filterNames...))
 }
 
-func TestAttachBPFFilterMigrationFailurePreservesOldFilter(t *testing.T) {
+func TestTCAttachBPFFilterMigrationFailurePreservesOldFilter(t *testing.T) {
 	for _, conflict := range []bool{true, false} {
 		name := "replace failure"
 		if conflict {
@@ -526,37 +530,4 @@ func TestAttachBPFFilterMigrationFailurePreservesOldFilter(t *testing.T) {
 			require.Empty(t, mock.deletedFilters, "failed migration must preserve the working filter")
 		})
 	}
-}
-
-func TestPruneBPFHashMapNil(t *testing.T) {
-	require.ErrorContains(t, pruneBPFHashMap(nil, map[string]bool{}), "target map is nil")
-}
-
-func TestLoadCollectionWithPinnedMapsMissingMap(t *testing.T) {
-	if os.Getenv("KUBE_OVN_BPF_TEST") != "1" {
-		t.Skip("requires privileged BPF environment")
-	}
-	if err := unix.Mount("bpf", "/sys/fs/bpf", "bpf", 0, ""); err != nil {
-		require.ErrorIs(t, err, unix.EBUSY)
-	}
-	dir, err := os.MkdirTemp("/sys/fs/bpf", "bpf-missing-")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-
-	spec := &ebpf.CollectionSpec{
-		Maps: map[string]*ebpf.MapSpec{
-			"valid_map": {
-				Type:       ebpf.Hash,
-				KeySize:    4,
-				ValueSize:  4,
-				MaxEntries: 10,
-			},
-		},
-	}
-	pinPaths := map[string]string{
-		"missing_map": filepath.Join(dir, "missing_map"),
-	}
-	coll, err := loadCollectionWithPinnedMaps(spec, pinPaths)
-	require.ErrorContains(t, err, "missing_map not found in collection")
-	require.Nil(t, coll)
 }

@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	tcEIPFilterName = "kube-ovn-eip"
-	tcEIPv4MapName  = "kube_ovn_eip_v4_map"
-	tcEIPv6MapName  = "kube_ovn_eip_v6_map"
+	tcEIPFilterName       = "kube-ovn-eip"
+	tcEIPLegacyFilterName = "tc_eip.o:[classifier]"
+	tcEIPv4MapName        = "kube_ovn_eip_v4_map"
+	tcEIPv6MapName        = "kube_ovn_eip_v6_map"
 )
+
+var tcEIPFilterNames = []string{tcEIPFilterName, tcEIPLegacyFilterName}
 
 // 结构体内存布局必须与 tc_eip.c 中的 struct eip_target 保持完全一致（总计 16 字节，严格 32 位对齐）
 type bpfEipTarget struct {
@@ -64,6 +67,9 @@ func (m *linuxTCManager) resolveLinkName(linkName string) (string, error) {
 		return linkName, nil
 	}
 	if m.attachedDev != "" {
+		if m.cfg != nil && m.cfg.TcBpfInterface != "" && m.attachedDev != m.cfg.TcBpfInterface {
+			klog.Warningf("TC BPF attached interface %s differs from configured interface %s; call Attach(%q) to switch interface", m.attachedDev, m.cfg.TcBpfInterface, m.cfg.TcBpfInterface)
+		}
 		klog.V(3).Infof("reusing already attached TC BPF interface %s", m.attachedDev)
 		return m.attachedDev, nil
 	}
@@ -83,6 +89,10 @@ func (m *linuxTCManager) doAttach(linkName string, useCache bool) error {
 	}
 	// 若处于测试注入独立 Map 模式（未加载完整 BPF Collection），跳过底层网卡挂载
 	if m.collection == nil && (m.v4Map != nil || m.v6Map != nil) {
+		return nil
+	}
+	// 稳态数据面高频操作极速短路：避免反复执行 resolveLinkName 与 V(3) 日志输出
+	if useCache && m.attachedDev != "" && (linkName == "" || linkName == m.attachedDev) {
 		return nil
 	}
 	dev, err := m.resolveLinkName(linkName)
@@ -112,7 +122,7 @@ func (m *linuxTCManager) ensureAttached(linkName string) error {
 }
 
 func (m *linuxTCManager) attach(linkName string) error {
-	link, err := netlink.LinkByName(linkName)
+	link, err := netlinkOps.LinkByName(linkName)
 	if err != nil {
 		return err
 	}
@@ -125,7 +135,7 @@ func (m *linuxTCManager) attach(linkName string) error {
 		Link:        link,
 		Program:     newEbpfTCProgram(m.collection.Programs["tc_eip_ingress"]),
 		AttachName:  tcEIPFilterName,
-		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		LegacyNames: []string{tcEIPLegacyFilterName},
 		Priority:    m.priority(),
 	})
 }
@@ -183,7 +193,7 @@ func (m *linuxTCManager) priority() uint16 {
 
 // 严格仅匹配本程序的 TC 过滤器。
 func (m *linuxTCManager) isEIPFilter(filter *netlink.BpfFilter) bool {
-	return isMatchingTCFilter(filter, m.progID, m.progTag, tcEIPFilterName, "tc_eip.o:[classifier]")
+	return isMatchingTCFilter(filter, m.progID, m.progTag, tcEIPFilterNames...)
 }
 
 func (m *linuxTCManager) cleanupFilters(linkName string) error {
@@ -340,7 +350,7 @@ func (m *linuxTCManager) SyncEIPs(expected map[string]TCRedirectTarget, retained
 		var old bpfEipTarget
 		if err := targetMap.Lookup(key, &old); err == nil && old.Ifindex > 0 {
 			// 严格核验宿主机上存量目标网卡设备的物理存活性，仅在设备存活时保留旧条目
-			if link, err := netlink.LinkByIndex(int(old.Ifindex)); err == nil && link != nil {
+			if link, err := netlinkOps.LinkByIndex(int(old.Ifindex)); err == nil && link != nil {
 				wanted[string(key)] = true
 			}
 		}

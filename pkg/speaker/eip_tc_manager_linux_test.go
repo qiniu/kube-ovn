@@ -3,6 +3,7 @@
 package speaker
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -27,6 +28,16 @@ func requireBPFIntegration(t *testing.T) {
 	if os.Getenv("KUBE_OVN_BPF_TEST") != "1" {
 		t.Skip("requires an isolated privileged Linux network namespace")
 	}
+}
+
+func requireBPFObject(t *testing.T) string {
+	t.Helper()
+	requireBPFIntegration(t)
+	path := os.Getenv("KUBE_OVN_BPF_OBJECT")
+	if path == "" {
+		t.Skip("requires KUBE_OVN_BPF_OBJECT environment variable pointing to compiled tc_eip.o")
+	}
+	return path
 }
 
 // newTestTCManager 构建测试专用的 linuxTCManager 实例并注入预设大小的 BPF Hash Map。
@@ -86,9 +97,7 @@ func TestTCAttachMissingObject(t *testing.T) {
 }
 
 func TestTCNonEIPContinuesClassification(t *testing.T) {
-	requireBPFIntegration(t)
-	path := os.Getenv("KUBE_OVN_BPF_OBJECT")
-	require.NotEmpty(t, path)
+	path := requireBPFObject(t)
 	spec, err := ebpf.LoadCollectionSpec(path)
 	require.NoError(t, err)
 	for _, m := range spec.Maps {
@@ -139,6 +148,7 @@ func testTCPinPath(t *testing.T) string {
 }
 
 func TestTCRetryRestartAndDisable(t *testing.T) {
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eip-retry0"}}
 	require.NoError(t, netlink.LinkAdd(link))
@@ -151,7 +161,7 @@ func TestTCRetryRestartAndDisable(t *testing.T) {
 	}
 	m := NewTCManager(cfg)
 	require.Error(t, m.Attach(link.Name))
-	cfg.TcBpfProgPath = os.Getenv("KUBE_OVN_BPF_OBJECT")
+	cfg.TcBpfProgPath = bpfObj
 	require.NoError(t, m.Attach(link.Name), "retry must load the object after it becomes available")
 	require.NoError(t, m.Attach(link.Name), "attachment must be idempotent")
 	ip := net.ParseIP("2001:db8::1")
@@ -225,6 +235,7 @@ func TestTCSyncRetainedDeclarativeProtection(t *testing.T) {
 }
 
 func TestTCMacvlanDelivery(t *testing.T) {
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
 	run := func(command string) {
 		t.Helper()
@@ -255,7 +266,7 @@ ip -n eip-outside link set lo up
 ip -n eip-outside link set eip-external up
 ip -n eip-outside addr add 198.18.0.3/24 dev eip-external
 ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
-	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "eip-uplink", TcBpfProgPath: os.Getenv("KUBE_OVN_BPF_OBJECT"), TcBpfMapPath: pin})
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "eip-uplink", TcBpfProgPath: bpfObj, TcBpfMapPath: pin})
 	t.Cleanup(func() { require.NoError(t, m.Close()) })
 	require.NoError(t, m.Attach("eip-uplink"))
 	host, err := netlink.LinkByName("eip-host")
@@ -269,7 +280,7 @@ ip -n eip-outside route add 203.0.113.10/32 via 198.18.0.1`)
 }
 
 func TestTCPriorityMigrationAndCleanup(t *testing.T) {
-	requireBPFIntegration(t)
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-prio-%d", time.Now().UnixNano()%100000)}}
 	require.NoError(t, netlink.LinkAdd(link))
@@ -279,7 +290,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	cfg1 := &Configuration{
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      link.Name,
-		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfProgPath:       bpfObj,
 		TcBpfMapPath:        pin,
 		TcBpfPriority:       5,
 	}
@@ -300,7 +311,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 	cfg2 := &Configuration{
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      link.Name,
-		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfProgPath:       bpfObj,
 		TcBpfMapPath:        pin,
 		TcBpfPriority:       7,
 	}
@@ -351,7 +362,7 @@ func TestTCPriorityMigrationAndCleanup(t *testing.T) {
 }
 
 func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
-	requireBPFIntegration(t)
+	bpfObj := requireBPFObject(t)
 	pin := testTCPinPath(t)
 	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: fmt.Sprintf("eip-reload-%d", time.Now().UnixNano()%100000)}}
 	require.NoError(t, netlink.LinkAdd(link))
@@ -360,7 +371,7 @@ func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 	cfg := &Configuration{
 		EnableTcBpfRedirect: true,
 		TcBpfInterface:      link.Name,
-		TcBpfProgPath:       os.Getenv("KUBE_OVN_BPF_OBJECT"),
+		TcBpfProgPath:       bpfObj,
 		TcBpfMapPath:        pin,
 	}
 
@@ -395,7 +406,7 @@ func TestTCHotReloadPreservesMapAndFilters(t *testing.T) {
 	require.True(t, os.IsNotExist(err), "pinned map must be removed after Clean")
 }
 
-func TestResolveLinkName(t *testing.T) {
+func TestTCResolveLinkName(t *testing.T) {
 	// 1. 显式指定网卡参数，优先级最高
 	m := &linuxTCManager{
 		cfg:         &Configuration{TcBpfInterface: "cfg0"},
@@ -475,4 +486,48 @@ func TestTCDeleteEIPAfterClose(t *testing.T) {
 			require.ErrorContains(t, m.DeleteEIP(net.ParseIP("1.2.3.4")), "TC manager is closed")
 		})
 	}
+}
+
+func TestTCManagerAttachUsesNetlinkOps(t *testing.T) {
+	origOps := netlinkOps
+	var queriedLink string
+	mock := &mockTCNetlinkOps{
+		linkByNameFunc: func(name string) (netlink.Link, error) {
+			queriedLink = name
+			return nil, errors.New("link not found by mock ops")
+		},
+	}
+	netlinkOps = mock
+	t.Cleanup(func() { netlinkOps = origOps })
+
+	m := NewTCManager(&Configuration{EnableTcBpfRedirect: true, TcBpfInterface: "test-bond"}).(*linuxTCManager)
+	err := m.Attach("test-bond")
+	require.ErrorContains(t, err, "link not found by mock ops")
+	require.Equal(t, "test-bond", queriedLink)
+}
+
+func TestTCManagerOpsLinkByIndex(t *testing.T) {
+	origOps := netlinkOps
+	var queriedIndex int
+	mock := &mockTCNetlinkOps{
+		linkByIndexFunc: func(index int) (netlink.Link, error) {
+			queriedIndex = index
+			return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Index: index, Name: "dummy-test"}}, nil
+		},
+	}
+	netlinkOps = mock
+	t.Cleanup(func() { netlinkOps = origOps })
+
+	m, v4, _ := newTestTCManager(t)
+	ip := net.ParseIP("192.0.2.1")
+	target := TCRedirectTarget{TargetIfindex: 42, ParentIfindex: 1, TargetMAC: net.HardwareAddr{2, 0, 0, 0, 0, 1}}
+	require.NoError(t, m.addEIP(ip, target))
+
+	// 调用 SyncEIPs 传入 retainedIPs，存量 IP 应通过 netlinkOps.LinkByIndex 校验网卡存活性
+	require.NoError(t, m.SyncEIPs(map[string]TCRedirectTarget{}, ip.String()))
+	require.Equal(t, 42, queriedIndex)
+
+	var found bpfEipTarget
+	require.NoError(t, v4.Lookup(ip.To4(), &found))
+	require.Equal(t, uint32(42), found.Ifindex)
 }
