@@ -374,6 +374,34 @@ func TestAttachBPFFilterOpsBranches(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, mock.replacedFilters, 1)
 	require.Empty(t, mock.deletedFilters)
+
+	// 7. 历史名称规则就地规范化分支：同 priority 上存在属于本组件的旧规则（ProgID 一致但 Name 为历史旧名），必须执行 FilterReplace 规范化为 AttachName
+	mock = &mockTCNetlinkOps{
+		filterListFilters: []netlink.Filter{
+			&netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: 10, Parent: netlink.HANDLE_MIN_INGRESS, Handle: 1, Priority: 5, Protocol: unix.ETH_P_ALL,
+				},
+				DirectAction: true,
+				Id:           1001,
+				Tag:          "08218004caf6a189",
+				Name:         "tc_eip.o:[classifier]",
+			},
+		},
+	}
+	netlinkOps = mock
+	err = attachBPFFilter(tcFilterConfig{
+		Link:        link,
+		Program:     prog,
+		AttachName:  "kube-ovn-eip",
+		LegacyNames: []string{"tc_eip.o:[classifier]"},
+		Priority:    5,
+	})
+	require.NoError(t, err)
+	require.Len(t, mock.replacedFilters, 1)
+	require.Equal(t, uint16(5), mock.replacedFilters[0].Attrs().Priority)
+	require.Equal(t, "kube-ovn-eip", mock.replacedFilters[0].(*netlink.BpfFilter).Name)
+	require.Empty(t, mock.deletedFilters)
 }
 
 func TestDetachBPFFiltersOnLinksWithOps(t *testing.T) {

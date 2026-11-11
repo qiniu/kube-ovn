@@ -93,6 +93,9 @@ func (m *linuxTCManager) doAttach(linkName string, useCache bool) error {
 	if useCache && m.attachedDev == dev {
 		return nil
 	}
+	if m.attachedDev != "" && m.attachedDev != dev {
+		klog.Warningf("TC BPF interface changed from %s to %s; previous interface filters may still be attached", m.attachedDev, dev)
+	}
 	if err := m.attach(dev); err != nil {
 		return err
 	}
