@@ -86,6 +86,13 @@ type VpcNatGatewaySpec struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default=true
 	EnableLanIPAsHairpinSNAT *bool `json:"enableLanIpAsHairpinSnat,omitempty"`
+	// TCPConnLimit configures the maximum concurrent TCP connections for the NAT gateway.
+	// If unset, defaults to 50,000 (DefaultNatGwTCPConnLimit).
+	// Set to positive integer for custom threshold; set to 0 to disable connlimit without affecting pre-routing SYN rate limiting.
+	// Applied dynamically without Pod recreation.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty"`
 	// User-defined annotations for the StatefulSet NAT gateway Pod template.
 	// Only effective at creation time; updates to this field are not detected.
 	Annotations map[string]string `json:"annotations,omitempty"`
@@ -117,6 +124,8 @@ type VpcNatGatewayStatus struct {
 	Selector        []string            `json:"selector" patchStrategy:"merge"`
 	Tolerations     []corev1.Toleration `json:"tolerations" patchStrategy:"merge"`
 	Affinity        corev1.Affinity     `json:"affinity" patchStrategy:"merge"`
+	// TCPConnLimit is the current active TCP connlimit value applied to the NAT gateway.
+	TCPConnLimit *int32 `json:"tcpConnLimit,omitempty" patchStrategy:"merge"`
 }
 
 type Route struct {
