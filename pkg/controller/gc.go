@@ -405,6 +405,10 @@ func (c *Controller) gcIP() error {
 		return err
 	}
 	for _, ip := range ips {
+		if ip.Labels[util.IPReservedLabel] == "true" {
+			// a reserved ip is created by the user to hold an address for a pod that may not exist yet
+			continue
+		}
 		exist, err := c.checkIPOwnerExists(ip)
 		if err != nil {
 			klog.Errorf("failed to check ip owner exists, %v", err)
