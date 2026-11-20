@@ -58,6 +58,14 @@ const (
 	natGwTCPConnLimitSet  = "tcp-connlimit-set"
 	natGwTCPSynLimitSet   = "tcp-syn-limit-set"
 
+	natGwStatelessInit    = "stateless-init"
+	natGwStatelessFipAdd  = "stateless-fip-add"
+	natGwStatelessFipDel  = "stateless-fip-del"
+	natGwStatelessDnatAdd = "stateless-dnat-add"
+	natGwStatelessDnatDel = "stateless-dnat-del"
+	natGwStatelessSnatAdd = "stateless-snat-add"
+	natGwStatelessSnatDel = "stateless-snat-del"
+
 	// The two states of the lanIP fallback the gateway script accepts, also the values recorded
 	// in VpcNatGatewayStatus.HairpinSNAT.
 	hairpinSNATEnable  = "enable"
@@ -363,10 +371,16 @@ func (c *Controller) getNatGwTCPSynRateLimitArgs(gw *kubeovnv1.VpcNatGateway) []
 	return []string{srcRate, srcBurst, dstRate, dstBurst}
 }
 
+// getNatGwDataplaneMode 获取并校验指定 VPC NAT 网关的 DataplaneMode 配置。
 func (c *Controller) getNatGwDataplaneMode(gw *kubeovnv1.VpcNatGateway) string {
-	return strings.TrimSpace(gw.Spec.DataplaneMode)
+	mode, err := c.activeNatGatewayDataplaneMode(gw)
+	if err != nil {
+		klog.Errorf("resolve dataplane mode for gateway %s: %v", gw.Name, err)
+	}
+	return mode
 }
 
+// isStatelessMode 判定指定模式字符串是否为 stateless-nft 无状态数据面模式。
 func isStatelessMode(mode string) bool {
 	return mode == util.NatDataplaneModeStatelessNft
 }
@@ -494,6 +508,32 @@ func (c *Controller) handleAddOrUpdateVpcNatGw(key string) error {
 		return nil
 	}
 	if err = c.rejectStaleVpcNatGwQoSGeneration(gw); err != nil {
+		return err
+	}
+
+	mode, err := util.NatGatewayDataplaneMode(gw)
+	if err != nil {
+		klog.Errorf("failed to validate dataplane mode for gateway %s: %v", key, err)
+		return err
+	}
+	// 网关数据面模式不可变，若需切换必须删除并重新创建网关
+	if gw.Status.DataplaneMode != "" && gw.Status.DataplaneMode != mode {
+		err = fmt.Errorf("gateway %s: dataplane mode is immutable (%q -> %q); delete and recreate the gateway to switch mode", key, gw.Status.DataplaneMode, mode)
+		klog.Error(err)
+		return err
+	}
+	if gw.Status.DataplaneMode == "" && mode == util.NatDataplaneModeStatelessNft {
+		pod, podErr := c.getNatGwPod(key, c.natGwNamespace(gw))
+		if podErr == nil && pod != nil && pod.Annotations[util.VpcNatGatewayInitAnnotation] != "" {
+			err = fmt.Errorf("gateway %s: dataplane mode is immutable (stateful -> %q); delete and recreate the gateway to switch mode", key, mode)
+			klog.Error(err)
+			return err
+		}
+	}
+	// 无状态模式（notrack）绕过 conntrack，不支持配置 tcpConnLimit
+	if mode == util.NatDataplaneModeStatelessNft && gw.Spec.TCPConnLimit != nil && *gw.Spec.TCPConnLimit > 0 {
+		err = fmt.Errorf("gateway %s: stateless dataplane mode does not support tcpConnLimit (must be 0 or unset)", key)
+		klog.Error(err)
 		return err
 	}
 
@@ -764,6 +804,19 @@ func (c *Controller) handleInitVpcNatGw(key string) error {
 		// The init script may fail on first run but succeed on retry after chains are established
 		klog.Warningf("vpc nat gateway %s init attempt failed (will retry): %v", key, err)
 		return fmt.Errorf("failed to init vpc nat gateway, %w", err)
+	}
+
+	dataplaneMode, err := c.activeNatGatewayDataplaneMode(gw)
+	if err != nil {
+		klog.Warningf("invalid dataplane mode for vpc nat gateway %s: %v, ignoring and fallback", key, err)
+		dataplaneMode = ""
+	}
+	// 无状态网关在 Pod 内初始化基础 nft 表及 TCP MSS 自动钳制
+	if dataplaneMode == util.NatDataplaneModeStatelessNft {
+		if err := c.execNatGwRulesInPods([]*corev1.Pod{pod}, natGwStatelessInit, nil); err != nil {
+			klog.Errorf("initialize stateless gateway %s: %v", key, err)
+			return err
+		}
 	}
 
 	mode := hairpinSNATMode(gw)
