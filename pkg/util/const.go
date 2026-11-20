@@ -340,18 +340,19 @@ const (
 	NatPolicyRuleActionForward = "forward"
 	NatPolicyRuleIDLength      = 12
 
-	NAT                        = "nat"
-	Mangle                     = "mangle"
-	Raw                        = "raw"
-	Prerouting                 = "PREROUTING"
-	Postrouting                = "POSTROUTING"
-	Output                     = "OUTPUT"
-	OvnPrerouting              = "OVN-PREROUTING"
-	OvnPostrouting             = "OVN-POSTROUTING"
-	OvnOutput                  = "OVN-OUTPUT"
-	OvnMasquerade              = "OVN-MASQUERADE"
-	OvnNatOutGoingPolicy       = "OVN-NAT-POLICY"
-	OvnNatOutGoingPolicySubnet = "OVN-NAT-PSUBNET-"
+	NAT                         = "nat"
+	Mangle                      = "mangle"
+	Raw                         = "raw"
+	Prerouting                  = "PREROUTING"
+	Postrouting                 = "POSTROUTING"
+	Output                      = "OUTPUT"
+	OvnPrerouting               = "OVN-PREROUTING"
+	OvnPostrouting              = "OVN-POSTROUTING"
+	OvnOutput                   = "OVN-OUTPUT"
+	OvnMasquerade               = "OVN-MASQUERADE"
+	OvnNatOutGoingPolicy        = "OVN-NAT-POLICY"
+	OvnNatOutGoingPolicySubnet  = "OVN-NAT-PSUBNET-"
+	OvnPortForwardIptablesChain = "KUBE-OVN-PF"
 
 	TProxyListenPort = 8102
 	TProxyRouteTable = 10001
@@ -530,6 +531,8 @@ const (
 	//      (bgp=cluster is the equivalent for Pod/Subnet paths; LB VIP path uses "true".)
 	// Takes priority over BgpVipAnnotation when both are present.
 	MetalLBAllowSharedIPAnnotation = "metallb.universe.tf/allow-shared-ip"
+
+	PortForwardConnLimitAnnotation = "ovn.kubernetes.io/port-forward-connlimit"
 )
 
 // Readonly kinds of Kubernetes objects
