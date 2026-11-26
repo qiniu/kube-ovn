@@ -97,9 +97,10 @@ type Controller struct {
 	k8sExec k8sexec.Interface
 
 	// channel used for fdb sync
-	fdbSyncChan   chan struct{}
-	fdbSyncMutex  sync.Mutex
-	vswitchClient ovs.Vswitch
+	fdbSyncChan      chan struct{}
+	fdbSyncMutex     sync.Mutex
+	pfConnLimitMutex sync.Mutex
+	vswitchClient    ovs.Vswitch
 }
 
 func newTypedRateLimitingQueue[T comparable](name string, rateLimiter workqueue.TypedRateLimiter[T]) workqueue.TypedRateLimitingInterface[T] {
@@ -227,6 +228,17 @@ func NewController(config *Configuration,
 		UpdateFunc: controller.enqueueUpdateService,
 	}); err != nil {
 		util.LogFatalAndExit(err, "failed to add service event handler")
+	}
+
+	var gcErr error
+	for i := 0; i < 3; i++ {
+		if gcErr = controller.gcPortForwardConnLimitRules(); gcErr == nil {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if gcErr != nil {
+		klog.Errorf("failed to run startup gc for port-forward connlimit rules after 3 attempts: %v", gcErr)
 	}
 
 	if _, err = podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -1045,6 +1057,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) {
 	go wait.Until(c.loopTunnelCheck, 5*time.Second, stopCh)
 	go wait.Until(c.runAddOrUpdateProviderNetworkWorker, time.Second, stopCh)
 	go wait.Until(c.runAddOrUpdateServicekWorker, time.Second, stopCh)
+	go wait.Until(c.gcPortForwardConnLimitRulesWorker, 3*time.Minute, stopCh)
 	go wait.Until(c.runDeleteProviderNetworkWorker, time.Second, stopCh)
 	go wait.Until(c.runSubnetWorker, time.Second, stopCh)
 	go wait.Until(c.runUpdatePodWorker, time.Second, stopCh)

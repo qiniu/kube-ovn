@@ -575,6 +575,17 @@ func (c *Controller) reconcileServices(event *serviceEvent) error {
 		}
 	}
 
+	if err := c.reconcilePortForwardConnLimit(oldService, newService); err != nil {
+		svcName := ""
+		if newService != nil {
+			svcName = newService.Namespace + "/" + newService.Name
+		} else if oldService != nil {
+			svcName = oldService.Namespace + "/" + oldService.Name
+		}
+		klog.Errorf("failed to reconcile port-forward connlimit for service %s: %v", svcName, err)
+		return err
+	}
+
 	return nil
 }
 

@@ -103,6 +103,15 @@ ip6tables -t mangle -X OVN-OUTPUT
 ip6tables -t mangle -F OVN-POSTROUTING
 ip6tables -t mangle -X OVN-POSTROUTING
 
+iptables -t mangle -D PREROUTING -j KUBE-OVN-PF 2>/dev/null || true
+iptables -t mangle -D OUTPUT -j KUBE-OVN-PF 2>/dev/null || true
+iptables -t mangle -F KUBE-OVN-PF 2>/dev/null || true
+iptables -t mangle -X KUBE-OVN-PF 2>/dev/null || true
+ip6tables -t mangle -D PREROUTING -j KUBE-OVN-PF 2>/dev/null || true
+ip6tables -t mangle -D OUTPUT -j KUBE-OVN-PF 2>/dev/null || true
+ip6tables -t mangle -F KUBE-OVN-PF 2>/dev/null || true
+ip6tables -t mangle -X KUBE-OVN-PF 2>/dev/null || true
+
 sleep 1
 
 ipset destroy ovn60subnets-nat
