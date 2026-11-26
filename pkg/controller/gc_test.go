@@ -86,6 +86,8 @@ func TestGcIP(t *testing.T) {
 	orphan := ipCR(ovs.PodNameToPortName("sts-0", namespace, util.OvnProvider), "sts-0", util.KindStatefulSet, "false")
 	reserved := ipCR(ovs.PodNameToPortName("future-0", namespace, util.OvnProvider), "future-0", util.KindStatefulSet, "true")
 	live := ipCR(ovs.PodNameToPortName("alive-0", namespace, util.OvnProvider), "alive-0", util.KindStatefulSet, "false")
+	// the statefulset is gone but its pod is still there: terminating, or orphaned by --cascade=orphan
+	outlived := ipCR(ovs.PodNameToPortName("left-0", namespace, util.OvnProvider), "left-0", util.KindStatefulSet, "false")
 	// a user reserved ip that handleAddReservedIP has not labeled yet
 	unlabeled := ipCR(ovs.PodNameToPortName("pending-0", namespace, util.OvnProvider), "pending-0", util.KindStatefulSet, "")
 	unlabeled.Labels = nil
@@ -105,8 +107,11 @@ func TestGcIP(t *testing.T) {
 		StatefulSets: []*appsv1.StatefulSet{{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "alive"},
 		}},
-		Pods: []*corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: launcher}}},
-		IPs:  []*kubeovnv1.IP{orphan, reserved, live, unlabeled, launcherIP, vmiIP, goneVMIP},
+		Pods: []*corev1.Pod{
+			{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: launcher}},
+			{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "left-0"}},
+		},
+		IPs: []*kubeovnv1.IP{orphan, reserved, live, outlived, unlabeled, launcherIP, vmiIP, goneVMIP},
 	})
 	require.NoError(t, err)
 	c := fc.fakeController
@@ -132,6 +137,8 @@ func TestGcIP(t *testing.T) {
 	require.NoError(t, err, "a reserved ip must survive even without its owner")
 	_, err = c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), live.Name, metav1.GetOptions{})
 	require.NoError(t, err, "an ip of a live statefulset must survive")
+	_, err = c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), outlived.Name, metav1.GetOptions{})
+	require.NoError(t, err, "an ip of a pod that outlives its statefulset must survive")
 	_, err = c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), unlabeled.Name, metav1.GetOptions{})
 	require.NoError(t, err, "a reserved ip that is not labeled yet must survive")
 	_, err = c.config.KubeOvnClient.KubeovnV1().IPs().Get(context.Background(), launcherIP.Name, metav1.GetOptions{})

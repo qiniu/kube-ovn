@@ -362,7 +362,13 @@ func (c *Controller) checkIPOwnerExists(ip *kubeovnv1.IP) (bool, error) {
 		}
 
 		_, err := c.config.KubeClient.AppsV1().StatefulSets(ip.Spec.Namespace).Get(context.Background(), stsName, metav1.GetOptions{})
-		if err != nil && k8serrors.IsNotFound(err) {
+		if !k8serrors.IsNotFound(err) {
+			return true, err
+		}
+		// the pod may outlive its statefulset: it is still terminating gracefully, or the statefulset
+		// was deleted with --cascade=orphan. Its delete handler releases the ip once it is gone.
+		_, err = c.podsLister.Pods(ip.Spec.Namespace).Get(ip.Spec.PodName)
+		if k8serrors.IsNotFound(err) {
 			return false, nil
 		}
 		return true, err
