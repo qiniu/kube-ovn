@@ -321,7 +321,7 @@ func (c *Controller) gcVip() error {
 
 func (c *Controller) checkIPOwnerExists(ip *kubeovnv1.IP) (bool, error) {
 	// Check if Subnet exists
-	if _, ok := c.ipam.Subnets[ip.Spec.Subnet]; !ok {
+	if _, ok := c.ipam.GetSubnet(ip.Spec.Subnet); !ok {
 		return false, nil
 	}
 
@@ -334,10 +334,19 @@ func (c *Controller) checkIPOwnerExists(ip *kubeovnv1.IP) (bool, error) {
 		return true, err
 	}
 
-	// Check if VM exists
+	// Check if VM exists. The ip is named after the vm, after a vmi that has no parent vm,
+	// or after the virt-launcher pod when keep-vm-ip is disabled.
 	if ip.Spec.PodType == util.KindVirtualMachine {
 		_, err := c.config.KubevirtClient.VirtualMachine(ip.Spec.Namespace).Get(context.Background(), ip.Spec.PodName, metav1.GetOptions{})
-		if err != nil && k8serrors.IsNotFound(err) {
+		if !k8serrors.IsNotFound(err) {
+			return true, err
+		}
+		_, err = c.config.KubevirtClient.VirtualMachineInstance(ip.Spec.Namespace).Get(context.Background(), ip.Spec.PodName, metav1.GetOptions{})
+		if !k8serrors.IsNotFound(err) {
+			return true, err
+		}
+		_, err = c.podsLister.Pods(ip.Spec.Namespace).Get(ip.Spec.PodName)
+		if k8serrors.IsNotFound(err) {
 			return false, nil
 		}
 		return true, err
@@ -405,8 +414,9 @@ func (c *Controller) gcIP() error {
 		return err
 	}
 	for _, ip := range ips {
-		if ip.Labels[util.IPReservedLabel] == "true" {
-			// a reserved ip is created by the user to hold an address for a pod that may not exist yet
+		if ip.Labels[util.IPReservedLabel] != "false" {
+			// only "false" marks an ip created by the controller. A user reserved ip holds an address
+			// for a pod that may not exist yet, and it has no label until handleAddReservedIP is done.
 			continue
 		}
 		exist, err := c.checkIPOwnerExists(ip)
