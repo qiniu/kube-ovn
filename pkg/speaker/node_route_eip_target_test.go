@@ -91,7 +91,7 @@ func TestGetNatGwTCRedirectTarget(t *testing.T) {
 		}
 
 		// 验证不搞越界猜测，明确 fail-fast 返回错误
-		_, err := c.getNatGwTCRedirectTargetInternal(pod, eip, lookup)
+		_, err := c.getNatGwTCRedirectTargetInternal(pod, eip, lookup, nil)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "failed to get external subnet las-derived-subnet-not-found")
 	})
@@ -209,7 +209,7 @@ func TestResolveEipRedirectTargetCache(t *testing.T) {
 func TestNatGwTCRedirectTarget(t *testing.T) {
 	t.Run("nil pod", func(t *testing.T) {
 		subnet := &kubeovnv1.Subnet{ObjectMeta: metav1.ObjectMeta{Name: "ext-subnet"}}
-		_, err := natGwTCRedirectTarget(nil, subnet, "bond0", nil)
+		_, err := natGwTCRedirectTarget(nil, subnet, "bond0", nil, nil)
 		require.ErrorContains(t, err, "NAT gateway pod is missing")
 	})
 
@@ -219,7 +219,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 			Spec:       kubeovnv1.SubnetSpec{Provider: "invalid-provider-without-dot"},
 		}
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nat-gw", Namespace: "kube-system"}}
-		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil)
+		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil, nil)
 		require.ErrorContains(t, err, "is not a valid NAD format")
 	})
 
@@ -252,7 +252,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		}
 
 		// 1. 成功解析直通网卡索引与 MAC
-		target, err := natGwTCRedirectTarget(pod, subnet, "", lookup)
+		target, err := natGwTCRedirectTarget(pod, subnet, "", lookup, nil)
 		require.NoError(t, err)
 		require.Equal(t, 12, target.TargetIfindex)
 		require.Equal(t, net.HardwareAddr{2, 0, 0, 0, 0, 2}, target.TargetMAC)
@@ -267,7 +267,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		}
 		for _, status := range invalidStatuses {
 			pod.Annotations[nadv1.NetworkStatusAnnot] = status
-			_, err := natGwTCRedirectTarget(pod, subnet, "", lookup)
+			_, err := natGwTCRedirectTarget(pod, subnet, "", lookup, nil)
 			require.Error(t, err, "status %q", status)
 		}
 
@@ -275,7 +275,7 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 		pod.Annotations[nadv1.NetworkStatusAnnot] = `[{"name":"kube-system/wan","mac":"02:00:00:00:00:02"}]`
 		_, err = natGwTCRedirectTarget(pod, subnet, "", func(string) (netlink.Link, error) {
 			return nil, errors.New("link missing")
-		})
+		}, nil)
 		require.Error(t, err)
 	})
 
@@ -294,8 +294,116 @@ func TestNatGwTCRedirectTarget(t *testing.T) {
 				},
 			},
 		}
-		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil)
+		_, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil, nil)
 		require.ErrorContains(t, err, "has no network status for kube-system/wan")
+	})
+
+	t.Run("veth ovs underlay mode via alias", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-ovn"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "public-ovn-2001.kube-system.ovn"},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-ovn-0",
+				Namespace: "kube-system",
+				UID:       "pod-uid-123",
+				Annotations: map[string]string{
+					nadv1.NetworkStatusAnnot: `[{"name":"kube-system/public-ovn-2001","interface":"net1","mac":"02:00:00:00:00:99"}]`,
+				},
+			},
+		}
+		lookupByAlias := func(alias string) (netlink.Link, error) {
+			if alias == "kube-system/vpc-nat-gw-ovn-0/pod-uid-123/net1" {
+				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 88, Name: "abcdef12_net1_h"}}, nil
+			}
+			return nil, errors.New("not found")
+		}
+		target, err := natGwTCRedirectTarget(pod, subnet, "bond0", nil, lookupByAlias)
+		require.NoError(t, err)
+		require.Equal(t, 88, target.TargetIfindex)
+		require.Equal(t, 0, target.ParentIfindex)
+		require.Equal(t, "02:00:00:00:00:99", target.TargetMAC.String())
+	})
+
+	t.Run("veth ovs underlay mode without net1 network-status", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-ovn"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "public-ovn-2002.kube-system.ovn"},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-ovn-noipam-0",
+				Namespace: "kube-system",
+				UID:       "pod-uid-noipam",
+				Annotations: map[string]string{
+					nadv1.NetworkStatusAnnot:                                    `[{"name":"generic-veth","interface":"eth0","ips":["10.222.0.250"],"mac":"ba:65:2d:c7:7b:1e"}]`,
+					"public-ovn-2002.kube-system.ovn.kubernetes.io/mac_address": "ae:06:1c:85:06:ec",
+				},
+			},
+		}
+		lookupByAlias := func(alias string) (netlink.Link, error) {
+			if alias == "kube-system/vpc-nat-gw-ovn-noipam-0/pod-uid-noipam/net1" {
+				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 99, Name: "f6fca7b7_net1_h"}}, nil
+			}
+			return nil, errors.New("not found")
+		}
+		target, err := natGwTCRedirectTarget(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		require.NoError(t, err)
+		require.Equal(t, 99, target.TargetIfindex)
+		require.Equal(t, 0, target.ParentIfindex)
+		require.Equal(t, "ae:06:1c:85:06:ec", target.TargetMAC.String())
+	})
+
+	t.Run("veth ovs underlay mode without any network-status", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-ovn"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "public-ovn-2002.kube-system.ovn"},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-ovn-no-annot-0",
+				Namespace: "kube-system",
+				UID:       "pod-uid-no-annot",
+				Annotations: map[string]string{
+					"public-ovn-2002.kube-system.ovn.kubernetes.io/mac_address": "ae:06:1c:85:06:ec",
+				},
+			},
+		}
+		lookupByAlias := func(alias string) (netlink.Link, error) {
+			if alias == "kube-system/vpc-nat-gw-ovn-no-annot-0/pod-uid-no-annot/net1" {
+				return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: 101, Name: "f6fca7b7_net1_h"}}, nil
+			}
+			return nil, errors.New("not found")
+		}
+		target, err := natGwTCRedirectTarget(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		require.NoError(t, err)
+		require.Equal(t, 101, target.TargetIfindex)
+		require.Equal(t, 0, target.ParentIfindex)
+		require.Equal(t, "ae:06:1c:85:06:ec", target.TargetMAC.String())
+	})
+
+	t.Run("veth ovs underlay mode reports alias error when noIPAM fallback has no IP", func(t *testing.T) {
+		subnet := &kubeovnv1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-ovn"},
+			Spec:       kubeovnv1.SubnetSpec{Provider: "public-ovn-2002.kube-system.ovn"},
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vpc-nat-gw-ovn-alias-err-0",
+				Namespace: "kube-system",
+				Annotations: map[string]string{
+					nadv1.NetworkStatusAnnot:                                    `[{"name":"kube-system/public-ovn-2002","interface":"net1"}]`,
+					"public-ovn-2002.kube-system.ovn.kubernetes.io/mac_address": "ae:06:1c:85:06:ec",
+				},
+			},
+		}
+		lookupByAlias := func(_ string) (netlink.Link, error) {
+			return nil, errors.New("link alias not found")
+		}
+		_, err := natGwTCRedirectTarget(pod, subnet, "macbond0.2000", nil, lookupByAlias)
+		require.ErrorContains(t, err, "failed to locate host veth by alias")
+		require.ErrorContains(t, err, "link alias not found")
 	})
 }
 

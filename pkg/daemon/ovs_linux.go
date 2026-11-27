@@ -71,7 +71,7 @@ func (csh cniServerHandler) configureDpdkNic(podName, podNamespace, provider, ne
 	return ovs.SetInterfaceBandwidth(podName, podNamespace, ifaceID, egress, ingress)
 }
 
-func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns, containerID, vfDriver, ifName, mac string, mtu int, ip, gateway string, isDefaultRoute, vmMigration bool, routes []request.Route, _, _ []string, ingress, egress, deviceID, latency, limit, loss, jitter string, gwCheckMode int, u2oInterconnectionIP, oldPodName, encapIP string) ([]request.Route, error) {
+func (csh cniServerHandler) configureNic(podName, podNamespace, podUID, provider, netns, containerID, vfDriver, ifName, mac string, mtu int, ip, gateway string, isDefaultRoute, vmMigration bool, routes []request.Route, _, _ []string, ingress, egress, deviceID, latency, limit, loss, jitter string, gwCheckMode int, u2oInterconnectionIP, oldPodName, encapIP string) ([]request.Route, error) {
 	var err error
 	var hostNicName, containerNicName, pfPci string
 	var vfID int
@@ -112,8 +112,10 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 			"external_ids:vendor=" + util.CniTypeName,
 			"external_ids:pod_name=" + podName,
 			"external_ids:pod_namespace=" + podNamespace,
-			"external_ids:ip=" + ipStr,
 			"external_ids:pod_netns=" + netns,
+		}
+		if ipStr != "" {
+			args = append(args, "external_ids:ip="+ipStr)
 		}
 		if encapIP != "" {
 			args = append(args, "external_ids:encap-ip="+encapIP)
@@ -130,8 +132,10 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 			"external_ids:vendor=" + util.CniTypeName,
 			"external_ids:pod_name=" + podName,
 			"external_ids:pod_namespace=" + podNamespace,
-			"external_ids:ip=" + ipStr,
 			"external_ids:pod_netns=" + netns,
+		}
+		if ipStr != "" {
+			args = append(args, "external_ids:ip="+ipStr)
 		}
 		if encapIP != "" {
 			args = append(args, "external_ids:encap-ip="+encapIP)
@@ -175,7 +179,8 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 		return nil, fmt.Errorf("failed to parse mac %s %w", macAddr, err)
 	}
 	if !yusur.IsYusurSmartNic(deviceID) {
-		if err = configureHostNic(hostNicName); err != nil {
+		alias := util.GenNatGwHostVethAlias(podNamespace, podName, podUID, ifName)
+		if err = configureHostNic(hostNicName, alias); err != nil {
 			klog.Error(err)
 			return nil, err
 		}
@@ -393,7 +398,7 @@ func generateNicName(containerID, ifname string) (string, string) {
 	return fmt.Sprintf("%s_%s_h", containerID[0:12-len(ifname)], ifname), fmt.Sprintf("%s_%s_c", containerID[0:12-len(ifname)], ifname)
 }
 
-func configureHostNic(nicName string) error {
+func configureHostNic(nicName, alias string) error {
 	hostLink, err := netlink.LinkByName(nicName)
 	if err != nil {
 		return fmt.Errorf("can not find host nic %s: %w", nicName, err)
@@ -406,6 +411,20 @@ func configureHostNic(nicName string) error {
 	}
 	if err = netlink.LinkSetTxQLen(hostLink, 1000); err != nil {
 		return fmt.Errorf("can not set host nic %s qlen: %w", nicName, err)
+	}
+	if alias != "" {
+		if oldLink, err := netlink.LinkByAlias(alias); err == nil && oldLink != nil && oldLink.Attrs().Index != hostLink.Attrs().Index {
+			klog.Warningf("clearing stale alias %q from host nic %s (ifindex=%d) before assigning to %s (ifindex=%d)",
+				alias, oldLink.Attrs().Name, oldLink.Attrs().Index, nicName, hostLink.Attrs().Index)
+			if err := netlink.LinkSetAlias(oldLink, ""); err != nil {
+				klog.Errorf("failed to clear stale alias %q on host nic %s: %v", alias, oldLink.Attrs().Name, err)
+			}
+		}
+		if len(alias) >= 256 {
+			klog.Errorf("host nic %s alias %q length %d exceeds Linux IFALIASZ limit (255), skipping LinkSetAlias", nicName, alias, len(alias))
+		} else if err = netlink.LinkSetAlias(hostLink, alias); err != nil {
+			klog.Errorf("failed to set alias %q (len=%d) on host nic %s: %v", alias, len(alias), nicName, err)
+		}
 	}
 
 	return nil
@@ -1246,6 +1265,9 @@ func configureNic(link, ip string, macAddr net.HardwareAddr, mtu int, detectIPv4
 	}
 
 	for ipStr := range strings.SplitSeq(ip, ",") {
+		if ipStr == "" {
+			continue
+		}
 		// Do not reassign same address for link
 		if _, ok := ipDelMap[ipStr]; ok {
 			delete(ipDelMap, ipStr)
